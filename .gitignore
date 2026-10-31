@@ -1,0 +1,12 @@
+/Binaries/
+/Intermediate/
+/Build/VS2022/
+/Build/Xcode/
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.ppm
+*.bmp
+.DS_Store

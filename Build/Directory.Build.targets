@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <IntDir>$(MSBuildThisFileDirectory)..\Intermediate\VS2022\$(MSBuildProjectName)\$(Configuration)\</IntDir>
+    <IntDirFullPath>$([System.IO.Path]::GetFullPath('$(IntDir)'))</IntDirFullPath>
+    <DesktopDeployRecipeFile>$(IntDirFullPath)$(TargetName)$(TargetExt).recipe</DesktopDeployRecipeFile>
+  </PropertyGroup>
+</Project>
