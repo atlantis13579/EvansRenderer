@@ -1,3 +1,5 @@
+#include "Renderer/DX12/DX12PipelineCache.h"
+#include "Renderer/D3DShaderCache.h"
 #include "Editor/ImguiRenderDX12.h"
 
 #if defined(_WIN32)
@@ -219,7 +221,7 @@ struct ImguiRenderDX12::Impl
             return false;
         }
         SafeRelease(error);
-        const HRESULT result = Device->CreateRootSignature(
+        const HRESULT result = Evans::Renderer::CreateCachedRootSignature(Device,
             0,
             signature->GetBufferPointer(),
             signature->GetBufferSize(),
@@ -270,7 +272,7 @@ float4 PS(VSOutput input) : SV_TARGET
         ID3DBlob* vertexShader = nullptr;
         ID3DBlob* pixelShader = nullptr;
         ID3DBlob* error = nullptr;
-        HRESULT result = D3DCompile(
+        HRESULT result = Evans::Renderer::CompileCachedD3DShader(
             ShaderSource,
             std::strlen(ShaderSource),
             "EvansImguiDX12",
@@ -292,7 +294,7 @@ float4 PS(VSOutput input) : SV_TARGET
             return false;
         }
         SafeRelease(error);
-        result = D3DCompile(
+        result = Evans::Renderer::CompileCachedD3DShader(
             ShaderSource,
             std::strlen(ShaderSource),
             "EvansImguiDX12",
@@ -363,7 +365,7 @@ float4 PS(VSOutput input) : SV_TARGET
         description.RTVFormats[0] = renderTargetFormat;
         description.SampleDesc.Count = 1;
 
-        result = Device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&PipelineState));
+        result = Evans::Renderer::CreateCachedGraphicsPipelineState(Device,&description, IID_PPV_ARGS(&PipelineState));
         SafeRelease(pixelShader);
         SafeRelease(vertexShader);
         return SUCCEEDED(result);
@@ -532,6 +534,7 @@ float4 PS(VSOutput input) : SV_TARGET
         TEXTMETRICA metrics = {};
         GetTextMetricsA(dc, &metrics);
         FontHeight = std::max(8, static_cast<int>(metrics.tmHeight));
+        imguiSetFontHeight(FontHeight);
 
         int penX = 1;
         int penY = 1;

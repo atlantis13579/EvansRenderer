@@ -36,6 +36,7 @@ bool CpuRasterRHI::Initialize(const RasterRHICreateInfo& createInfo)
 void CpuRasterRHI::Shutdown() noexcept
 {
     Context_->Execution.Shutdown();
+    Context_->Resources={};
 }
 
 bool CpuRasterRHI::IsInitialized() const noexcept

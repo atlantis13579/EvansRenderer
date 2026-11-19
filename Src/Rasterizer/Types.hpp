@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+namespace Evans::Renderer { struct GpuImage; }
+
 namespace Evans::Rasterizer
 {
 
@@ -109,6 +111,7 @@ struct RasterVertex
     Float3 Position;
     Float3 Normal{0.0f, 0.0f, 1.0f};
     Float2 TexCoord;
+    Float2 LightmapUV;
 };
 
 inline constexpr std::uint32_t InvalidRasterTextureIndex =
@@ -123,6 +126,10 @@ struct RasterTexture
     // a V flip, and invalid texture references sample opaque white. Shared
     // ownership lets adapters alias an image without copying its pixel storage.
     std::shared_ptr<const std::vector<std::uint8_t>> PixelsRGBA8;
+    // Packed RGBA8 levels after the original level, generated at runtime.
+    std::shared_ptr<const std::vector<std::uint8_t>> MipPixelsRGBA8;
+    bool SRGB = false;
+    bool Irradiance = false;
 
     [[nodiscard]] bool IsValid() const noexcept
     {
@@ -156,6 +163,9 @@ struct RasterMaterial
     float AlphaCutoff = 0.0f;
     std::uint32_t DiffuseTextureIndex = InvalidRasterTextureIndex;
     std::uint32_t OpacityTextureIndex = InvalidRasterTextureIndex;
+    std::uint32_t NormalTextureIndex = InvalidRasterTextureIndex;
+    float SubsurfaceWeight = 0;
+    bool ReceivesLightmap = false;
 };
 
 struct RasterTriangle
@@ -247,14 +257,26 @@ struct RasterLight
     float Intensity = 1.0f;
     Float2 AreaSize{1.0f, 1.0f};
     bool CastShadows = true;
+    // World-space radius per emitter sample; zero means unbounded.
+    float Range = 0.0f;
 };
 
 struct RasterSettings
 {
+    bool GpuPresentation = false;
     FillMode Mode = FillMode::Solid;
     VertexInputSpace InputSpace = VertexInputSpace::Clip;
     ClipDepthRange DepthRange = ClipDepthRange::ZeroToOne;
     ShadingModel Shading = ShadingModel::Unlit;
+    bool TextureMapping = true, NormalMapping = true, AlphaTesting = true;
+    bool AnisotropicFiltering = false;
+    std::uint32_t FrontLightmap = InvalidRasterTextureIndex, BackLightmap = InvalidRasterTextureIndex;
+    float LightmapIntensity = 0;
+    bool ACESColor = false;
+    float Exposure = 1, Contrast = 1, Saturation = 1;
+    std::uint32_t SkyTexture = InvalidRasterTextureIndex, SkyDiffuseTexture = InvalidRasterTextureIndex;
+    float SkyIntensity = 0, SkyDiffuseIntensity = 0;
+    Float3 SubsurfaceScattering{};
 
     Matrix4 World;
     Matrix4 View;
@@ -277,6 +299,7 @@ struct RasterSettings
     bool OutlineEnabled = true;
     float ShadowBias = 0.001f;
     float ShadowSlopeScaledBias = 0.0f;
+    float ShadowReceiverSlopeBias = 0.0f;
     float ShadowStrength = 0.55f;
     std::uint32_t ShadowMapSize = 512;
     std::uint32_t ShadowPCFRadius = 1;
@@ -289,6 +312,7 @@ struct RasterSettings
     std::array<RasterLight, MaximumRasterLights> Lights;
     std::uint32_t LightCount = LegacyRasterLightCount;
     std::int32_t ShadowLightIndex = 0;
+    std::shared_ptr<const RasterScene> ImmutableScene;
 };
 
 [[nodiscard]] inline std::uint32_t EffectiveRasterLightCount(
@@ -367,19 +391,24 @@ struct RasterStatistics
     std::uint64_t ShadedFragments = 0;
     std::uint64_t DepthRejectedFragments = 0;
     std::uint64_t DispatchedTiles = 0;
+    // CPU workers and GPU dispatch invocations are separate quantities.
     std::uint32_t WorkerThreads = 0;
+    std::uint64_t ComputeGroups = 0, ComputeInvocations = 0;
     double TransformMilliseconds = 0.0;
+    // Host elapsed time; asynchronous GPU paths report submission, not GPU duration.
     double RasterMilliseconds = 0.0;
+    bool PostClipCountAvailable = true;
     std::string ExecutionPath;
 };
 
 class RenderTarget
 {
 public:
+    std::shared_ptr<Renderer::GpuImage> GpuColor;
     RenderTarget() = default;
-    RenderTarget(std::uint32_t width, std::uint32_t height) { Resize(width, height); }
+    RenderTarget(std::uint32_t width, std::uint32_t height, bool cpuStorage = true) { Resize(width, height, cpuStorage); }
 
-    void Resize(std::uint32_t width, std::uint32_t height)
+    void Resize(std::uint32_t width, std::uint32_t height, bool cpuStorage = true)
     {
         if (width == 0 || height == 0)
         {
@@ -387,6 +416,9 @@ public:
         }
         Width_ = width;
         Height_ = height;
+        GpuColor.reset();
+        GpuOnly_ = !cpuStorage;
+        if (GpuOnly_) { Colors_.clear(); Depth_.clear(); return; }
         Colors_.resize(static_cast<std::size_t>(width) * height);
         Depth_.resize(static_cast<std::size_t>(width) * height);
         Clear({}, std::numeric_limits<float>::infinity());
@@ -401,8 +433,8 @@ public:
     [[nodiscard]] bool IsValid() const noexcept
     {
         return Width_ > 0 && Height_ > 0 &&
-               Colors_.size() == static_cast<std::size_t>(Width_) * Height_ &&
-               Depth_.size() == Colors_.size();
+               (GpuOnly_ || (Colors_.size() == static_cast<std::size_t>(Width_) * Height_ &&
+               Depth_.size() == Colors_.size()));
     }
     [[nodiscard]] std::uint32_t Width() const noexcept { return Width_; }
     [[nodiscard]] std::uint32_t Height() const noexcept { return Height_; }
@@ -434,6 +466,7 @@ private:
         return static_cast<std::size_t>(y) * Width_ + x;
     }
 
+    bool GpuOnly_ = false;
     std::uint32_t Width_ = 0;
     std::uint32_t Height_ = 0;
     std::vector<Color> Colors_;

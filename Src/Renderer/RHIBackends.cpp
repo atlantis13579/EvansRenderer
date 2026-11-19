@@ -1,10 +1,10 @@
 #include "Renderer/IRHI.h"
 
-#include "Renderer/DX11RHI.h"
-#include "Renderer/DX12RHI.h"
-#include "Renderer/MetalRHI.h"
-#include "Renderer/OpenGLESRHI.h"
-#include "Renderer/VulkanRHI.h"
+#include "Renderer/DX11/DX11RHI.h"
+#include "Renderer/DX12/DX12RHI.h"
+#include "Renderer/Metal/MetalRHI.h"
+#include "Renderer/OpenGLES/OpenGLESRHI.h"
+#include "Renderer/Vulkan/VulkanRHI.h"
 
 #include <algorithm>
 #include <cctype>

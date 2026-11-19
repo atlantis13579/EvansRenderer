@@ -36,6 +36,7 @@ namespace Evans::Maths
 		std::size_t GetLeafCount() const;
 		const AABB& GetBounds() const;
 		const std::vector<Node>& GetNodes() const { return m_Nodes; }
+		const std::vector<std::uint32_t>& GetPrimitiveIndices() const { return m_PrimitiveIndices; }
 		bool RayCast(const TriMesh& mesh, const Ray& ray, const TriMeshHitOptions& options, TriMeshHit& hit) const;
 
 	private:

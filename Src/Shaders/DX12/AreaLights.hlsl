@@ -1,0 +1,992 @@
+
+// DX12 world-space shadow queries. Woop, Benthin and Wald, JCGT 2013.
+// https://jcgt.org/published/0002/01/05/ . Forward escape links bound traversal;
+// independent alpha planes preserve bilinear cutout coverage. The RGBA32UI ABI
+// is described in RayTracedShadowScene.h. No screen-space visibility is assumed.
+Texture2D<uint4> ShadowRayScene : register(t20);
+static const uint ShadowRayCasterFlag=1u,ShadowRayImageABI=1u;
+static const uint ShadowRayCountsHeader=0u,ShadowRayOffsetsHeader=1u,ShadowRayTraceHeader=2u,ShadowRayLightHeader=3u;
+static const uint ShadowRayNodeSize=3u,ShadowRayTriangleSize=6u,ShadowRayMaterialSize=3u,ShadowRayScalarLanes=4u;
+static const uint ShadowRayNodeMaximum=1u,ShadowRayNodeLinks=2u;
+static const uint ShadowRayTriangleUV01=3u,ShadowRayTriangleUV2=4u,ShadowRayTriangleMetadata=5u;
+static const uint ShadowRayMaterialOpacity=1u,ShadowRayMaterialCoverageWord=2u;
+uint4 ShadowRayLoad(uint address)
+{ uint width,height; ShadowRayScene.GetDimensions(width,height); width=max(width,1u); return ShadowRayScene.Load(int3(address%width,address/width,0)); }
+struct ShadowRayNode { float4 Lower,Upper; uint4 Link; };
+struct ShadowRayTriangle { float4 P0,P1,P2,UV01,UV2; uint4 Identity; };
+struct ShadowRayMaterial { uint4 Diffuse,Opacity; float4 Alpha; };
+static const float ShadowRayHalfPixel=0.5;
+static const float ShadowRayBinary32Epsilon=1.1920928955078125e-7;
+static const float ShadowRayEdgeRoundoff=3*ShadowRayBinary32Epsilon/(1-3*ShadowRayBinary32Epsilon);
+ShadowRayNode ShadowRayReadNode(uint index)
+{
+    uint base=ShadowRayLoad(ShadowRayOffsetsHeader).x+index*ShadowRayNodeSize;
+    ShadowRayNode result;
+    result.Lower=asfloat(ShadowRayLoad(base));
+    result.Upper=asfloat(ShadowRayLoad(base+1u));
+    result.Link=ShadowRayLoad(base+2u);
+    return result;
+}
+ShadowRayTriangle ShadowRayReadTriangle(uint index)
+{
+    uint base=ShadowRayLoad(ShadowRayOffsetsHeader).y+index*ShadowRayTriangleSize;
+    ShadowRayTriangle result;
+    result.P0=asfloat(ShadowRayLoad(base));
+    result.P1=asfloat(ShadowRayLoad(base+1u));
+    result.P2=asfloat(ShadowRayLoad(base+2u));
+    result.UV01=asfloat(ShadowRayLoad(base+3u));
+    result.UV2=asfloat(ShadowRayLoad(base+4u));
+    result.Identity=ShadowRayLoad(base+5u);
+    return result;
+}
+ShadowRayMaterial ShadowRayReadMaterial(uint index)
+{
+    uint base=ShadowRayLoad(ShadowRayOffsetsHeader).z+index*ShadowRayMaterialSize;
+    ShadowRayMaterial result;
+    result.Diffuse=ShadowRayLoad(base);
+    result.Opacity=ShadowRayLoad(base+1u);
+    result.Alpha=asfloat(ShadowRayLoad(base+2u));
+    return result;
+}
+float ShadowRayScalar(uint index)
+{ uint4 value=ShadowRayLoad(ShadowRayLoad(ShadowRayOffsetsHeader).w+index/ShadowRayScalarLanes); return asfloat(value)[index%ShadowRayScalarLanes]; }
+float ShadowRayReadCoverage(uint4 map,float2 uv)
+{
+    if (!map.w) return 1;
+    float2 p=frac(float2(uv.x,-uv.y))*float2(map.yz)-ShadowRayHalfPixel;
+    uint x=p.x<0 ? map.y-1 : uint(floor(p.x)),y=p.y<0 ? map.z-1 : uint(floor(p.y));
+    uint nextX=x+1==map.y ? 0 : x+1,nextY=y+1==map.z ? 0 : y+1;
+    float upper=lerp(ShadowRayScalar(map.x+y*map.y+x),ShadowRayScalar(map.x+y*map.y+nextX),frac(p.x));
+    float lower=lerp(ShadowRayScalar(map.x+nextY*map.y+x),ShadowRayScalar(map.x+nextY*map.y+nextX),frac(p.x));
+    return lerp(upper,lower,frac(p.y));
+}
+bool ShadowRayInBounds(ShadowRayNode node,float3 origin,float3 ray,float limit)
+{
+    float nearDistance=0,farDistance=limit;
+    [unroll] for (uint dimension=0;dimension<3;++dimension)
+    {
+        if (ray[dimension]==0)
+        {
+            if (origin[dimension]<node.Lower[dimension] || origin[dimension]>node.Upper[dimension]) return false;
+            continue;
+        }
+        float first=(node.Lower[dimension]-origin[dimension])/ray[dimension];
+        float last=(node.Upper[dimension]-origin[dimension])/ray[dimension];
+        nearDistance=max(nearDistance,min(first,last)); farDistance=min(farDistance,max(first,last));
+        if (nearDistance>farDistance) return false;
+    }
+    return true;
+}
+float ShadowRayEdgeFunction(float2 first,float2 second)
+{
+    precise float positive=first.x*second.y,negative=first.y*second.x;
+    precise float signedArea=positive-negative;
+    return abs(signedArea)<=ShadowRayEdgeRoundoff*(abs(positive)+abs(negative)) ? 0 : signedArea;
+}
+bool ShadowRayHitTriangle(ShadowRayTriangle primitive,float3 origin,float3 ray,float limit,out float3 barycentric)
+{
+    barycentric=0;
+    uint major=abs(ray.x)>abs(ray.y) ? 0 : 1; if (abs(ray.z)>abs(ray[major])) major=2;
+    uint horizontal=(major+1)%3,vertical=(horizontal+1)%3;
+    float3 first=primitive.P0.xyz-origin,second=primitive.P1.xyz-origin,third=primitive.P2.xyz-origin;
+    float2 slope=float2(ray[horizontal],ray[vertical])/ray[major];
+    precise float2 a=float2(first[horizontal],first[vertical])-slope*first[major];
+    precise float2 b=float2(second[horizontal],second[vertical])-slope*second[major];
+    precise float2 c=float2(third[horizontal],third[vertical])-slope*third[major];
+    float3 area=float3(ShadowRayEdgeFunction(b,c),ShadowRayEdgeFunction(c,a),ShadowRayEdgeFunction(a,b));
+    if (any(area<0) && any(area>0)) return false;
+    float determinant=area.x+area.y+area.z; if (determinant==0) return false;
+    float distance=dot(area,float3(first[major],second[major],third[major]))/(determinant*ray[major]);
+    if (!(distance>0 && distance<=limit)) return false;
+    barycentric=area/determinant; return true;
+}
+bool ShadowRayAnyAcceptedHit(float3 origin,float3 ray,float limit)
+{
+    bool blocked=false;
+    uint address=0;
+    [loop] while (address<ShadowRayLoad(0u).y && !blocked)
+    {
+        ShadowRayNode node=ShadowRayReadNode(address);
+        if (!ShadowRayInBounds(node,origin,ray,limit)) { address=node.Link.w; continue; }
+        if (!node.Link.z) { address=node.Link.x; continue; }
+        [loop] for (uint local=0;local<node.Link.z && !blocked;++local)
+        {
+            ShadowRayTriangle primitive=ShadowRayReadTriangle(node.Link.y+local);
+            if ((primitive.Identity.w & ShadowRayCasterFlag)==0u) continue; float3 barycentric;
+            if (!ShadowRayHitTriangle(primitive,origin,ray,limit,barycentric)) continue;
+            ShadowRayMaterial material=ShadowRayReadMaterial(primitive.Identity.x); if (material.Alpha.y<=0) { blocked=true; break; }
+            float2 uv=barycentric.x*primitive.UV01.xy+barycentric.y*primitive.UV01.zw+barycentric.z*primitive.UV2.xy;
+            float alpha=dot(barycentric,float3(primitive.P0.w,primitive.P1.w,primitive.P2.w))*material.Alpha.x;
+            alpha*=ShadowRayReadCoverage(material.Diffuse,uv)*ShadowRayReadCoverage(material.Opacity,uv);
+            if (saturate(alpha)>=material.Alpha.y) { blocked=true; break; }
+        }
+        address=node.Link.w;
+    }
+    return blocked;
+}
+static const float ShadowRayNormalFloor=1e-12,ShadowRayOriginRoundoff=8.0*1.1920928955078125e-7;
+bool ShadowRayEnabled() { return ShadowRayLoad(ShadowRayCountsHeader).x!=0u && ShadowRayLoad(ShadowRayLightHeader).y==ShadowRayImageABI; }
+float ShadowRayVisibility(float3 position,float3 normal,float3 towardLight)
+{
+    if (!ShadowRayEnabled()) return 1.0;
+    float4 parameters=asfloat(ShadowRayLoad(ShadowRayTraceHeader));
+    float scale=max(abs(towardLight.x),max(abs(towardLight.y),abs(towardLight.z)));
+    if (!(scale>0.0) || !(all(isfinite(float4(position,scale))))) return 1.0;
+    float3 scaled=towardLight/scale; float magnitude=length(scaled);
+    float3 direction=scaled/magnitude;
+    bool finiteEmitter=ShadowRayLoad(ShadowRayLightHeader).x!=0u;
+    float limit=finiteEmitter?min(scale*magnitude,parameters.z):parameters.z;
+    if (!(limit>parameters.y)) return 1.0;
+    float normalSquared=dot(normal,normal);
+    float3 unitNormal=normalSquared>ShadowRayNormalFloor?normal*rsqrt(normalSquared):0.0;
+    float roundoff=ShadowRayOriginRoundoff*max(abs(position.x),max(abs(position.y),abs(position.z)));
+    float3 normalOffset=unitNormal*max(parameters.x,roundoff);
+    if (finiteEmitter)
+    {
+        // Bias the origin while preserving the actual emitter endpoint.
+        float3 endpointVector=towardLight-normalOffset;
+        float endpointScale=max(abs(endpointVector.x),max(abs(endpointVector.y),abs(endpointVector.z)));
+        if (!(endpointScale>0.0)) return 1.0;
+        float3 endpointUnit=endpointVector/endpointScale;
+        float endpointMagnitude=length(endpointUnit);
+        direction=endpointUnit/endpointMagnitude;
+        limit=min(endpointScale*endpointMagnitude,parameters.z);
+    }
+    float3 origin=position+normalOffset+direction*parameters.y;
+    limit-=parameters.y;
+    if (!(limit>0.0)) return 1.0;
+    if (!(all(isfinite(origin)))) return 1.0;
+    float visibility=1.0;
+    if (ShadowRayAnyAcceptedHit(origin,direction,limit)) visibility=0.0;
+    return visibility;
+}
+
+static const float ShadowRaySurfaceStrength=0.55;
+// Native D3D12 translucent Lumen receiver. The atlas contains signed, cosine-
+// convolved SH; division by pi below applies the diffuse BRDF exactly once.
+cbuffer LumenTranslucencyParameters : register(b9)
+{
+    row_major float4x4 TranslucentCamera,TranslucentInverse;
+    uint4 TranslucentCells;
+    float4 TranslucentDepthScale,TranslucentImageSize;
+};
+Texture2D<float4> TranslucentSH : register(t19);
+SamplerState TranslucentFilter : register(s2);
+static const float LumenDielectricReflectance=0.04;
+float3 LumenTranslucentIrradiance(float3 position,float3 n)
+{
+    if (TranslucentCells.w==0) return 0;
+    float4 homogeneous=mul(TranslucentCamera,float4(position,1));
+    if (homogeneous.w<=TranslucentImageSize.z) return 0;
+    float3 screen=homogeneous.xyz/homogeneous.w;
+    if (screen.z<0 || screen.z>1 || any(abs(screen.xy)>1)) return 0;
+    float4 originH=mul(TranslucentInverse,float4(screen.xy,0,1)),endH=mul(TranslucentInverse,float4(screen.xy,1,1));
+    if (min(abs(originH.w),abs(endH.w))<=TranslucentImageSize.z) return 0;
+    float3 origin=originH.xyz/originH.w;
+    float span=min(length(endH.xyz/endH.w-origin),TranslucentDepthScale.x),travel=length(position-origin);
+    if (span<=TranslucentImageSize.z || travel>span) return 0;
+    float2 screenUV=float2(screen.x*0.5+0.5,0.5-screen.y*0.5);
+    float3 location=float3(screenUV*TranslucentCells.xy,pow(saturate(travel/span),rcp(TranslucentDepthScale.y))*TranslucentCells.z)-0.5;
+    location=clamp(location,0,float3(TranslucentCells.xyz)-1);
+    float z0=floor(location.z),z1=min(z0+1,float(TranslucentCells.z-1));
+    n*=rsqrt(max(dot(n,n),TranslucentImageSize.w));
+    static const float SHPi=3.14159265358979323846;
+    static const uint SHCount=9;
+    float sh[SHCount]={sqrt(1/(4*SHPi)),sqrt(3/(4*SHPi))*n.y,sqrt(3/(4*SHPi))*n.z,sqrt(3/(4*SHPi))*n.x,
+        sqrt(15/(4*SHPi))*n.x*n.y,sqrt(15/(4*SHPi))*n.y*n.z,sqrt(5/(16*SHPi))*(3*n.z*n.z-1),
+        sqrt(15/(4*SHPi))*n.x*n.z,sqrt(15/(16*SHPi))*(n.x*n.x-n.y*n.y)};
+    float3 result=0;
+
+    static const uint VolumeVisibilityBit=2;
+    if ((TranslucentCells.w&VolumeVisibilityBit)!=0)
+    {
+        uint3 base=uint3(floor(location)); float3 fraction=frac(location);
+        // Unsupported corners keep zero weight in the original kernel; a
+        // surviving bright corner must not acquire the missing corner's mass.
+        [loop] for (uint corner=0;corner<8;++corner)
+        {
+            uint3 bit=uint3(corner&1,(corner>>1)&1,corner>>2),p=min(base+bit,TranslucentCells.xyz-1);
+            float weight=(bit.x?fraction.x:1-fraction.x)*(bit.y?fraction.y:1-fraction.y)*(bit.z?fraction.z:1-fraction.z); if (weight<=0) continue;
+            uint row=p.z*TranslucentCells.y+p.y; float radius=TranslucentSH.Load(int3(p.x,row,0)).w; if (radius<=0) continue;
+            float2 clipXY=float2(2*(float(p.x)+0.5)/TranslucentCells.x-1,1-2*(float(p.y)+0.5)/TranslucentCells.y);
+            float4 a=mul(TranslucentInverse,float4(clipXY,0,1)),b=mul(TranslucentInverse,float4(clipXY,1,1));
+            if (min(abs(a.w),abs(b.w))<=TranslucentImageSize.z) continue;
+            float3 start=a.xyz/a.w,axis=b.xyz/b.w-start; float spanToFar=length(axis);
+            if (!isfinite(spanToFar) || spanToFar<=TranslucentImageSize.z) continue;
+            float depth=pow((float(p.z)+0.5)/TranslucentCells.z,TranslucentDepthScale.y);
+            float3 probe=start+axis*(depth*min(spanToFar,TranslucentDepthScale.x)/spanToFar);
+            float separation=length(position-probe); if (!isfinite(separation) || separation>radius) continue;
+            [unroll] for (uint band=0;band<SHCount;++band)
+                result+=weight*sh[band]*TranslucentSH.Load(int3(p.x+band*TranslucentCells.x,row,0)).xyz;
+        }
+        return max(result,0)*TranslucentDepthScale.z/(SHPi*TranslucentDepthScale.w);
+    }
+    [unroll] for (uint band=0;band<SHCount;++band)
+    {
+        float column=band*TranslucentCells.x+location.x+0.5;
+        float2 low=float2(column,z0*TranslucentCells.y+location.y+0.5)/TranslucentImageSize.xy;
+        float2 high=float2(column,z1*TranslucentCells.y+location.y+0.5)/TranslucentImageSize.xy;
+        result+=sh[band]*lerp(TranslucentSH.SampleLevel(TranslucentFilter,low,0).xyz,
+            TranslucentSH.SampleLevel(TranslucentFilter,high,0).xyz,location.z-z0);
+    }
+    return max(result,0)*TranslucentDepthScale.z/(SHPi*TranslucentDepthScale.w);
+}
+
+// DX12 physically based rectangle emitters: midpoint surface quadrature of the
+// full GGX/Smith/Schlick BRDF. CPU preparation converts one-sided total power
+// to radiance (Phi = pi * area * Le); W selects the N x N integration grid.
+// Visibility comes from the selected raster shadow method, shared by emitter
+// samples. This does not claim exact per-sample visibility or analytic GGX.
+// Reference: PBRT 4e, Area Lights, https://pbr-book.org/4ed/Light_Sources/Area_Lights
+// Finite support is part of the light model, shared by every emitter sample.
+// Karis' smooth attenuation window; Filament, Punctual lights.
+float LightRangeWindow(float3 displacement, float range)
+{
+    if (range == 0.0f) return 1.0f;
+    float3 magnitude = abs(displacement);
+    if (max(magnitude.x, max(magnitude.y, magnitude.z)) >= range) return 0.0f;
+    float3 scaled = displacement / range;
+    float squaredRatio = dot(scaled, scaled);
+    float fade = max(1.0f - squaredRatio * squaredRatio, 0.0f);
+    return fade * fade;
+}
+
+// The independent contact producer supplies raw visibility for this raster sample.
+// Only the selected direct light consumes it. Primary map filters already apply
+// artistic strength, so the composition below applies that strength just once.
+#if defined(EVANS_CONTACT_RECEIVER)
+cbuffer ContactReceiver : register(b7) { uint ContactEnabled; };
+Texture2DArray<float> ContactImage : register(t15);
+#endif
+float ReadContactVisibility(float4 pixel, uint sampleIndex)
+{
+#if defined(EVANS_CONTACT_RECEIVER)
+    if (ContactEnabled != 0) return ContactImage.Load(int4(int2(pixel.xy), sampleIndex, 0));
+#endif
+    return 1.0f;
+}
+float CombineContactVisibility(float primary, float contact, float strength)
+{
+    return lerp(1.0f - strength, primary, contact);
+}
+
+// DX12 PBR shading: standalone native HLSL, with forward material prerequisites.
+// Numeric policy is explicit so these teaching shaders can be tuned without
+// searching expressions. Registers and vertex semantics belong to the API ABI.
+static const uint MaximumLights = 4u;
+static const float MaximumHalfFloatRadiance = 65504.0f;
+static const uint DirectionalLight = 0u;
+static const uint PointLight = 1u;
+static const float SrgbLinearScale = 12.92f;
+static const float SrgbOffset = 0.055f;
+static const float SrgbScale = 1.055f;
+static const float SrgbGamma = 2.4f;
+static const float SrgbThreshold = 0.04045f;
+static const float NormalLengthEpsilon = 1.0e-12f;
+static const float ProjectionEpsilon = 1.0e-7f;
+static const float TangentDeterminantEpsilon = 1.0e-10f;
+static const float LightDistanceEpsilon = 1.0e-6f;
+static const float ParallelAxisLimit = 0.999f;
+static const float ShadowMinimumCosine = 0.15f;
+static const float ShadowMaximumBias = 0.0045f;
+static const float ShadowConstantBias = 0.00035f;
+static const float ShadowSlopeBias = 0.00060f;
+
+static const float ShadowStrength = 0.55f;
+static const float CoverageNoiseScale = 52.9829189f;
+static const float2 CoverageNoiseDirection = float2(0.06711056f, 0.00583715f);
+static const int AreaSamplesPerAxis = 2;
+static const float AreaSampleOffset = 0.25f;
+static const float AreaSampleWeight = 0.25f;
+static const float OutlineWorldScale = 0.01f;
+static const float OutlineModeThreshold = 1.5f;
+static const float ByteMaximum = 255.0f;
+static const float PackedOutlineMaximum = 65535.0f;
+static const uint OutlineRadiusShift = 8u;
+
+struct LightConstants
+{
+    float4 PositionType;
+    float4 DirectionIntensity;
+    float4 ColorCastShadows;
+    float4 AreaSizePadding;
+};
+
+cbuffer DrawConstants : register(b0)
+{
+    row_major float4x4 World;
+    row_major float4x4 NormalWorld;
+    row_major float4x4 ViewProjection;
+    row_major float4x4 LightViewProjection;
+    float4 PipelineColor;
+    float4 MaterialDiffuseColor;
+    float4 MaterialAmbientColor;
+    float4 MaterialSpecularColor;
+    float4 MaterialEmissiveColor;
+    float4 MaterialParameters;
+    float4 AmbientColorStrength;
+    float4 CameraLightCount;
+    float4 RenderParameters;
+    uint4 TextureFlags;
+    LightConstants Lights[MaximumLights];
+    float4 ShadingParameters; // roughness, metallic, toon bands, HDR output
+};
+
+Texture2D<float> ShadowMap : register(t0);
+Texture2D<float4> DiffuseMap : register(t1);
+Texture2D<float4> NormalMap : register(t2);
+Texture2D<float4> OpacityMap : register(t3);
+SamplerState SurfaceSampler : register(s0);
+
+float3 SRGBToLinear(float3 color)
+{
+    float3 low = color / SrgbLinearScale;
+    float3 high = pow((color + SrgbOffset) / SrgbScale, SrgbGamma);
+    return float3(
+        color.r <= SrgbThreshold ? low.r : high.r,
+        color.g <= SrgbThreshold ? low.g : high.g,
+        color.b <= SrgbThreshold ? low.b : high.b);
+}
+
+float3 PrepareDisplayLinear(float3 color)
+{
+    color = max(color, 0.0f);
+    // Float scene attachments retain radiance for the later HDR chain.
+    if (ShadingParameters.w > 0.5f) return min(color, MaximumHalfFloatRadiance);
+    color /= max(1.0f, max(color.r, max(color.g, color.b)));
+    return saturate(color);
+}
+
+float3 NormalizeSafe(float3 value, float3 fallback)
+{
+    float lengthSquared = dot(value, value);
+    return lengthSquared > NormalLengthEpsilon ? value * rsqrt(lengthSquared) : fallback;
+}
+
+struct VSInput
+{
+    float3 Position : POSITION;
+    float3 Normal : NORMAL;
+    float4 Color : COLOR0;
+    float2 TexCoord : TEXCOORD0;
+};
+
+struct VSOutput
+{
+    precise float4 Position : SV_POSITION;
+    float3 WorldPosition : TEXCOORD0;
+    float3 Normal : TEXCOORD1;
+    float4 Color : COLOR0;
+    float4 LightPosition : TEXCOORD2;
+    float2 TexCoord : TEXCOORD3;
+};
+
+VSOutput VSMain(VSInput input)
+{
+    VSOutput output;
+    float4 worldPosition = mul(World, float4(input.Position, 1.0f));
+    float3 worldNormal = NormalizeSafe(
+        mul((float3x3)NormalWorld, input.Normal),
+        float3(0.0f, 1.0f, 0.0f));
+    if (RenderParameters.y > OutlineModeThreshold)
+    {
+        worldPosition.xyz += worldNormal * (MaterialParameters.w * OutlineWorldScale);
+    }
+    output.Position = mul(ViewProjection, worldPosition);
+    output.WorldPosition = worldPosition.xyz / max(abs(worldPosition.w), ProjectionEpsilon);
+    output.Normal = worldNormal;
+    output.Color = float4(SRGBToLinear(saturate(input.Color.rgb)), input.Color.a);
+    output.LightPosition = mul(LightViewProjection, worldPosition);
+    output.TexCoord = float2(input.TexCoord.x, 1.0f - input.TexCoord.y);
+    return output;
+}
+
+float4 SampleDiffuse(float2 texCoord)
+{
+    return TextureFlags.x != 0
+        ? DiffuseMap.Sample(SurfaceSampler, texCoord)
+        : float4(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+float SampleOpacity(float2 texCoord)
+{
+    return TextureFlags.z != 0
+        ? OpacityMap.Sample(SurfaceSampler, texCoord).r
+        : 1.0f;
+}
+
+float SurfaceAlpha(VSOutput input, float4 diffuseSample)
+{
+    return saturate(
+        input.Color.a *
+        MaterialParameters.y *
+        diffuseSample.a *
+        SampleOpacity(input.TexCoord));
+}
+
+void ApplyAlphaClip(float alpha)
+{
+    if (MaterialParameters.z > 0.0f)
+    {
+        clip(alpha - MaterialParameters.z);
+    }
+}
+
+// CSM: positive eye-depth intervals choose one map, or two in their overlap.
+// The terminal interval blends toward an unshadowed receiver. Separate resource
+// declarations match independent DX12 descriptor tables at t10 through t13.
+static const uint SplitCapacity = 4u;
+
+static const float SplitDarkening = 0.55f;
+static const float SplitBiasBase = 0.00035f;
+static const float SplitBiasSlope = 0.00060f;
+static const float SplitBiasLimit = 0.0045f;
+static const float SplitCosineFloor = 0.15f;
+static const float SplitVectorEpsilon = 1.0e-12f;
+cbuffer CascadeUniforms : register(b2)
+{
+    row_major float4x4 SplitToLight[SplitCapacity];
+    float4 SplitEndDistances;
+    float4 SplitFadeDistances;
+    float4 CameraDistancePlane;
+    float4 SplitRange; // near, far, count, map resolution
+    float4 ShadowFiltering; // radius (zero means hard), comparison count, reserved
+};
+Texture2D<float> SplitDepth0 : register(t10);
+Texture2D<float> SplitDepth1 : register(t11);
+Texture2D<float> SplitDepth2 : register(t12);
+Texture2D<float> SplitDepth3 : register(t13);
+float SplitDepthAt(uint index, int2 coordinate)
+{
+    if (index == 0u) return SplitDepth0.Load(int3(coordinate, 0));
+    if (index == 1u) return SplitDepth1.Load(int3(coordinate, 0));
+    if (index == 2u) return SplitDepth2.Load(int3(coordinate, 0));
+    return SplitDepth3.Load(int3(coordinate, 0));
+}
+float SplitComparison(uint index, int2 coordinate, float receiver)
+{
+    int2 limit = int2(SplitRange.ww) - 1;
+    return receiver > SplitDepthAt(index, clamp(coordinate, 0, limit)) ? 1.0f : 0.0f;
+}
+float SplitVisibility(uint index, float3 position, float bias)
+{
+    // Fitting produces affine light matrices with homogeneous W equal to one.
+    float3 light = mul(SplitToLight[index], float4(position, 1.0f)).xyz;
+    float2 texcoord = float2(light.x + 1.0f, 1.0f - light.y) * 0.5f;
+    if (light.z < 0.0f || light.z > 1.0f || any(texcoord < 0.0f) || any(texcoord > 1.0f)) return 1.0f;
+    if (ShadowFiltering.x == 0.0f)
+        return 1.0f - SplitDarkening * SplitComparison(index, int2(floor(texcoord * SplitRange.w)), light.z - bias);
+    float2 texel = texcoord * SplitRange.w - 0.5f;
+    int2 origin = int2(floor(texel));
+    float2 interpolation = frac(texel);
+    float receiver = light.z - bias;
+    float occluded = 0.0f;
+    // Compact loops avoid expanding four resource-selection branches per tap.
+    [loop] for (int row = -int(ShadowFiltering.x); row <= int(ShadowFiltering.x); ++row)
+        [loop] for (int column = -int(ShadowFiltering.x); column <= int(ShadowFiltering.x); ++column)
+        {
+            int2 pixel = origin + int2(column, row);
+            float top = lerp(SplitComparison(index, pixel, receiver),
+                SplitComparison(index, pixel + int2(1, 0), receiver), interpolation.x);
+            float bottom = lerp(SplitComparison(index, pixel + int2(0, 1), receiver),
+                SplitComparison(index, pixel + 1, receiver), interpolation.x);
+            occluded += lerp(top, bottom, interpolation.y);
+        }
+    return 1.0f - occluded * (1.0f / ShadowFiltering.y) * SplitDarkening;
+}
+// Virtual shadows share the cascade receiver slots. End distances describe the
+// logical hierarchy; fade distances describe the physical atlas and directory.
+// Point reads plus per-corner indirection keep unrelated physical tiles apart.
+static const uint VirtualGutter = 1;
+static const float VirtualPixelCenter = 0.5f;
+float2 VirtualStoredDepth(float2 coordinate, uint minimumLevel)
+{
+    uint4 hierarchy = uint4(SplitEndDistances), atlas = uint4(SplitFadeDistances);
+    uint rowPages = hierarchy.x / hierarchy.y, levelOffset = 0;
+    [loop] for (uint level = 0; level < hierarchy.z; ++level)
+    {
+        if (level >= minimumLevel)
+        {
+            uint resolution = rowPages * hierarchy.y;
+            uint2 texel = min(uint2(coordinate * resolution), resolution - 1);
+            uint2 page = texel / hierarchy.y;
+            uint entryIndex = levelOffset + page.x + page.y * rowPages;
+            int2 tablePixel = int2(entryIndex % hierarchy.w, entryIndex / hierarchy.w);
+            uint encodedSlot = uint(round(SplitDepth1.Load(int3(tablePixel, 0)).x * atlas.w));
+            if (encodedSlot > 0)
+            {
+                uint slot = encodedSlot - 1;
+                uint2 origin = uint2(slot % atlas.z, slot / atlas.z) * (hierarchy.y + 2 * VirtualGutter);
+                uint2 location = origin + VirtualGutter + texel % hierarchy.y;
+                return float2(SplitDepth0.Load(int3(location, 0)).x, level);
+            }
+        }
+        levelOffset += rowPages * rowPages; rowPages /= 2;
+    }
+    return float2(1, hierarchy.z - 1);
+}
+// Compare receiver and caster at the same resolved virtual texel center.
+// The actual ancestor mip is essential when detail pages are not resident.
+float2 VirtualReceiverGradient(float2 uv, float depth)
+{
+    float2 x = ddx(uv), y = ddy(uv);
+    float zx = ddx(depth), zy = ddy(depth);
+    float determinant = x.x * y.y - x.y * y.x;
+    float scale = max(dot(x, x) * dot(y, y), 1.0e-30);
+    if (determinant * determinant <= scale * 1.0e-12) return float2(0.0, 0.0);
+    return float2(y.y * zx - x.y * zy, x.x * zy - y.x * zx) / determinant;
+}
+float VirtualReceiverAt(float2 sampleUv, uint actualMip, float2 receiverUv, float receiver, float2 gradient)
+{
+    float resolution = float(uint(SplitEndDistances.x) >> actualMip);
+    float2 pixel = clamp(floor(sampleUv * resolution), float2(0.0, 0.0), float2(resolution - 1.0, resolution - 1.0));
+    float2 center = (pixel + float2(0.5, 0.5)) / resolution;
+    // Depth one is also the empty atlas value; extrapolation beyond the far plane must remain lit.
+    return min(1.0, receiver + dot(center - receiverUv, gradient));
+}
+float VirtualComparison(int2 pixel, uint mip, float2 receiverUv, float receiver, float2 gradient)
+{
+    uint resolution = uint(SplitEndDistances.x) >> mip;
+    float2 uv = (float2(clamp(pixel, int2(0, 0), int2(int(resolution) - 1, int(resolution) - 1))) + float2(0.5, 0.5)) / float(resolution);
+    float2 stored = VirtualStoredDepth(uv, mip);
+    return VirtualReceiverAt(uv, uint(stored.y), receiverUv, receiver, gradient) <= stored.x ? 1.0 : 0.0;
+}
+float VirtualVisibility(float3 position, float bias)
+{
+    float4 light = mul(SplitToLight[0], float4(position, 1.0));
+    float3 projected = light.xyz / max(light.w, CameraDistancePlane.w);
+    float2 uv = float2(projected.x, -projected.y) * 0.5 + float2(0.5, 0.5);
+    float2 gradient = VirtualReceiverGradient(uv, projected.z);
+    float footprint = max(length(ddx(uv) * CameraDistancePlane.y), length(ddy(uv) * CameraDistancePlane.z)) * SplitEndDistances.x;
+    uint mip = uint(clamp(floor(log2(max(1.0, footprint)) + CameraDistancePlane.x), 0.0, SplitEndDistances.z - 1.0));
+    if (light.w <= CameraDistancePlane.w || any(uv < 0.0) || any(uv > 1.0) || projected.z < 0.0 || projected.z > 1.0) return 1.0;
+    float2 stored = VirtualStoredDepth(uv, mip);
+    float receiver = projected.z - bias;
+    if (ShadowFiltering.x == 0.0)
+        return VirtualReceiverAt(uv, uint(stored.y), uv, receiver, gradient) <= stored.x ? 1.0 : 0.0;
+    mip = uint(stored.y);
+    float2 texel = uv * float(uint(SplitEndDistances.x) >> mip) - float2(0.5, 0.5);
+    int2 first = int2(floor(texel)); float2 weight = frac(texel); float visible = 0.0;
+    for (int y = -int(ShadowFiltering.x); y <= int(ShadowFiltering.x); ++y)
+        for (int x = -int(ShadowFiltering.x); x <= int(ShadowFiltering.x); ++x)
+        {
+            int2 p = first + int2(x, y);
+            float a = VirtualComparison(p, mip, uv, receiver, gradient);
+            float b = VirtualComparison(p + int2(1, 0), mip, uv, receiver, gradient);
+            float c = VirtualComparison(p + int2(0, 1), mip, uv, receiver, gradient);
+            float d = VirtualComparison(p + int2(1, 1), mip, uv, receiver, gradient);
+            visible += lerp(lerp(a, b, weight.x), lerp(c, d, weight.x), weight.y);
+        }
+    return visible / ShadowFiltering.y;
+}
+
+
+float CascadedReceiverVisibility(float3 position, float3 normal, float3 towardLight)
+{
+    if (ShadowFiltering.z != 0)
+    {
+        float cosine = saturate(dot(normal, towardLight * rsqrt(max(dot(towardLight, towardLight), SplitVectorEpsilon))));
+        float slope = sqrt(max(1 - cosine * cosine, 0)) / max(cosine, SplitCosineFloor);
+        float bias = min(SplitBiasLimit, SplitBiasBase + SplitBiasSlope * slope);
+        return 1 - SplitDarkening * (1 - VirtualVisibility(position, bias));
+    }
+    float eyeDistance = dot(CameraDistancePlane, float4(position, 1.0f));
+    if (eyeDistance < SplitRange.x || eyeDistance > SplitRange.y) return 1.0f;
+    float cosine = saturate(dot(normal, towardLight * rsqrt(max(dot(towardLight, towardLight), SplitVectorEpsilon))));
+    float slope = sqrt(max(1.0f - cosine * cosine, 0.0f)) / max(cosine, SplitCosineFloor);
+    float bias = min(SplitBiasLimit, SplitBiasBase + SplitBiasSlope * slope);
+    uint count = uint(SplitRange.z);
+    [loop] for (uint index = 0u; index < count; ++index)
+    {
+        if (eyeDistance > SplitEndDistances[index]) continue;
+        float visibility = SplitVisibility(index, position, bias);
+        float overlap = SplitEndDistances[index] - SplitFadeDistances[index];
+        if (overlap > 0.0f && eyeDistance >= SplitFadeDistances[index])
+        {
+            float nextVisibility = 1.0f;
+            if (index + 1u < count) nextVisibility = SplitVisibility(index + 1u, position, bias);
+            float weight = saturate((eyeDistance - SplitFadeDistances[index]) / overlap);
+            visibility = lerp(visibility, nextVisibility, weight);
+        }
+        return visibility;
+    }
+    return 1.0f;
+}
+
+float SampleShadow(
+    float3 receiverWorld,
+    float4 lightPosition,
+    float3 surfaceNormal,
+    float3 directionToLight)
+{
+    if (RenderParameters.x>=0.5f && ShadowRayEnabled()) return 1.0-ShadowRaySurfaceStrength*(1.0-ShadowRayVisibility(receiverWorld,surfaceNormal,directionToLight));
+    if (RenderParameters.x >= 0.5f && SplitRange.z > 0.0f)
+        return CascadedReceiverVisibility(receiverWorld, surfaceNormal, directionToLight);
+    if (RenderParameters.x < 0.5f || abs(lightPosition.w) < ProjectionEpsilon)
+    {
+        return 1.0f;
+    }
+    float3 projected = lightPosition.xyz / lightPosition.w;
+    float2 uv = float2(projected.x * 0.5f + 0.5f, 0.5f - projected.y * 0.5f);
+    if (any(uv < 0.0f) || any(uv > 1.0f) || projected.z < 0.0f || projected.z > 1.0f)
+    {
+        return 1.0f;
+    }
+    uint width;
+    uint height;
+    ShadowMap.GetDimensions(width, height);
+    if (width == 0 || height == 0) return 1.0f;
+
+    float directionLengthSquared = dot(directionToLight, directionToLight);
+    float3 direction = directionLengthSquared > NormalLengthEpsilon
+        ? directionToLight * rsqrt(directionLengthSquared)
+        : surfaceNormal;
+    float normalToLight = saturate(dot(surfaceNormal, direction));
+    float sineToLight = sqrt(max(1.0f - normalToLight * normalToLight, 0.0f));
+    float slope = sineToLight / max(normalToLight, ShadowMinimumCosine);
+    float receiverBias = min(ShadowMaximumBias, ShadowConstantBias + ShadowSlopeBias * slope);
+    // Hard shadows bypass the bilinear comparison kernel.
+    if (ShadowFiltering.x == 0.0f)
+    {
+        int2 pixel = clamp(int2(floor(uv * float2(width, height))), 0, int2(width, height) - 1);
+        return 1.0f - ShadowStrength * ((projected.z - receiverBias) > ShadowMap.Load(int3(pixel, 0)) ? 1.0f : 0.0f);
+    }
+    float2 texelPosition = uv * float2(width, height) - 0.5f;
+    float2 interpolation = frac(texelPosition);
+    int2 basePixel = int2(floor(texelPosition));
+    float occlusion = 0.0f;
+    [loop]
+    for (int y = -int(ShadowFiltering.x); y <= int(ShadowFiltering.x); ++y)
+    {
+        [loop]
+        for (int x = -int(ShadowFiltering.x); x <= int(ShadowFiltering.x); ++x)
+        {
+            int2 pixel00 = clamp(basePixel + int2(x, y), int2(0, 0), int2(width - 1, height - 1));
+            int2 pixel10 = clamp(pixel00 + int2(1, 0), int2(0, 0), int2(width - 1, height - 1));
+            int2 pixel01 = clamp(pixel00 + int2(0, 1), int2(0, 0), int2(width - 1, height - 1));
+            int2 pixel11 = clamp(pixel00 + int2(1, 1), int2(0, 0), int2(width - 1, height - 1));
+            float comparisonDepth = projected.z - receiverBias;
+            float comparison00 = comparisonDepth > ShadowMap.Load(int3(pixel00, 0)) ? 1.0f : 0.0f;
+            float comparison10 = comparisonDepth > ShadowMap.Load(int3(pixel10, 0)) ? 1.0f : 0.0f;
+            float comparison01 = comparisonDepth > ShadowMap.Load(int3(pixel01, 0)) ? 1.0f : 0.0f;
+            float comparison11 = comparisonDepth > ShadowMap.Load(int3(pixel11, 0)) ? 1.0f : 0.0f;
+            float comparisonTop = lerp(comparison00, comparison10, interpolation.x);
+            float comparisonBottom = lerp(comparison01, comparison11, interpolation.x);
+            occlusion += lerp(comparisonTop, comparisonBottom, interpolation.y);
+        }
+    }
+    return 1.0f - ShadowStrength * occlusion / ShadowFiltering.y;
+}
+
+float3 ResolveSurfaceNormal(VSOutput input, bool isFrontFace)
+{
+    float3 normal = NormalizeSafe(input.Normal, float3(0.0f, 1.0f, 0.0f));
+    if (!isFrontFace) normal = -normal;
+    if (TextureFlags.y == 0) return normal;
+
+    float3 positionDx = ddx(input.WorldPosition);
+    float3 positionDy = ddy(input.WorldPosition);
+    float2 texCoordDx = ddx(input.TexCoord);
+    float2 texCoordDy = ddy(input.TexCoord);
+    float determinant = texCoordDx.x * texCoordDy.y - texCoordDx.y * texCoordDy.x;
+    if (abs(determinant) < TangentDeterminantEpsilon) return normal;
+    float inverseDeterminant = rcp(determinant);
+    float3 tangent = (positionDx * texCoordDy.y - positionDy * texCoordDx.y) * inverseDeterminant;
+    float3 sourceBitangent = (-positionDx * texCoordDy.x + positionDy * texCoordDx.x) * inverseDeterminant;
+    tangent -= normal * dot(normal, tangent);
+    float3 helper = abs(normal.y) < ParallelAxisLimit
+        ? float3(0.0f, 1.0f, 0.0f)
+        : float3(1.0f, 0.0f, 0.0f);
+    tangent = NormalizeSafe(tangent, NormalizeSafe(
+        cross(helper, normal), float3(1.0f, 0.0f, 0.0f)));
+    float handedness = dot(cross(normal, tangent), sourceBitangent) < 0.0f ? -1.0f : 1.0f;
+    float3 bitangent = NormalizeSafe(
+        cross(normal, tangent) * handedness, float3(0.0f, 0.0f, 1.0f));
+    float3 tangentNormal = NormalMap.Sample(SurfaceSampler, input.TexCoord).xyz * 2.0f - 1.0f;
+    return NormalizeSafe(
+        tangent * tangentNormal.x +
+        bitangent * tangentNormal.y +
+        normal * tangentNormal.z,
+        normal);
+}
+
+// A metallic/roughness Cook-Torrance BRDF. GGX controls the normal
+// distribution; separable Smith masking and Schlick Fresnel conserve the
+// reflected/diffuse energy split. Walter et al., EGSR 2007:
+// https://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf
+float SmithMasking(float cosine, float alphaSquared)
+{
+    const float MaskingEpsilon = 1.0e-6f;
+    float projectedVariance = alphaSquared + (1.0f - alphaSquared) * cosine * cosine;
+    return (2.0f * cosine) / max(cosine + sqrt(projectedVariance), MaskingEpsilon);
+}
+
+void AccumulateLightSample(float2 roughnessMetallic,
+    float3 lightDirection, float3 radiance, float visibility,
+    float3 normal, float3 viewDirection,
+    inout float3 diffuseLight, inout float3 specularLight, float3 baseColor)
+{
+    const float Pi = 3.14159265359f;
+    const float MinimumRoughness = 0.045f;
+    const float DielectricF0 = 0.04f;
+    const float BrdfEpsilon = 1.0e-6f;
+    const float DistributionEpsilon = 1.0e-12f;
+    const float FresnelPower = 5.0f;
+    float3 light = NormalizeSafe(lightDirection, normal);
+    float lightCosine = saturate(dot(normal, light));
+    float viewCosine = saturate(dot(normal, viewDirection));
+    if (lightCosine == 0.0f || viewCosine == 0.0f) return;
+    float3 halfway = NormalizeSafe(viewDirection + light, normal);
+    float normalHalf = saturate(dot(normal, halfway));
+    float viewHalf = saturate(dot(viewDirection, halfway));
+    float perceptualRoughness = max(MinimumRoughness, saturate(roughnessMetallic.x));
+    float alpha = perceptualRoughness * perceptualRoughness;
+    float alphaSquared = alpha * alpha;
+    float ggxDenominator = 1.0f + (alphaSquared - 1.0f) * normalHalf * normalHalf;
+    float ggx = alphaSquared / max(Pi * ggxDenominator * ggxDenominator, DistributionEpsilon);
+    float metal = saturate(roughnessMetallic.y);
+    float3 f0 = lerp(float3(DielectricF0, DielectricF0, DielectricF0), saturate(baseColor), metal);
+    float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - viewHalf, FresnelPower);
+    float geometry = SmithMasking(lightCosine, alphaSquared) * SmithMasking(viewCosine, alphaSquared);
+    float3 irradiance = max(radiance, 0.0f) * visibility * lightCosine;
+    float3 diffuseWeight = (1.0f - fresnel) * (1.0f - metal);
+    diffuseLight += irradiance * diffuseWeight / Pi;
+    specularLight += irradiance * fresnel * ggx * geometry / max(4.0f * lightCosine * viewCosine, BrdfEpsilon);
+}
+
+void AccumulateSceneLight(float2 roughnessMetallic,
+    uint lightIndex,
+    VSOutput input,
+    float3 normal,
+    float3 viewDirection,
+    float contactVisibility,
+    inout float3 diffuseLight,
+    inout float3 specularLight, float3 baseColor)
+{
+    LightConstants light = Lights[lightIndex];
+    uint type = (uint)(light.PositionType.w + 0.5f);
+    float3 shadowDirection = type == DirectionalLight
+        ? light.DirectionIntensity.xyz
+        : light.PositionType.xyz - input.WorldPosition;
+    bool isShadowLight =
+        int(lightIndex) == int(RenderParameters.z) &&
+        light.ColorCastShadows.w > 0.5f;
+    float visibility = isShadowLight
+        ? SampleShadow(input.WorldPosition, input.LightPosition, normal, shadowDirection)
+        : 1.0f;
+    if (isShadowLight) visibility = CombineContactVisibility(visibility, contactVisibility, ShadowStrength);
+    float3 radiance =
+        max(light.ColorCastShadows.rgb, 0.0f) *
+        max(light.DirectionIntensity.w, 0.0f);
+    if (type == DirectionalLight)
+    {
+        AccumulateLightSample(roughnessMetallic,
+            light.DirectionIntensity.xyz, radiance, visibility,
+            normal, viewDirection, diffuseLight, specularLight, baseColor);
+        return;
+    }
+    if (type == PointLight)
+    {
+        float3 toLight = light.PositionType.xyz - input.WorldPosition;
+        float distanceSquared = max(dot(toLight, toLight), LightDistanceEpsilon);
+        AccumulateLightSample(roughnessMetallic,
+            toLight, radiance * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared, visibility,
+            normal, viewDirection, diffuseLight, specularLight, baseColor);
+        return;
+    }
+
+    float3 emissionDirection = NormalizeSafe(
+        light.DirectionIntensity.xyz, float3(0.0f, -1.0f, 0.0f));
+    float3 helper = abs(emissionDirection.y) < ParallelAxisLimit
+        ? float3(0.0f, 1.0f, 0.0f)
+        : float3(1.0f, 0.0f, 0.0f);
+    float3 tangent = NormalizeSafe(
+        cross(helper, emissionDirection), float3(1.0f, 0.0f, 0.0f));
+    float3 bitangent = NormalizeSafe(
+        cross(emissionDirection, tangent), float3(0.0f, 0.0f, 1.0f));
+    // Area-to-solid-angle Jacobian: dA * emitterCosine / distanceSquared.
+    const float MinimumEmitterGrid = 2.0, MaximumEmitterGrid = 16.0;
+    const float EmitterStratumCenter = 0.5;
+    bool physicalEmitter = light.AreaSizePadding.w > 0.0;
+    int emitterGrid = physicalEmitter ? int(clamp(light.AreaSizePadding.w, MinimumEmitterGrid, MaximumEmitterGrid)) : AreaSamplesPerAxis;
+    float emitterSampleWeight = (physicalEmitter ? abs(light.AreaSizePadding.x * light.AreaSizePadding.y) : 1.0) / float(emitterGrid * emitterGrid);
+    [loop]
+    for (int sampleY = 0; sampleY < emitterGrid; ++sampleY)
+    {
+        [loop]
+        for (int sampleX = 0; sampleX < emitterGrid; ++sampleX)
+        {
+            float offsetX = ((float(sampleX) + EmitterStratumCenter) / float(emitterGrid) - EmitterStratumCenter);
+            float offsetY = ((float(sampleY) + EmitterStratumCenter) / float(emitterGrid) - EmitterStratumCenter);
+            float3 samplePosition =
+                light.PositionType.xyz +
+                tangent * (offsetX * light.AreaSizePadding.x) +
+                bitangent * (offsetY * light.AreaSizePadding.y);
+            float3 toLight = samplePosition - input.WorldPosition;
+            float distanceSquared = max(dot(toLight, toLight), LightDistanceEpsilon);
+            float3 direction = toLight * rsqrt(distanceSquared);
+            float emitterCosine = max(dot(emissionDirection, -direction), 0.0f);
+            AccumulateLightSample(roughnessMetallic,
+                direction,
+                radiance * (emitterSampleWeight * emitterCosine * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared),
+                visibility, normal, viewDirection, diffuseLight, specularLight, baseColor);
+        }
+    }
+}
+
+// The surface reads a generated cumulative transport volume at its own depth.
+// Integration belongs to the standalone VolumetricFog technique. Keep this
+// small consumer local so shading sources remain independently compilable.
+cbuffer SurfaceVolumeParameters : register(b4)
+{
+    row_major float4x4 VolumeInverseCamera;
+    float4 VolumeMedium;
+    float4 VolumeAmbientSource;
+    float4 VolumeDimensions;
+    uint4 VolumeSettings;
+};
+Texture2D<float4> SurfaceVolume : register(t14);
+SamplerState SurfaceVolumeSampler : register(s1);
+static const float VolumeDistanceFloor = 1.0e-6f;
+static const float VolumeHalfFloatLimit = 65504.0f;
+
+float3 VolumePoint(float2 ndcXY, float depth)
+{
+    float4 homogeneous = mul(VolumeInverseCamera, float4(ndcXY, depth, 1));
+    return homogeneous.xyz / homogeneous.w;
+}
+// Paired transport planes keep colored extinction separate from source radiance.
+static const uint RgbTransportMode = 2;
+float4 VolumeBoundaryTransmission(float2 rayUV, uint endpoint)
+{
+    if (endpoint == 0) return float4(1, 1, 1, 1);
+    float2 cell = clamp(rayUV * VolumeDimensions.zw, 0.5f, VolumeDimensions.zw - 0.5f);
+    cell.x += (endpoint - 1) * VolumeDimensions.z;
+    float2 extent = float2(VolumeDimensions.z * VolumeSettings.y, VolumeDimensions.w);
+    cell.y = (cell.y + extent.y) * 0.5;
+    return SurfaceVolume.SampleLevel(SurfaceVolumeSampler, cell / extent, 0);
+}
+float4 VolumeBoundary(float2 rayUV, uint endpoint)
+{
+    if (endpoint == 0) return float4(0, 0, 0, 1);
+    float2 cell = clamp(rayUV * VolumeDimensions.zw, 0.5f, VolumeDimensions.zw - 0.5f);
+    cell.x += (endpoint - 1) * VolumeDimensions.z;
+    float2 extent = float2(VolumeDimensions.z * VolumeSettings.y, VolumeDimensions.w);
+    if (VolumeSettings.w == RgbTransportMode) cell.y *= 0.5;
+    return SurfaceVolume.SampleLevel(SurfaceVolumeSampler, cell / extent, 0);
+}
+float3 TransportSurfaceRadiance(float3 incoming, float4 pixelPosition)
+{
+    if (VolumeSettings.w == 0) return incoming;
+    float2 rayUV = pixelPosition.xy / VolumeDimensions.xy;
+    float2 ndcXY = float2(rayUV.x * 2 - 1, 1 - rayUV.y * 2);
+    float3 start = VolumePoint(ndcXY, 0);
+    float fullDistance = min(length(VolumePoint(ndcXY, 1) - start), VolumeMedium.w);
+    float fraction = saturate(length(VolumePoint(ndcXY, pixelPosition.z) - start) /
+        max(fullDistance, VolumeDistanceFloor));
+    float continuousBoundary = fraction * VolumeSettings.y;
+    uint boundary = (uint)continuousBoundary;
+    float4 integrated = lerp(VolumeBoundary(rayUV, boundary),
+        VolumeBoundary(rayUV, min(boundary + 1, VolumeSettings.y)), continuousBoundary - boundary);
+    float3 mediumTransmission = VolumeSettings.w == RgbTransportMode ? (lerp(VolumeBoundaryTransmission(rayUV, boundary),
+        VolumeBoundaryTransmission(rayUV, min(boundary + 1, VolumeSettings.y)), continuousBoundary - boundary)).rgb : integrated.aaa;
+    return clamp(incoming * mediumTransmission + integrated.rgb, 0, VolumeHalfFloatLimit);
+}
+
+#if defined(EVANS_CONTACT_RECEIVER)
+float4 PSContact(VSOutput input, bool isFrontFace : SV_IsFrontFace, uint contactSample : SV_SampleIndex) : SV_TARGET
+#else
+float4 PSMain(VSOutput input, bool isFrontFace : SV_IsFrontFace) : SV_TARGET
+#endif
+{
+    float2 roughnessMetallic = ShadingParameters.xy;
+    if (TextureFlags.z > 1) roughnessMetallic *= OpacityMap.Sample(SurfaceSampler, input.TexCoord).gb;
+#if !defined(EVANS_CONTACT_RECEIVER)
+    const uint contactSample = 0;
+#endif
+    float4 diffuseSample = SampleDiffuse(input.TexCoord);
+    float alpha = SurfaceAlpha(input, diffuseSample);
+    ApplyAlphaClip(alpha);
+    // Rasterize the same triangle depth as the fill; keep a pixel-width edge.
+    if (RenderParameters.y > 1.0 && RenderParameters.y < 1.5)
+    {
+        float3 wireBary = input.Color.rgb;
+        float3 wireDx = ddx(wireBary), wireDy = ddy(wireBary);
+        float3 wireDistance = wireBary / max(sqrt(wireDx * wireDx + wireDy * wireDy), 1.0e-8);
+        if (min(wireDistance.x, min(wireDistance.y, wireDistance.z)) > 0.75) discard;
+    }
+    if (RenderParameters.y > 0.5f)
+    {
+        return float4(TransportSurfaceRadiance(SRGBToLinear(saturate(PipelineColor.rgb)), input.Position), alpha);
+    }
+
+    float3 surfaceBase =
+        input.Color.rgb *
+        max(PipelineColor.rgb, 0.0f) *
+        max(diffuseSample.rgb, 0.0f);
+    float3 baseColor = saturate(surfaceBase * MaterialDiffuseColor.rgb);
+    float3 normal = ResolveSurfaceNormal(input, isFrontFace);
+    float3 viewDirection = NormalizeSafe(
+        CameraLightCount.xyz - input.WorldPosition, normal);
+    float3 diffuseLight = 0.0f;
+    float3 specularLight = 0.0f;
+    uint lightCount = min((uint)(CameraLightCount.w + 0.5f), MaximumLights);
+    [loop]
+    for (uint lightIndex = 0; lightIndex < lightCount; ++lightIndex)
+    {
+        AccumulateSceneLight(roughnessMetallic,
+            lightIndex, input, normal, viewDirection, ReadContactVisibility(input.Position, contactSample),
+            diffuseLight, specularLight, baseColor);
+    }
+
+    float3 color =
+        surfaceBase *
+            max(MaterialAmbientColor.rgb, 0.0f) *
+            max(AmbientColorStrength.rgb, 0.0f) *
+            max(AmbientColorStrength.w, 0.0f) * (1.0f - saturate(roughnessMetallic.y)) +
+        surfaceBase * max(MaterialDiffuseColor.rgb, 0.0f) * diffuseLight +
+        specularLight +
+        max(MaterialEmissiveColor.rgb, 0.0f);
+    color += surfaceBase * max(MaterialDiffuseColor.rgb,0) * (1-LumenDielectricReflectance) * (1-saturate(roughnessMetallic.y)) * LumenTranslucentIrradiance(input.WorldPosition,normal);
+    return float4(PrepareDisplayLinear(TransportSurfaceRadiance(color, input.Position)), alpha);
+}
+
+#if defined(EVANS_CONTACT_RECEIVER)
+float4 PSMain(VSOutput fragment, bool frontFacing : SV_IsFrontFace) : SV_TARGET
+{ return PSContact(fragment, frontFacing, 0); }
+#endif
+
+// Native DX12 weighted accumulation consumes this material's lit, fogged HDR
+// result. Additive radiance/opacity and product revealage have distinct MRT
+// blend states; the independent WeightedBlendedOIT source resolves them.
+cbuffer TransparencyParameters : register(b5)
+{
+    float4 OpacityAndDepthWeights; // alpha exponent, depth exponent, depth scale, weight floor
+    uint4 TransparencyFlags;
+};
+struct TransparencyFragment
+{
+    float4 WeightedRadiance : SV_Target0;
+    float OpacityForRevealage : SV_Target1;
+};
+TransparencyFragment PSWeighted(VSOutput fragment, bool frontFacing : SV_IsFrontFace)
+{
+    float4 shaded = PSMain(fragment, frontFacing);
+    float opacity = saturate(shaded.a);
+    TransparencyFragment result = (TransparencyFragment)0;
+    if (opacity <= 0.0) return result;
+    float nearPreference = 1.0 - saturate(fragment.Position.z) * OpacityAndDepthWeights.z;
+    float weight = max(pow(opacity, OpacityAndDepthWeights.x) *
+        pow(nearPreference, OpacityAndDepthWeights.y), OpacityAndDepthWeights.w);
+    float weightedOpacity = weight * opacity;
+    result.WeightedRadiance = float4(shaded.rgb * weightedOpacity, weightedOpacity);
+    result.OpacityForRevealage = opacity;
+    return result;
+}
+
+float4 PSOutline(VSOutput input) : SV_TARGET
+{
+    float4 diffuseSample = SampleDiffuse(input.TexCoord);
+    ApplyAlphaClip(SurfaceAlpha(input, diffuseSample));
+    return float4(SRGBToLinear(saturate(PipelineColor.rgb)), PipelineColor.a);
+}

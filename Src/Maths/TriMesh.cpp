@@ -115,6 +115,7 @@ namespace Evans::Maths
 			{
 				continue;
 			}
+			if (options.AcceptHit && !options.AcceptHit(triangleIndex, triangleHit)) continue;
 			static_cast<RayTriangleHit&>(hit) = triangleHit;
 			hit.TriangleIndex = triangleIndex;
 			closestDistance = triangleHit.Distance;

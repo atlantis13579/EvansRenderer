@@ -37,7 +37,6 @@ public:
         int viewportHeight) = 0;
     virtual void DrawImgui() = 0;
     virtual bool EndFrame() = 0;
-    virtual bool CaptureBackBuffer(Image& output) = 0;
 
     [[nodiscard]] virtual bool IsInitialized() const noexcept = 0;
     [[nodiscard]] virtual EditorPresentationAPI API() const noexcept = 0;
@@ -47,9 +46,8 @@ public:
 [[nodiscard]] std::unique_ptr<IEditorPresenter> CreateEditorPresenter(EditorPresentationAPI api);
 [[nodiscard]] const char* ToString(EditorPresentationAPI api) noexcept;
 
-// Native realtime selections and DXR choose a presentation API. Offscreen
-// OpenGL ES, software rasterizer, and ray-tracing selections retain the most
-// recent window API because their CPU Image output is presentation-independent.
+// Native realtime selections choose their matching presentation API.
+// CPU software outputs retain the most recent window API.
 [[nodiscard]] EditorPresentationAPI ResolvePresentationAPI(
     std::string_view backendId,
     EditorPresentationAPI lastRealtimeAPI) noexcept;

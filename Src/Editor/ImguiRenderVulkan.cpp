@@ -70,6 +70,7 @@ bool ImguiRenderVulkan::Initialize()
     TEXTMETRICA metrics{};
     GetTextMetricsA(dc, &metrics);
     FontLineHeight_ = std::max(8L, metrics.tmHeight);
+    imguiSetFontHeight(FontLineHeight_);
     int penX = 1;
     int penY = 1;
     const int rowHeight = FontLineHeight_ + 2;

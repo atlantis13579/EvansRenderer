@@ -1,4 +1,5 @@
 #include "Editor/Demos.hpp"
+#include "Renderer/Reflections/EnvironmentRadiance.h"
 
 #include <algorithm>
 #include <cmath>
@@ -88,10 +89,13 @@ struct Bounds
         return "Models/UtahTeapot/teapot.obj";
     case DemoId::SponzaAtrium:
         return "Scenes/Sponza/sponza.obj";
+    case DemoId::StanfordDragon:
+        return "Models/StanfordDragon/dragon.obj";
     case DemoId::Triangle:
+    case DemoId::FurCube:
         break;
     }
-    throw std::invalid_argument("The triangle demo does not have an external model path");
+    throw std::invalid_argument("The procedural demo does not have an external model path");
 }
 
 } // namespace
@@ -99,6 +103,10 @@ struct Bounds
 DemoCatalog::DemoCatalog(std::filesystem::path contentRoot)
     : ContentRoot_(std::move(contentRoot))
 {
+    constexpr unsigned EnvironmentFaceResolution=128;
+    std::string error;
+    SkyEnvironment_=Renderer::LoadEnvironmentRadiance(ContentRoot_/"Environments/KloppenheimSky/kloppenheim_06_puresky_1k.hdr",EnvironmentFaceResolution,error);
+    if (!SkyEnvironment_) throw std::runtime_error(error);
 }
 
 const std::vector<DemoDescriptor>& DemoCatalog::Descriptors()
@@ -106,17 +114,35 @@ const std::vector<DemoDescriptor>& DemoCatalog::Descriptors()
     static const std::vector<DemoDescriptor> descriptors = {
         {DemoId::Triangle, "Triangle", "A colored triangle used to validate the selected RHI."},
         {DemoId::UtahTeapot, "Rotating Utah Teapot", "The classic Utah teapot with continuous rotation."},
-        {DemoId::SponzaAtrium, "Sponza Atrium", "A detailed architectural stress scene."}};
+        {DemoId::SponzaAtrium, "Sponza Atrium", "A detailed architectural stress scene."},
+        {DemoId::StanfordDragon, "Stanford Dragon", "Four fixed exhibits for diffusion, glass, transparency and planar reflection."},
+        {DemoId::FurCube, "Fur Cube", "A procedural cube with short fibers and editable fur parameters."},
+        {DemoId::BigWorld, "Big World", "Procedural mountains, lakes, forests, weather and real-time volumetric clouds."}};
     return descriptors;
+}
+
+bool DemoCatalog::SupportsBackend(DemoId demo,Techniques::Backend backend)
+{
+    using Techniques::Technique;
+    switch (demo)
+    {
+    case DemoId::FurCube: return Techniques::QuerySupport(Technique::HairFur,backend).Available();
+    case DemoId::StanfordDragon: return Techniques::IsSoftwareRaster(backend) || Techniques::QuerySupport(Technique::Refraction,backend).Available();
+    case DemoId::BigWorld: return Techniques::QuerySupport(Technique::VolumetricClouds,backend).Available();
+    default: return true;
+    }
 }
 
 SceneSnapshot DemoCatalog::Load(DemoId demo) const
 {
-    if (demo == DemoId::Triangle)
-    {
-        return LoadTriangle();
-    }
-    return LoadModelDemo(demo, ModelPath(demo));
+    auto scene=demo==DemoId::Triangle ? LoadTriangle() :
+        demo==DemoId::StanfordDragon ? LoadDragon() :
+        demo==DemoId::FurCube ? LoadHair() :
+        IsVolumeDemo(demo) ? LoadVolume(demo) : LoadModelDemo(demo,ModelPath(demo));
+    if (demo!=DemoId::BigWorld) scene.Environment=SkyEnvironment_;
+    for (const auto& node : scene.Nodes)
+        if (node.Visible && node.Mesh) scene.TriangleCountAtLoad += node.Mesh->Indices.size() / 3;
+    return scene;
 }
 
 void DemoCatalog::Update(
@@ -136,7 +162,7 @@ void DemoCatalog::Update(
         node.LocalTransform.RotationDegrees.Y =
             std::fmod(node.LocalTransform.RotationDegrees.Y + delta, 360.0f);
     }
-    ++scene.Revision;
+    ++scene.TransformRevision;
 }
 
 SceneSnapshot DemoCatalog::LoadTriangle() const
@@ -194,20 +220,19 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
 
     if (demo == DemoId::SponzaAtrium)
     {
-        // Place the camera at human height inside the centered atrium and look
-        // along its main colonnade instead of at the mostly closed exterior.
-        scene.SceneCamera.Position = {-1.15f, -0.55f, 0.0f};
-        scene.SceneCamera.Target = {1.6f, -0.45f, 0.0f};
-        scene.SceneCamera.VerticalFieldOfViewDegrees = 72.0f;
-        scene.Lights.push_back(
-            {LightType::Directional, {}, {-0.35f, -1.0f, -0.25f}, {}, 3.0f, {}, true});
+        scene.AlternateMaterials = FileResourceLoader::LoadMaterialLibrary(ContentRoot_ / "Scenes/Sponza/PBR/Sponza.mtl");
+        ConfigureSponzaLighting(scene);
+        scene.BakedLightingDirectory=ContentRoot_/"Scenes/Sponza/Baked";
     }
     else
     {
+        // Preserve highlight headroom so the shading-model comparison does not
+        // collapse to saturated white on the teapot's white diffuse material.
+        constexpr float TeapotDirectionalIntensity = 0.8f;
         scene.SceneCamera.Position = {0.0f, 1.4f, 4.5f};
         scene.SceneCamera.Target = {0.0f, 0.3f, 0.0f};
         scene.Lights.push_back(
-            {LightType::Directional, {}, {-0.35f, -1.0f, -0.25f}, {}, 3.0f, {}, true});
+            {LightType::Directional, {}, {-0.35f, -1.0f, -0.25f}, {}, TeapotDirectionalIntensity, {}, true});
     }
     return scene;
 }

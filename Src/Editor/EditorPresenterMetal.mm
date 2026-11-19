@@ -1,3 +1,5 @@
+#include "Renderer/Metal/MetalShaderCache.h"
+#include "Renderer/Types.h"
 #include "Editor/EditorPresenterMetal.h"
 
 #if defined(__APPLE__)
@@ -103,11 +105,6 @@ void ReleaseObject(id object)
     }
 }
 
-std::size_t AlignUp(std::size_t value, std::size_t alignment)
-{
-    return (value + alignment - 1u) / alignment * alignment;
-}
-
 std::string ErrorDescription(NSError* error, const char* fallback)
 {
     if (error != nil)
@@ -171,7 +168,7 @@ struct EditorPresenterMetal::Impl
     {
         NSError* error = nil;
         NSString* source = [NSString stringWithUTF8String:ShaderSource];
-        id<MTLLibrary> library = [Device newLibraryWithSource:source options:nil error:&error];
+        id<MTLLibrary> library = Evans::Renderer::CompileCachedMetalLibrary(Device,source,nil,&error);
         if (library == nil)
         {
             return Fail(ErrorDescription(error, "Metal editor shader compilation failed."));
@@ -198,12 +195,12 @@ struct EditorPresenterMetal::Impl
         colorAttachment.sourceAlphaBlendFactor = MTLBlendFactorOne;
         colorAttachment.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         colorAttachment.alphaBlendOperation = MTLBlendOperationAdd;
-        Pipeline = [Device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        Pipeline = Evans::Renderer::CreateCachedMetalRenderPipeline(Device,descriptor,&error);
         if (Pipeline != nil)
         {
             // The viewport is a completed image; only UI primitives need alpha blending.
             colorAttachment.blendingEnabled = NO;
-            ViewportPipeline = [Device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+            ViewportPipeline = Evans::Renderer::CreateCachedMetalRenderPipeline(Device,descriptor,&error);
         }
         ReleaseObject(descriptor);
         ReleaseObject(vertex);
@@ -267,6 +264,7 @@ struct EditorPresenterMetal::Impl
             NSForegroundColorAttributeName: [NSColor whiteColor]};
         FontHeight = std::max(8, static_cast<int>(std::ceil(
             [@"M" sizeWithAttributes:attributes].height)));
+        imguiSetFontHeight(FontHeight);
         int penX = 1;
         int penY = 1;
         for (int character = 32; character < 128; ++character)
@@ -357,9 +355,10 @@ struct EditorPresenterMetal::Impl
         }
         Layer.device = Device;
         Layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        Layer.framebufferOnly = NO;
+        Layer.framebufferOnly = YES;
         Layer.opaque = YES;
         Layer.presentsWithTransaction = NO;
+        Layer.displaySyncEnabled = NO;
         return true;
     }
 
@@ -517,7 +516,18 @@ struct EditorPresenterMetal::Impl
         {
             return false;
         }
-        if (ViewportTexture == nil || ViewportWidth != image.Width || ViewportHeight != image.Height)
+        if(image.GpuColor)
+        {
+            if(image.GpuColor->Backend!=Renderer::RHIBackend::Metal) return Fail("Incompatible GPU viewport backend");
+            id<MTLTexture> texture=(id<MTLTexture>)image.GpuColor->NativeTexture;
+            if(texture.device!=Device)return Fail("GPU viewport belongs to another Metal device");
+            ReleaseObject(ViewportTexture);ViewportTexture=[texture retain];
+            ViewportIsGpu=true;ViewportWidth=image.Width;ViewportHeight=image.Height;UploadedRevision=revision;
+            const auto lease=image.GpuColor;
+            [CommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) { (void)completed; (void)lease.get(); }];
+            return true;
+        }
+        if (ViewportIsGpu || ViewportTexture == nil || ViewportWidth != image.Width || ViewportHeight != image.Height)
         {
             ReleaseObject(ViewportTexture);
             ViewportTexture = CreateTexture(
@@ -525,7 +535,7 @@ struct EditorPresenterMetal::Impl
                 static_cast<int>(image.Height),
                 MTLPixelFormatRGBA8Unorm,
                 image.PixelsRGBA8.data());
-            ViewportWidth = image.Width;
+            ViewportIsGpu=false;ViewportWidth = image.Width;
             ViewportHeight = image.Height;
             UploadedRevision = revision;
             return ViewportTexture != nil;
@@ -971,84 +981,11 @@ struct EditorPresenterMetal::Impl
         return true;
     }
 
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (Encoder == nil || CommandBuffer == nil || Drawable == nil)
-        {
-            AbortFrame();
-            return Fail("Metal editor has no frame to capture.");
-        }
-        [Encoder endEncoding];
-        Encoder = nil;
-        const NSUInteger width = Drawable.texture.width;
-        const NSUInteger height = Drawable.texture.height;
-        const std::size_t rowPitch = AlignUp(width * 4u, 256u);
-        id<MTLBuffer> readback = [Device
-            newBufferWithLength:rowPitch * height
-            options:MTLResourceStorageModeShared];
-        id<MTLBlitCommandEncoder> blit = [CommandBuffer blitCommandEncoder];
-        if (readback == nil || blit == nil)
-        {
-            ReleaseObject(readback);
-            AbortFrame();
-            return Fail("Metal editor capture allocation failed.");
-        }
-        [blit
-            copyFromTexture:Drawable.texture
-            sourceSlice:0
-            sourceLevel:0
-            sourceOrigin:MTLOriginMake(0, 0, 0)
-            sourceSize:MTLSizeMake(width, height, 1)
-            toBuffer:readback
-            destinationOffset:0
-            destinationBytesPerRow:rowPitch
-            destinationBytesPerImage:rowPitch * height];
-        [blit endEncoding];
-        [CommandBuffer commit];
-        [CommandBuffer waitUntilCompleted];
-        if (CommandBuffer.status == MTLCommandBufferStatusError)
-        {
-            const std::string error = ErrorDescription(
-                CommandBuffer.error,
-                "Metal editor capture command failed.");
-            ReleaseObject(readback);
-            ReleaseFrameResources();
-            return Fail(error);
-        }
-        output.Width = static_cast<std::uint32_t>(width);
-        output.Height = static_cast<std::uint32_t>(height);
-        output.PixelsRGBA8.resize(width * height * 4u);
-        const auto* source = static_cast<const std::uint8_t*>(readback.contents);
-        if (source == nullptr)
-        {
-            ReleaseObject(readback);
-            ReleaseFrameResources();
-            output = {};
-            return Fail("Metal editor capture buffer is not CPU-visible.");
-        }
-        for (NSUInteger y = 0; y < height; ++y)
-        {
-            for (NSUInteger x = 0; x < width; ++x)
-            {
-                const std::size_t sourceOffset = y * rowPitch + x * 4u;
-                const std::size_t destinationOffset = (y * width + x) * 4u;
-                output.PixelsRGBA8[destinationOffset] = source[sourceOffset + 2u];
-                output.PixelsRGBA8[destinationOffset + 1u] = source[sourceOffset + 1u];
-                output.PixelsRGBA8[destinationOffset + 2u] = source[sourceOffset];
-                output.PixelsRGBA8[destinationOffset + 3u] = source[sourceOffset + 3u];
-            }
-        }
-        ReleaseObject(readback);
-        ReleaseFrameResources();
-        LastError.clear();
-        return true;
-    }
-
     NSView* View = nil;
     CAMetalLayer* Layer = nil;
     CALayer* PreviousLayer = nil;
     id<MTLDevice> Device = nil;
+    bool ViewportIsGpu=false;
     id<MTLCommandQueue> Queue = nil;
     id<MTLRenderPipelineState> Pipeline = nil;
     id<MTLRenderPipelineState> ViewportPipeline = nil;
@@ -1120,11 +1057,6 @@ void EditorPresenterMetal::DrawImgui()
 bool EditorPresenterMetal::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterMetal::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterMetal::IsInitialized() const noexcept

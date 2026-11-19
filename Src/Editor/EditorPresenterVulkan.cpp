@@ -1,9 +1,13 @@
+#include "Renderer/Types.h"
+#include "Renderer/Vulkan/VulkanExternalMemory.h"
+#include "Renderer/Vulkan/VulkanPipelineCache.h"
 #include "Editor/EditorPresenterVulkan.h"
 
 #if defined(_WIN32)
 
 #include "Editor/ImguiRenderVulkan.h"
 #include "Editor/VulkanPresenterABI.h"
+#include "Renderer/Vulkan/VulkanShaderCompiler.h"
 
 #include <algorithm>
 #include <array>
@@ -29,12 +33,6 @@ struct PushConstants
     float Scale[2];
     float Translate[2];
 };
-
-constexpr std::uint32_t VertexShader[] = {
-    0x07230203u,0x00010000u,0x00080007u,0x0000002eu,0x00000000u,0x00020011u,0x00000001u,0x0006000bu,0x00000001u,0x4c534c47u,0x6474732eu,0x3035342eu,0x00000000u,0x0003000eu,0x00000000u,0x00000001u,0x000b000fu,0x00000000u,0x00000004u,0x6e69616du,0x00000000u,0x0000000du,0x00000012u,0x00000027u,0x00000028u,0x0000002au,0x0000002cu,0x00030003u,0x00000002u,0x000001c2u,0x00040005u,0x00000004u,0x6e69616du,0x00000000u,0x00060005u,0x0000000bu,0x505f6c67u,0x65567265u,0x78657472u,0x00000000u,0x00060006u,0x0000000bu,0x00000000u,0x505f6c67u,0x7469736fu,0x006e6f69u,0x00070006u,0x0000000bu,0x00000001u,0x505f6c67u,0x746e696fu,0x657a6953u,0x00000000u,0x00070006u,0x0000000bu,0x00000002u,0x435f6c67u,0x4470696cu,0x61747369u,0x0065636eu,0x00070006u,0x0000000bu,0x00000003u,0x435f6c67u,0x446c6c75u,0x61747369u,0x0065636eu,0x00030005u,0x0000000du,0x00000000u,0x00050005u,0x00000012u,0x6f506e69u,0x69746973u,0x00006e6fu,0x00060005u,0x00000014u,0x68737550u,0x736e6f43u,0x746e6174u,0x00000073u,0x00050006u,0x00000014u,0x00000000u,0x6c616373u,0x00000065u,0x00060006u,0x00000014u,0x00000001u,0x6e617274u,0x74616c73u,0x00000065u,0x00050005u,0x00000016u,0x736e6f63u,0x746e6174u,0x00000073u,0x00050005u,0x00000027u,0x5474756fu,0x6f437865u,0x0064726fu,0x00050005u,0x00000028u,0x65546e69u,0x6f6f4378u,0x00006472u,0x00050005u,0x0000002au,0x4374756fu,0x726f6c6fu,0x00000000u,0x00040005u,0x0000002cu,0x6f436e69u,0x00726f6cu,0x00050048u,0x0000000bu,0x00000000u,0x0000000bu,0x00000000u,0x00050048u,0x0000000bu,0x00000001u,0x0000000bu,0x00000001u,0x00050048u,0x0000000bu,0x00000002u,0x0000000bu,0x00000003u,0x00050048u,0x0000000bu,0x00000003u,0x0000000bu,0x00000004u,0x00030047u,0x0000000bu,0x00000002u,0x00040047u,0x00000012u,0x0000001eu,0x00000000u,0x00050048u,0x00000014u,0x00000000u,0x00000023u,0x00000000u,0x00050048u,0x00000014u,0x00000001u,0x00000023u,0x00000008u,0x00030047u,0x00000014u,0x00000002u,0x00040047u,0x00000027u,0x0000001eu,0x00000000u,0x00040047u,0x00000028u,0x0000001eu,0x00000001u,0x00040047u,0x0000002au,0x0000001eu,0x00000001u,0x00040047u,0x0000002cu,0x0000001eu,0x00000002u,0x00020013u,0x00000002u,0x00030021u,0x00000003u,0x00000002u,0x00030016u,0x00000006u,0x00000020u,0x00040017u,0x00000007u,0x00000006u,0x00000004u,0x00040015u,0x00000008u,0x00000020u,0x00000000u,0x0004002bu,0x00000008u,0x00000009u,0x00000001u,0x0004001cu,0x0000000au,0x00000006u,0x00000009u,0x0006001eu,0x0000000bu,0x00000007u,0x00000006u,0x0000000au,0x0000000au,0x00040020u,0x0000000cu,0x00000003u,0x0000000bu,0x0004003bu,0x0000000cu,0x0000000du,0x00000003u,0x00040015u,0x0000000eu,0x00000020u,0x00000001u,0x0004002bu,0x0000000eu,0x0000000fu,0x00000000u,0x00040017u,0x00000010u,0x00000006u,0x00000002u,0x00040020u,0x00000011u,0x00000001u,0x00000010u,0x0004003bu,0x00000011u,0x00000012u,0x00000001u,0x0004001eu,0x00000014u,0x00000010u,0x00000010u,0x00040020u,0x00000015u,0x00000009u,0x00000014u,0x0004003bu,0x00000015u,0x00000016u,0x00000009u,0x00040020u,0x00000017u,0x00000009u,0x00000010u,0x0004002bu,0x0000000eu,0x0000001bu,0x00000001u,0x0004002bu,0x00000006u,0x0000001fu,0x00000000u,0x0004002bu,0x00000006u,0x00000020u,0x3f800000u,0x00040020u,0x00000024u,0x00000003u,0x00000007u,0x00040020u,0x00000026u,0x00000003u,0x00000010u,0x0004003bu,0x00000026u,0x00000027u,0x00000003u,0x0004003bu,0x00000011u,0x00000028u,0x00000001u,0x0004003bu,0x00000024u,0x0000002au,0x00000003u,0x00040020u,0x0000002bu,0x00000001u,0x00000007u,0x0004003bu,0x0000002bu,0x0000002cu,0x00000001u,0x00050036u,0x00000002u,0x00000004u,0x00000000u,0x00000003u,0x000200f8u,0x00000005u,0x0004003du,0x00000010u,0x00000013u,0x00000012u,0x00050041u,0x00000017u,0x00000018u,0x00000016u,0x0000000fu,0x0004003du,0x00000010u,0x00000019u,0x00000018u,0x00050085u,0x00000010u,0x0000001au,0x00000013u,0x00000019u,0x00050041u,0x00000017u,0x0000001cu,0x00000016u,0x0000001bu,0x0004003du,0x00000010u,0x0000001du,0x0000001cu,0x00050081u,0x00000010u,0x0000001eu,0x0000001au,0x0000001du,0x00050051u,0x00000006u,0x00000021u,0x0000001eu,0x00000000u,0x00050051u,0x00000006u,0x00000022u,0x0000001eu,0x00000001u,0x00070050u,0x00000007u,0x00000023u,0x00000021u,0x00000022u,0x0000001fu,0x00000020u,0x00050041u,0x00000024u,0x00000025u,0x0000000du,0x0000000fu,0x0003003eu,0x00000025u,0x00000023u,0x0004003du,0x00000010u,0x00000029u,0x00000028u,0x0003003eu,0x00000027u,0x00000029u,0x0004003du,0x00000007u,0x0000002du,0x0000002cu,0x0003003eu,0x0000002au,0x0000002du,0x000100fdu,0x00010038u};
-
-constexpr std::uint32_t FragmentShader[] = {
-    0x07230203u,0x00010000u,0x00080007u,0x00000018u,0x00000000u,0x00020011u,0x00000001u,0x0006000bu,0x00000001u,0x4c534c47u,0x6474732eu,0x3035342eu,0x00000000u,0x0003000eu,0x00000000u,0x00000001u,0x0008000fu,0x00000004u,0x00000004u,0x6e69616du,0x00000000u,0x00000009u,0x0000000bu,0x00000014u,0x00030010u,0x00000004u,0x00000007u,0x00030003u,0x00000002u,0x000001c2u,0x00040005u,0x00000004u,0x6e69616du,0x00000000u,0x00050005u,0x00000009u,0x4374756fu,0x726f6c6fu,0x00000000u,0x00040005u,0x0000000bu,0x6f436e69u,0x00726f6cu,0x00060005u,0x00000010u,0x67616d69u,0x78655465u,0x65727574u,0x00000000u,0x00050005u,0x00000014u,0x65546e69u,0x6f6f4378u,0x00006472u,0x00040047u,0x00000009u,0x0000001eu,0x00000000u,0x00040047u,0x0000000bu,0x0000001eu,0x00000001u,0x00040047u,0x00000010u,0x00000022u,0x00000000u,0x00040047u,0x00000010u,0x00000021u,0x00000000u,0x00040047u,0x00000014u,0x0000001eu,0x00000000u,0x00020013u,0x00000002u,0x00030021u,0x00000003u,0x00000002u,0x00030016u,0x00000006u,0x00000020u,0x00040017u,0x00000007u,0x00000006u,0x00000004u,0x00040020u,0x00000008u,0x00000003u,0x00000007u,0x0004003bu,0x00000008u,0x00000009u,0x00000003u,0x00040020u,0x0000000au,0x00000001u,0x00000007u,0x0004003bu,0x0000000au,0x0000000bu,0x00000001u,0x00090019u,0x0000000du,0x00000006u,0x00000001u,0x00000000u,0x00000000u,0x00000000u,0x00000001u,0x00000000u,0x0003001bu,0x0000000eu,0x0000000du,0x00040020u,0x0000000fu,0x00000000u,0x0000000eu,0x0004003bu,0x0000000fu,0x00000010u,0x00000000u,0x00040017u,0x00000012u,0x00000006u,0x00000002u,0x00040020u,0x00000013u,0x00000001u,0x00000012u,0x0004003bu,0x00000013u,0x00000014u,0x00000001u,0x00050036u,0x00000002u,0x00000004u,0x00000000u,0x00000003u,0x000200f8u,0x00000005u,0x0004003du,0x00000007u,0x0000000cu,0x0000000bu,0x0004003du,0x0000000eu,0x00000011u,0x00000010u,0x0004003du,0x00000012u,0x00000015u,0x00000014u,0x00050057u,0x00000007u,0x00000016u,0x00000011u,0x00000015u,0x00050085u,0x00000007u,0x00000017u,0x0000000cu,0x00000016u,0x0003003eu,0x00000009u,0x00000017u,0x000100fdu,0x00010038u};
 
 [[nodiscard]] std::string VulkanError(const char* operation, VkResult result)
 {
@@ -141,6 +139,7 @@ struct EditorPresenterVulkan::Impl
                 "vkGetPhysicalDeviceQueueFamilyProperties") &&
             LoadInstance(GetPhysicalDeviceMemoryProperties,
                 "vkGetPhysicalDeviceMemoryProperties") &&
+            LoadInstance(GetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties") &&
             LoadInstance(CreateDeviceFunction, "vkCreateDevice") &&
             LoadInstance(GetDeviceProcAddress, "vkGetDeviceProcAddr") &&
             LoadInstance(CreateWin32Surface, "vkCreateWin32SurfaceKHR") &&
@@ -207,8 +206,8 @@ struct EditorPresenterVulkan::Impl
             LoadDevice(CreateGraphicsPipelines, "vkCreateGraphicsPipelines") &&
             LoadDevice(DestroyPipelineFunction, "vkDestroyPipeline") &&
             LoadDevice(CmdPipelineBarrier, "vkCmdPipelineBarrier") &&
+            LoadDevice(CmdCopyImage, "vkCmdCopyImage") &&
             LoadDevice(CmdCopyBufferToImage, "vkCmdCopyBufferToImage") &&
-            LoadDevice(CmdCopyImageToBuffer, "vkCmdCopyImageToBuffer") &&
             LoadDevice(CmdBeginRenderPass, "vkCmdBeginRenderPass") &&
             LoadDevice(CmdEndRenderPass, "vkCmdEndRenderPass") &&
             LoadDevice(CmdSetViewport, "vkCmdSetViewport") &&
@@ -320,7 +319,7 @@ struct EditorPresenterVulkan::Impl
         queueCreate.queueFamilyIndex = QueueFamily;
         queueCreate.queueCount = 1;
         queueCreate.pQueuePriorities = &priority;
-        std::vector<const char*> extensions = {"VK_KHR_swapchain"};
+        std::vector<const char*> extensions = {"VK_KHR_swapchain","VK_KHR_timeline_semaphore","VK_KHR_external_semaphore_win32","VK_KHR_external_semaphore","VK_KHR_external_memory_win32","VK_KHR_external_memory","VK_KHR_dedicated_allocation","VK_KHR_get_memory_requirements2"};
         VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance{};
         maintenance.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
         if (MaintenanceInstanceEnabled)
@@ -351,7 +350,7 @@ struct EditorPresenterVulkan::Impl
         create.pQueueCreateInfos = &queueCreate;
         create.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
         create.ppEnabledExtensionNames = extensions.data();
-        create.pNext = PresentFencesEnabled ? &maintenance : nullptr;
+        TimelineSemaphoreFeatures timeline;timeline.pNext=PresentFencesEnabled?&maintenance:nullptr;create.pNext=&timeline;
         if (!Check(CreateDeviceFunction(PhysicalDevice, &create, nullptr, &Device),
                 "vkCreateDevice"))
         {
@@ -361,6 +360,7 @@ struct EditorPresenterVulkan::Impl
         {
             return false;
         }
+        Renderer::InitializeVulkanPipelineCache(Device,PhysicalDevice,GetPhysicalDeviceProperties,GetDeviceProcAddress);
         GetDeviceQueue(Device, QueueFamily, 0, &Queue);
         return Queue != nullptr || Fail("vkGetDeviceQueue returned a null graphics queue.");
     }
@@ -898,7 +898,6 @@ struct EditorPresenterVulkan::Impl
             DestroySwapchain(Device, Swapchain, nullptr);
         }
         Swapchain = 0;
-        DestroyBuffer(ReadbackBuffer);
     }
 
     bool CreateRenderPassAndPipeline()
@@ -939,19 +938,13 @@ struct EditorPresenterVulkan::Impl
 
         VkShaderModule vertexShader = 0;
         VkShaderModule fragmentShader = 0;
-        VkShaderModuleCreateInfo shader{};
-        shader.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        shader.codeSize = sizeof(VertexShader);
-        shader.pCode = VertexShader;
-        if (!Check(CreateShaderModuleFunction(Device, &shader, nullptr, &vertexShader),
-                "vkCreateShaderModule(editor vertex)"))
-        {
+        const Renderer::VulkanShaderProgram vertexProgram {"VulkanPresenter.glsl", Renderer::VulkanShaderStage::Vertex,
+            "EVANS_VERTEX_STAGE=1", Renderer::VulkanShaderDomain::Editor};
+        const Renderer::VulkanShaderProgram fragmentProgram {"VulkanPresenter.glsl", Renderer::VulkanShaderStage::Fragment,
+            "", Renderer::VulkanShaderDomain::Editor};
+        if (!Renderer::CreateVulkanShaderModule(Device, CreateShaderModuleFunction, vertexProgram, vertexShader, LastError))
             return false;
-        }
-        shader.codeSize = sizeof(FragmentShader);
-        shader.pCode = FragmentShader;
-        if (!Check(CreateShaderModuleFunction(Device, &shader, nullptr, &fragmentShader),
-                "vkCreateShaderModule(editor fragment)"))
+        if (!Renderer::CreateVulkanShaderModule(Device, CreateShaderModuleFunction, fragmentProgram, fragmentShader, LastError))
         {
             DestroyShaderModuleFunction(Device, vertexShader, nullptr);
             return false;
@@ -1045,7 +1038,7 @@ struct EditorPresenterVulkan::Impl
             // The viewport is a completed color framebuffer, not a UI overlay.
             // Preserve its RGB even when material cutouts left fractional alpha.
             blendAttachment.blendEnable = VK_FALSE_VALUE;
-            result = CreateGraphicsPipelines(Device, 0, 1, &create, nullptr, &ViewportPipeline);
+            result = Evans::Renderer::CreateCachedVulkanGraphicsPipelines(CreateGraphicsPipelines,Device,0, 1, &create, nullptr, &ViewportPipeline);
         }
         DestroyShaderModuleFunction(Device, fragmentShader, nullptr);
         DestroyShaderModuleFunction(Device, vertexShader, nullptr);
@@ -1068,6 +1061,7 @@ struct EditorPresenterVulkan::Impl
                 return false;
             }
         }
+        RetireGpuImports();
         if (!WaitForAcquisition() || !WaitForPresentation()) return false;
         DestroySwapchainResources();
 
@@ -1114,10 +1108,9 @@ struct EditorPresenterVulkan::Impl
         }
         Width = static_cast<int>(SwapchainExtent.width);
         Height = static_cast<int>(SwapchainExtent.height);
-        if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0U ||
-            (capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0U)
+        if ((capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0U)
         {
-            return Fail("The Vulkan surface must support color attachment and transfer-source usage.");
+            return Fail("The Vulkan surface must support color attachment usage.");
         }
         std::uint32_t imageCount = std::max(2U, capabilities.minImageCount + 1U);
         if (capabilities.maxImageCount > 0U)
@@ -1125,7 +1118,11 @@ struct EditorPresenterVulkan::Impl
             imageCount = std::min(imageCount, capabilities.maxImageCount);
         }
         VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
-        if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end())
+        if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end())
+        {
+            presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        else if (std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end())
         {
             presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
         }
@@ -1151,7 +1148,7 @@ struct EditorPresenterVulkan::Impl
         create.imageColorSpace = selectedFormat.colorSpace;
         create.imageExtent = SwapchainExtent;
         create.imageArrayLayers = 1;
-        create.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        create.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         create.preTransform = (capabilities.supportedTransforms &
             VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0U
@@ -1225,11 +1222,7 @@ struct EditorPresenterVulkan::Impl
                 return false;
             }
         }
-        const VkDeviceSize captureSize = static_cast<VkDeviceSize>(SwapchainExtent.width) *
-            SwapchainExtent.height * 4U;
-        return CreateBuffer(captureSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            ReadbackBuffer);
+        return true;
     }
 
     bool Initialize(HWND window, int width, int height)
@@ -1256,6 +1249,53 @@ struct EditorPresenterVulkan::Impl
         return true;
     }
 
+    std::vector<Texture> GpuImports;
+    std::vector<VkSemaphore> GpuReadySemaphores;
+    std::vector<std::shared_ptr<const Renderer::GpuImage>> GpuLeases;
+    void RetireGpuImports()
+    {
+        for(auto& texture:GpuImports)DestroyTexture(texture);
+        for(auto semaphore:GpuReadySemaphores)DestroySemaphoreFunction(Device,semaphore,nullptr);
+        GpuReadySemaphores.clear();GpuImports.clear();GpuLeases.clear();
+    }
+    bool ImportViewport(const Image& image)
+    {
+        if(image.GpuColor->Backend!=Renderer::RHIBackend::Vulkan)return Fail("Incompatible GPU viewport backend");
+        const auto& gpu=*image.GpuColor;Texture source;
+        ExternalImageCreateInfo external;
+        VkImageCreateInfo create{};create.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;create.pNext=&external;
+        create.imageType=VK_IMAGE_TYPE_2D;create.format=VkFormat(gpu.Format);create.extent={image.Width,image.Height,1};
+        create.mipLevels=1;create.arrayLayers=1;create.samples=VK_SAMPLE_COUNT_1_BIT;create.tiling=VK_IMAGE_TILING_OPTIMAL;
+        create.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;create.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+        if(!Check(CreateImageFunction(Device,&create,nullptr,&source.Handle),"Create imported Vulkan viewport"))return false;
+        DedicatedImageMemoryInfo dedicated;dedicated.image=source.Handle;
+        ImportWin32MemoryInfo imported;imported.handle=gpu.SharedHandle;imported.pNext=&dedicated;
+        VkMemoryAllocateInfo allocation{};allocation.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;allocation.pNext=&imported;
+        allocation.allocationSize=gpu.AllocationBytes;allocation.memoryTypeIndex=gpu.MemoryType;
+        if(!Check(AllocateMemory(Device,&allocation,nullptr,&source.Memory),"Import Vulkan viewport memory") ||
+            !Check(BindImageMemory(Device,source.Handle,source.Memory,0),"Bind imported viewport")){DestroyTexture(source);return false;}
+        VkImageMemoryBarrier acquire{};acquire.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        acquire.srcQueueFamilyIndex=ExternalQueueFamily;acquire.dstQueueFamilyIndex=QueueFamily;
+        acquire.oldLayout=VK_IMAGE_LAYOUT_GENERAL;acquire.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        acquire.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;acquire.image=source.Handle;acquire.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        CmdPipelineBarrier(CommandBuffer,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&acquire);
+        TransitionTexture(ViewportTexture,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};copy.srcSubresource=copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.extent={image.Width,image.Height,1};
+        CmdCopyImage(CommandBuffer,source.Handle,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,ViewportTexture.Handle,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+        TransitionTexture(ViewportTexture,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        auto release=acquire;release.srcQueueFamilyIndex=QueueFamily;release.dstQueueFamilyIndex=ExternalQueueFamily;
+        release.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;release.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+        release.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;release.dstAccessMask=0;
+        CmdPipelineBarrier(CommandBuffer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&release);
+        TimelineSemaphoreType type;VkSemaphore semaphore=0;VkSemaphoreCreateInfo desc{};desc.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;desc.pNext=&type;
+        if(!Check(CreateSemaphoreFunction(Device,&desc,nullptr,&semaphore),"Create viewport wait semaphore")){DestroyTexture(source);return false;}
+        const auto importSemaphore=reinterpret_cast<ImportSemaphoreWin32Handle>(GetDeviceProcAddress(Device,"vkImportSemaphoreWin32HandleKHR"));
+        ImportWin32SemaphoreInfo importedReady;importedReady.semaphore=semaphore;importedReady.handle=gpu.ReadyHandle;
+        if(!importSemaphore || !Check(importSemaphore(Device,&importedReady),"Import GPU viewport readiness")){DestroySemaphoreFunction(Device,semaphore,nullptr);DestroyTexture(source);return false;}
+        GpuReadySemaphores.push_back(semaphore);
+        GpuImports.push_back(source);GpuLeases.push_back(image.GpuColor);return true;
+    }
+
     bool EnsureViewportTexture(const Image& image, std::uint64_t revision)
     {
         if (!image.IsValid())
@@ -1274,8 +1314,8 @@ struct EditorPresenterVulkan::Impl
         }
         if (revision != UploadedRevision)
         {
-            if (!UploadTexture(ViewportTexture, image.PixelsRGBA8.data(),
-                    image.PixelsRGBA8.size()))
+            if (!(image.GpuColor ? ImportViewport(image) : UploadTexture(ViewportTexture, image.PixelsRGBA8.data(),
+                    image.PixelsRGBA8.size())))
             {
                 return false;
             }
@@ -1314,6 +1354,7 @@ struct EditorPresenterVulkan::Impl
         {
             return false;
         }
+        RetireGpuImports();
         if (!WaitForAcquisition() ||
             !Check(ResetFences(Device, 1, &AcquireFence), "vkResetFences(acquire)")) return false;
         VkResult acquire = AcquireNextImage(
@@ -1396,7 +1437,7 @@ struct EditorPresenterVulkan::Impl
         CmdDraw(CommandBuffer, vertexCount, 1, firstVertex, 0);
     }
 
-    void TransitionSwapchainForPresent(bool capture)
+    void TransitionSwapchainForPresent()
     {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1405,31 +1446,13 @@ struct EditorPresenterVulkan::Impl
         barrier.image = SwapchainImages[AcquiredImage];
         barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barrier.newLayout = capture
-            ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        barrier.dstAccessMask = capture ? VK_ACCESS_TRANSFER_READ_BIT : 0U;
         CmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            capture ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &barrier);
-        if (capture)
-        {
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {SwapchainExtent.width, SwapchainExtent.height, 1};
-            CmdCopyImageToBuffer(CommandBuffer, SwapchainImages[AcquiredImage],
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ReadbackBuffer.Handle, 1, &copy);
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barrier.dstAccessMask = 0;
-            CmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                0, nullptr, 0, nullptr, 1, &barrier);
-        }
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
 
-    bool FinishFrameCommands(bool capture)
+    bool FinishFrameCommands()
     {
         if (!FrameActive)
         {
@@ -1526,7 +1549,7 @@ struct EditorPresenterVulkan::Impl
             }
         }
         CmdEndRenderPass(CommandBuffer);
-        TransitionSwapchainForPresent(capture);
+        TransitionSwapchainForPresent();
         if (!Check(EndCommandBuffer(CommandBuffer), "vkEndCommandBuffer(frame)"))
         {
             return false;
@@ -1534,9 +1557,14 @@ struct EditorPresenterVulkan::Impl
         constexpr VkFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.waitSemaphoreCount = 1;
-        submit.pWaitSemaphores = &ImageAvailable;
-        submit.pWaitDstStageMask = &waitStage;
+        std::vector<VkSemaphore> waits{ImageAvailable};waits.insert(waits.end(),GpuReadySemaphores.begin(),GpuReadySemaphores.end());
+        std::vector<VkFlags> stages(waits.size(),VK_PIPELINE_STAGE_TRANSFER_BIT);stages[0]=waitStage;
+        submit.waitSemaphoreCount = unsigned(waits.size());
+        submit.pWaitSemaphores = waits.data();
+        submit.pWaitDstStageMask = stages.data();
+        std::vector<std::uint64_t> waitValues(waits.size(),1);waitValues[0]=0;const std::uint64_t signalValue=0;
+        TimelineSemaphoreSubmit timeline;timeline.waitValueCount=unsigned(waitValues.size());timeline.waitValues=waitValues.data();
+        timeline.signalValueCount=1;timeline.signalValues=&signalValue;if(!GpuReadySemaphores.empty())submit.pNext=&timeline;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &CommandBuffer;
         submit.signalSemaphoreCount = 1;
@@ -1597,47 +1625,7 @@ struct EditorPresenterVulkan::Impl
 
     bool EndFrame()
     {
-        return FinishFrameCommands(false) && PresentSubmittedFrame();
-    }
-
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (!FinishFrameCommands(true) ||
-            !Check(WaitForFences(Device, 1, &FrameFence, VK_TRUE_VALUE, GpuWaitTimeout),
-                "vkWaitForFences(capture)"))
-        {
-            return false;
-        }
-        void* mapped = nullptr;
-        const VkDeviceSize byteCount = static_cast<VkDeviceSize>(SwapchainExtent.width) *
-            SwapchainExtent.height * 4U;
-        if (!Check(MapMemory(Device, ReadbackBuffer.Memory, 0, byteCount, 0, &mapped),
-                "vkMapMemory(capture)"))
-        {
-            return false;
-        }
-        output.Width = SwapchainExtent.width;
-        output.Height = SwapchainExtent.height;
-        output.PixelsRGBA8.resize(static_cast<std::size_t>(byteCount));
-        const auto* source = static_cast<const std::uint8_t*>(mapped);
-        if (SwapchainFormat == VK_FORMAT_R8G8B8A8_UNORM)
-        {
-            std::memcpy(output.PixelsRGBA8.data(), source,
-                static_cast<std::size_t>(byteCount));
-        }
-        else
-        {
-            for (std::size_t pixel = 0; pixel < output.PixelsRGBA8.size() / 4U; ++pixel)
-            {
-                output.PixelsRGBA8[pixel * 4U] = source[pixel * 4U + 2U];
-                output.PixelsRGBA8[pixel * 4U + 1U] = source[pixel * 4U + 1U];
-                output.PixelsRGBA8[pixel * 4U + 2U] = source[pixel * 4U];
-                output.PixelsRGBA8[pixel * 4U + 3U] = source[pixel * 4U + 3U];
-            }
-        }
-        UnmapMemory(Device, ReadbackBuffer.Memory);
-        return PresentSubmittedFrame();
+        return FinishFrameCommands() && PresentSubmittedFrame();
     }
 
     bool Resize(int width, int height)
@@ -1686,6 +1674,7 @@ struct EditorPresenterVulkan::Impl
         FrameActive = false;
         FrameSubmitted = false;
         DestroySwapchainResources();
+        RetireGpuImports();
         DestroyTexture(ViewportTexture);
         DestroyTexture(FontTexture);
         DestroyTexture(WhiteTexture);
@@ -1727,6 +1716,7 @@ struct EditorPresenterVulkan::Impl
         }
         if (Device != nullptr && DestroyDeviceFunction != nullptr)
         {
+            Renderer::DestroyVulkanPipelineCache(Device);
             DestroyDeviceFunction(Device, nullptr);
         }
         if (Surface != 0 && DestroySurface != nullptr)
@@ -1814,7 +1804,6 @@ struct EditorPresenterVulkan::Impl
     std::uint32_t AcquiredImage = 0;
     Buffer UploadBuffer;
     Buffer VertexBuffer;
-    Buffer ReadbackBuffer;
     Texture WhiteTexture;
     Texture FontTexture;
     Texture ViewportTexture;
@@ -1844,6 +1833,7 @@ struct EditorPresenterVulkan::Impl
     PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
+    PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
     PFN_vkCreateDevice CreateDeviceFunction = nullptr;
     PFN_vkDestroyDevice DestroyDeviceFunction = nullptr;
     PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
@@ -1905,8 +1895,8 @@ struct EditorPresenterVulkan::Impl
     PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines = nullptr;
     PFN_vkDestroyPipeline DestroyPipelineFunction = nullptr;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier = nullptr;
+    PFN_vkCmdCopyImage CmdCopyImage = nullptr;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage = nullptr;
-    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
     PFN_vkCmdBeginRenderPass CmdBeginRenderPass = nullptr;
     PFN_vkCmdEndRenderPass CmdEndRenderPass = nullptr;
     PFN_vkCmdSetViewport CmdSetViewport = nullptr;
@@ -1960,11 +1950,6 @@ void EditorPresenterVulkan::DrawImgui()
 bool EditorPresenterVulkan::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterVulkan::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterVulkan::IsInitialized() const noexcept

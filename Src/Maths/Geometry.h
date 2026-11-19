@@ -189,29 +189,43 @@ namespace Evans::Maths
 			return false;
 		}
 
-		const float inverseDeterminant = 1.0f / determinant;
-		const Vector3 originOffset = distanceRay.Origin - a;
-		const float barycentricB = originOffset.Dot(determinantVector) * inverseDeterminant;
-		if (!std::isfinite(barycentricB) || barycentricB < 0.0f || barycentricB > 1.0f)
+		// Ray-aligned edge functions evaluate a shared edge from the same two
+		// transformed endpoints in either triangle. Independent Moller-Trumbore
+		// barycentric divisions can round both adjacent triangles to "outside".
+		// Use double intermediates throughout this CPU variant; retain the
+		// existing degeneracy, facing and distance-interval contracts above.
+		// Woop, Benthin and Wald, "Watertight Ray/Triangle Intersection" (2013):
+		// https://jcgt.org/published/0002/01/05/
+		const auto& direction = distanceRay.Direction;
+		const int depthAxis = Vector3(std::abs(direction.x),std::abs(direction.y),std::abs(direction.z)).LargestAxis();
+		const int horizontalAxis = (depthAxis+1)%3, verticalAxis = (horizontalAxis+1)%3;
+		const double shearX = double(direction[horizontalAxis])/direction[depthAxis];
+		const double shearY = double(direction[verticalAxis])/direction[depthAxis];
+		const double inverseDepth = 1.0/direction[depthAxis];
+		double projectedX[3], projectedY[3], projectedDepth[3];
+		const Vector3 corners[] = {a,b,c};
+		for (int i = 0; i < 3; ++i)
 		{
-			return false;
+			const double depth = double(corners[i][depthAxis])-distanceRay.Origin[depthAxis];
+			projectedX[i] = double(corners[i][horizontalAxis])-distanceRay.Origin[horizontalAxis]-shearX*depth;
+			projectedY[i] = double(corners[i][verticalAxis])-distanceRay.Origin[verticalAxis]-shearY*depth;
+			projectedDepth[i] = depth*inverseDepth;
 		}
-		const Vector3 cross = originOffset.Cross(edgeAB);
-		const float barycentricC = distanceRay.Direction.Dot(cross) * inverseDeterminant;
-		if (!std::isfinite(barycentricC) || barycentricC < 0.0f || barycentricB + barycentricC > 1.0f)
-		{
-			return false;
-		}
-		const float distance = edgeAC.Dot(cross) * inverseDeterminant;
-		if (!std::isfinite(distance) || distance < minimumDistance || distance > maximumDistance)
-		{
-			return false;
-		}
+		const double edgeA = projectedX[1]*projectedY[2]-projectedY[1]*projectedX[2];
+		const double edgeB = projectedX[2]*projectedY[0]-projectedY[2]*projectedX[0];
+		const double edgeC = projectedX[0]*projectedY[1]-projectedY[0]*projectedX[1];
+		if ((edgeA < 0 || edgeB < 0 || edgeC < 0) && (edgeA > 0 || edgeB > 0 || edgeC > 0)) return false;
+		const double area = edgeA+edgeB+edgeC;
+		if (!std::isfinite(area) || area == 0) return false;
+		const double parameter = (edgeA*projectedDepth[0]+edgeB*projectedDepth[1]+edgeC*projectedDepth[2])/area;
+		if (!std::isfinite(parameter) || parameter < minimumDistance || parameter > maximumDistance) return false;
+		const float distance = static_cast<float>(parameter);
+		if (!std::isfinite(distance)) return false;
 
 		hit.Distance = distance;
 		hit.Position = distanceRay.PointAt(distance);
 		hit.Normal = geometricNormal.Normalized();
-		hit.Barycentric = { 1.0f - barycentricB - barycentricC, barycentricB, barycentricC };
+		hit.Barycentric = { static_cast<float>(edgeA/area), static_cast<float>(edgeB/area), static_cast<float>(edgeC/area) };
 		hit.FrontFace = determinant > 0.0f;
 		return true;
 	}

@@ -1,3 +1,4 @@
+#include "Renderer/D3DShaderCache.h"
 #include "Editor/ImguiRenderDX11.h"
 
 // Adapted from Riemann's pull-queue DX11 ImGui renderer for Evans Editor.
@@ -170,7 +171,7 @@ namespace Evans::Editor
 		ID3DBlob* psBlob = nullptr;
 		ID3DBlob* errorBlob = nullptr;
 
-		HRESULT hr = D3DCompile(shaderSource, std::strlen(shaderSource), nullptr, nullptr, nullptr, "VS", "vs_4_0", 0, 0, &vsBlob, &errorBlob);
+		HRESULT hr = Evans::Renderer::CompileCachedD3DShader(shaderSource, std::strlen(shaderSource), nullptr, nullptr, nullptr, "VS", "vs_4_0", 0, 0, &vsBlob, &errorBlob);
 		if (FAILED(hr))
 		{
 			if (errorBlob)
@@ -182,7 +183,7 @@ namespace Evans::Editor
 		}
 		SafeRelease(errorBlob);
 
-		hr = D3DCompile(shaderSource, std::strlen(shaderSource), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &psBlob, &errorBlob);
+		hr = Evans::Renderer::CompileCachedD3DShader(shaderSource, std::strlen(shaderSource), nullptr, nullptr, nullptr, "PS", "ps_4_0", 0, 0, &psBlob, &errorBlob);
 		if (FAILED(hr))
 		{
 			if (errorBlob)
@@ -348,6 +349,7 @@ namespace Evans::Editor
 		TEXTMETRICA metrics = {};
 		GetTextMetricsA(dc, &metrics);
 		m_FontHeight = std::max(8, static_cast<int>(metrics.tmHeight));
+        imguiSetFontHeight(m_FontHeight);
 
 		int penX = 1;
 		int penY = 1;

@@ -14,6 +14,7 @@
 
 namespace Evans::Rasterizer::Detail
 {
+class ParallelExecutor;
 
 class ExecutionGate
 {
@@ -113,6 +114,6 @@ struct PreparedGpuRasterScenes
     const RasterSettings& settings,
     bool prepareShadowScene,
     const RasterCancellationToken& externalCancellation,
-    const std::atomic<bool>& backendCancellation);
+    const std::atomic<bool>& backendCancellation, ParallelExecutor* workers = nullptr);
 
 } // namespace Evans::Rasterizer::Detail

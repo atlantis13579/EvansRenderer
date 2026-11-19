@@ -1,3 +1,5 @@
+#include "Renderer/Types.h"
+#include "Renderer/OpenGLES/OpenGLESProgramCache.h"
 #include "Editor/EditorPresenterOpenGLES.h"
 
 #if defined(_WIN32)
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <cwchar>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -108,7 +111,6 @@ constexpr GLenum GL_DEPTH_TEST = 0x0B71;
 constexpr GLenum GL_CULL_FACE = 0x0B44;
 constexpr GLenum GL_BLEND = 0x0BE2;
 constexpr GLenum GL_SCISSOR_TEST = 0x0C11;
-constexpr GLenum GL_PACK_ALIGNMENT = 0x0D05;
 constexpr GLenum GL_UNPACK_ALIGNMENT = 0x0CF5;
 
 using PFNGLGETERROR = GLenum(EVANS_GL_CALL*)();
@@ -151,8 +153,6 @@ using PFNGLCLEAR = void(EVANS_GL_CALL*)(GLbitfield);
 using PFNGLDISABLE = void(EVANS_GL_CALL*)(GLenum);
 using PFNGLDRAWARRAYS = void(EVANS_GL_CALL*)(GLenum, GLint, GLsizei);
 using PFNGLPIXELSTOREI = void(EVANS_GL_CALL*)(GLenum, GLint);
-using PFNGLREADPIXELS = void(EVANS_GL_CALL*)(
-    GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 
 struct ViewportVertex
 {
@@ -325,7 +325,7 @@ struct EditorPresenterOpenGLES::Impl
 
     bool CreateWindowContext(HWND window)
     {
-        Display = EglGetDisplay(nullptr);
+        Display = SharedDisplay ? SharedDisplay : EglGetDisplay(nullptr);
         EGLint major = 0;
         EGLint minor = 0;
         if (Display == nullptr ||
@@ -355,15 +355,30 @@ struct EditorPresenterOpenGLES::Impl
             return Fail(HexError(
                 "eglBindAPI(OpenGL ES)", static_cast<unsigned long>(EglGetError())));
         const EGLint surfaceAttributes[] = {EGL_NONE_VALUE};
+        // WGL pixel formats are fixed for the lifetime of an HWND. Give ANGLE
+        // its own surface window even when Vulkan previously used the parent.
+        RECT client{};
+        GetClientRect(window, &client);
+        WNDCLASSW surfaceClass{};
+        surfaceClass.style = CS_OWNDC;
+        surfaceClass.lpfnWndProc = DefWindowProcW;
+        surfaceClass.hInstance = GetModuleHandleW(nullptr);
+        surfaceClass.lpszClassName = L"EvansOpenGLESSurface";
+        if (!RegisterClassW(&surfaceClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return Fail("Cannot register the OpenGL ES presentation window");
+        SurfaceWindow = CreateWindowExW(0, surfaceClass.lpszClassName, L"",
+            WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+            0, 0, client.right, client.bottom, window, nullptr, surfaceClass.hInstance, nullptr);
+        if (!SurfaceWindow) return Fail("Cannot create the OpenGL ES presentation window");
         Surface = EglCreateWindowSurface(
-            Display, Config, reinterpret_cast<EGLNativeWindowType>(window),
+            Display, Config, reinterpret_cast<EGLNativeWindowType>(SurfaceWindow),
             surfaceAttributes);
         if (Surface == nullptr)
             return Fail(HexError(
                 "eglCreateWindowSurface", static_cast<unsigned long>(EglGetError())));
         const EGLint contextAttributes[] = {
             EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE_VALUE};
-        Context = EglCreateContext(Display, Config, nullptr, contextAttributes);
+        Context = SharedContext ? SharedContext : EglCreateContext(Display, Config, nullptr, contextAttributes);
         if (Context == nullptr)
             return Fail(HexError(
                 "eglCreateContext(OpenGL ES 3)",
@@ -415,8 +430,7 @@ struct EditorPresenterOpenGLES::Impl
                EVANS_LOAD_GL(GlClear, "glClear") &&
                EVANS_LOAD_GL(GlDisable, "glDisable") &&
                EVANS_LOAD_GL(GlDrawArrays, "glDrawArrays") &&
-               EVANS_LOAD_GL(GlPixelStorei, "glPixelStorei") &&
-               EVANS_LOAD_GL(GlReadPixels, "glReadPixels");
+               EVANS_LOAD_GL(GlPixelStorei, "glPixelStorei");
 #undef EVANS_LOAD_GL
     }
 
@@ -467,38 +481,20 @@ void main()
 precision highp float;
 in vec2 TexCoord;
 uniform sampler2D ViewportTexture;
+uniform int NativeGpuImage;
 out vec4 OutColor;
 void main()
 {
     OutColor = texture(ViewportTexture, TexCoord);
+    if(NativeGpuImage!=0)
+        OutColor.rgb=mix(12.92*OutColor.rgb,1.055*pow(max(OutColor.rgb,vec3(0)),vec3(1.0/2.4))-0.055,step(vec3(0.0031308),OutColor.rgb));
 }
 )GLSL";
-        const GLuint vertex = Compile(GL_VERTEX_SHADER, vertexSource);
-        if (vertex == 0) return false;
-        const GLuint fragment = Compile(GL_FRAGMENT_SHADER, fragmentSource);
-        if (fragment == 0)
-        {
-            GlDeleteShader(vertex);
-            return false;
-        }
-        ViewportProgram = GlCreateProgram();
-        GlAttachShader(ViewportProgram, vertex);
-        GlAttachShader(ViewportProgram, fragment);
-        GlLinkProgram(ViewportProgram);
-        GlDeleteShader(vertex);
-        GlDeleteShader(fragment);
-        GLint linked = 0;
-        GlGetProgramiv(ViewportProgram, GL_LINK_STATUS, &linked);
-        if (linked == 0)
-        {
-            GLint logLength = 0;
-            GlGetProgramiv(ViewportProgram, GL_INFO_LOG_LENGTH, &logLength);
-            std::vector<char> log(
-                static_cast<std::size_t>(std::max(logLength, 1)), '\0');
-            GlGetProgramInfoLog(
-                ViewportProgram, static_cast<GLsizei>(log.size()), nullptr, log.data());
-            return Fail(std::string("OpenGL ES viewport program link failed: ") + log.data());
-        }
+        ViewportProgram=Renderer::CompileCachedGLESProgram([this](const char* name) {
+            auto* address=reinterpret_cast<void*>(GetProcAddress(GLESModule,name));
+            return address?address:EglGetProcAddress(name);
+        },{{GL_VERTEX_SHADER,vertexSource},{GL_FRAGMENT_SHADER,fragmentSource}},LastError);
+        if(!ViewportProgram)return false;
         const GLint textureLocation =
             GlGetUniformLocation(ViewportProgram, "ViewportTexture");
         if (textureLocation < 0)
@@ -530,9 +526,37 @@ void main()
         GlTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
 
+    std::shared_ptr<void> SharedGroup;
+    std::shared_ptr<std::mutex> SharedAccess;
+    std::unique_lock<std::mutex> FrameAccess;
+    EGLDisplay SharedDisplay=nullptr;
+    EGLContext SharedContext=nullptr;
+    bool GpuViewport=false,SkipTerminate=false;
+    std::shared_ptr<const Renderer::GpuImage> GpuFrameLease;
+    bool AdoptGpuGroup(const Image& image)
+    {
+        const auto gpu=image.GpuColor?image.GpuColor:image.GpuContext;
+        if(!gpu || SharedGroup==gpu->ContextOwner)
+            return Context ? true : InitializeNow(Window,Width,Height);
+        if(gpu->Backend!=Renderer::RHIBackend::OpenGLES)return Fail("Incompatible GPU viewport backend");
+        const auto window=Window;const auto width=Width,height=Height;
+        SkipTerminate=Display==gpu->NativeDisplay;
+        Shutdown();
+        SharedDisplay=gpu->NativeDisplay;SharedContext=gpu->NativeContext;SharedGroup=gpu->ContextOwner;
+        return InitializeNow(window,width,height);
+    }
+
     bool EnsureViewportTexture(const Image& image, std::uint64_t revision)
     {
         if (!image.IsValid()) return false;
+        if(image.GpuColor)
+        {
+            if(!GpuViewport && ViewportTexture)GlDeleteTextures(1,&ViewportTexture);
+            ViewportTexture=GLuint(reinterpret_cast<std::uintptr_t>(image.GpuColor->NativeTexture));
+            GpuViewport=true;GpuFrameLease=image.GpuColor;
+            ImageWidth=image.Width;ImageHeight=image.Height;UploadedRevision=revision;return true;
+        }
+        if(GpuViewport){ViewportTexture=0;GpuViewport=false;GpuFrameLease.reset();}
         if (ViewportTexture == 0)
         {
             GlGenTextures(1, &ViewportTexture);
@@ -566,14 +590,16 @@ void main()
         const float right = static_cast<float>(x + width) * 2.0f / Width - 1.0f;
         const float top = 1.0f - static_cast<float>(y) * 2.0f / Height;
         const float bottom = 1.0f - static_cast<float>(y + height) * 2.0f / Height;
-        const ViewportVertex vertices[] = {
+        ViewportVertex vertices[] = {
             {{left, top}, {0.0f, 0.0f}},
             {{right, top}, {1.0f, 0.0f}},
             {{right, bottom}, {1.0f, 1.0f}},
             {{left, top}, {0.0f, 0.0f}},
             {{right, bottom}, {1.0f, 1.0f}},
             {{left, bottom}, {0.0f, 1.0f}}};
+        if(GpuViewport)for(auto& vertex:vertices)vertex.TexCoord[1]=1.0f-vertex.TexCoord[1];
         GlUseProgram(ViewportProgram);
+        GlUniform1i(GlGetUniformLocation(ViewportProgram,"NativeGpuImage"),GpuViewport?1:0);
         GlBindVertexArray(ViewportVertexArray);
         GlBindBuffer(GL_ARRAY_BUFFER, ViewportVertexBuffer);
         GlBufferData(
@@ -587,6 +613,11 @@ void main()
         GlDrawArrays(GL_TRIANGLES, 0, 6);
     }
 
+    void AbortFrameAccess() noexcept
+    {
+        if(Display && EglMakeCurrent)EglMakeCurrent(Display,nullptr,nullptr,nullptr);
+        if(FrameAccess.owns_lock())FrameAccess.unlock();
+    }
     bool MakeCurrent()
     {
         if (Display == nullptr || Surface == nullptr || Context == nullptr)
@@ -597,9 +628,14 @@ void main()
             "eglMakeCurrent", static_cast<unsigned long>(EglGetError())));
     }
 
-    bool Initialize(HWND window, int width, int height)
+    bool Initialize(HWND window,int width,int height)
     {
-        Shutdown();
+        Shutdown();Window=window;Width=width;Height=height;Initialized=true;return true;
+    }
+    bool InitializeNow(HWND window, int width, int height)
+    {
+        const auto shared=SharedGroup;const auto display=SharedDisplay,context=SharedContext;
+        Shutdown();SharedGroup=shared;SharedDisplay=display;SharedContext=context;
         if (window == nullptr || IsWindow(window) == FALSE || width <= 0 || height <= 0)
             return Fail(
                 "The OpenGL ES editor presenter requires a valid Win32 window and dimensions.");
@@ -632,12 +668,14 @@ void main()
 
     void Shutdown() noexcept
     {
+        std::unique_lock<std::mutex> cleanup;
+        if(SharedAccess && !FrameAccess.owns_lock())cleanup=std::unique_lock<std::mutex>(*SharedAccess);
         if (Display != nullptr && Surface != nullptr && Context != nullptr &&
             EglMakeCurrent != nullptr)
         {
             EglMakeCurrent(Display, Surface, Surface, Context);
             ImguiRenderer.Shutdown();
-            if (GlDeleteTextures != nullptr && ViewportTexture != 0)
+            if (!GpuViewport && GlDeleteTextures != nullptr && ViewportTexture != 0)
                 GlDeleteTextures(1, &ViewportTexture);
             if (GlDeleteBuffers != nullptr && ViewportVertexBuffer != 0)
                 GlDeleteBuffers(1, &ViewportVertexBuffer);
@@ -647,11 +685,14 @@ void main()
                 GlDeleteProgram(ViewportProgram);
             EglMakeCurrent(Display, nullptr, nullptr, nullptr);
         }
-        if (Display != nullptr && Context != nullptr && EglDestroyContext != nullptr)
+        if (!SharedGroup && Display != nullptr && Context != nullptr && EglDestroyContext != nullptr)
             EglDestroyContext(Display, Context);
         if (Display != nullptr && Surface != nullptr && EglDestroySurface != nullptr)
             EglDestroySurface(Display, Surface);
-        if (Display != nullptr && EglTerminate != nullptr) EglTerminate(Display);
+        if (SurfaceWindow) DestroyWindow(SurfaceWindow);
+        SurfaceWindow = nullptr;
+        if (!SharedGroup && !SkipTerminate && Display != nullptr && EglTerminate != nullptr) EglTerminate(Display);
+        GpuFrameLease.reset();SharedGroup.reset();SharedDisplay=nullptr;SharedContext=nullptr;GpuViewport=false;SkipTerminate=false;
         if (EGLModule != nullptr) FreeLibrary(EGLModule);
         if (GLESModule != nullptr) FreeLibrary(GLESModule);
 
@@ -678,6 +719,8 @@ void main()
     {
         if (!Initialized || width <= 0 || height <= 0)
             return Fail("OpenGL ES presenter resize requires positive dimensions.");
+        if (SurfaceWindow && !SetWindowPos(SurfaceWindow, nullptr, 0, 0, width, height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return Fail("Cannot resize the OpenGL ES presentation window");
         Width = width;
         Height = height;
         return true;
@@ -691,7 +734,14 @@ void main()
         int viewportWidth,
         int viewportHeight)
     {
-        if (!Initialized || !MakeCurrent()) return false;
+        const auto context=image.GpuContext;
+        if(context && context->Owner)SharedAccess=std::static_pointer_cast<std::mutex>(context->Owner);
+        if(SharedAccess && !FrameAccess.owns_lock())FrameAccess=std::unique_lock<std::mutex>(*SharedAccess);
+        if (!AdoptGpuGroup(image) || !Initialized || !MakeCurrent()) return false;
+        const auto bindFramebuffer=reinterpret_cast<void(EVANS_GL_CALL*)(GLenum,GLuint)>(ResolveGL("glBindFramebuffer"));
+        const auto bindSampler=reinterpret_cast<void(EVANS_GL_CALL*)(GLuint,GLuint)>(ResolveGL("glBindSampler"));
+        if(bindFramebuffer)bindFramebuffer(0x8D40,0);
+        if(bindSampler)bindSampler(0,0);
         GlViewport(0, 0, Width, Height);
         GlDisable(GL_SCISSOR_TEST);
         GlClearColor(0.035f, 0.043f, 0.059f, 1.0f);
@@ -714,36 +764,18 @@ void main()
     bool EndFrame()
     {
         if (!Initialized || !MakeCurrent()) return false;
-        if (EglSwapBuffers(Display, Surface) != EGL_FALSE_VALUE) return true;
+        if (EglSwapBuffers(Display, Surface) != EGL_FALSE_VALUE)
+        {
+            EglMakeCurrent(Display,nullptr,nullptr,nullptr);
+            if(FrameAccess.owns_lock())FrameAccess.unlock();
+            return true;
+        }
         return Fail(HexError(
             "eglSwapBuffers", static_cast<unsigned long>(EglGetError())));
     }
 
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (!Initialized || !MakeCurrent()) return false;
-        const std::size_t rowBytes = static_cast<std::size_t>(Width) * 4U;
-        std::vector<std::uint8_t> bottomUp(
-            rowBytes * static_cast<std::size_t>(Height));
-        GlPixelStorei(GL_PACK_ALIGNMENT, 1);
-        GlReadPixels(
-            0, 0, Width, Height, GL_RGBA, GL_UNSIGNED_BYTE, bottomUp.data());
-        if (!CheckGL("Capture OpenGL ES editor back buffer")) return false;
-        output.Width = static_cast<std::uint32_t>(Width);
-        output.Height = static_cast<std::uint32_t>(Height);
-        output.PixelsRGBA8.resize(bottomUp.size());
-        for (int row = 0; row < Height; ++row)
-        {
-            std::memcpy(
-                output.PixelsRGBA8.data() + static_cast<std::size_t>(row) * rowBytes,
-                bottomUp.data() + static_cast<std::size_t>(Height - 1 - row) * rowBytes,
-                rowBytes);
-        }
-        return true;
-    }
-
     HWND Window = nullptr;
+    HWND SurfaceWindow = nullptr;
     int Width = 0;
     int Height = 0;
     bool Initialized = false;
@@ -805,7 +837,6 @@ void main()
     PFNGLDISABLE GlDisable = nullptr;
     PFNGLDRAWARRAYS GlDrawArrays = nullptr;
     PFNGLPIXELSTOREI GlPixelStorei = nullptr;
-    PFNGLREADPIXELS GlReadPixels = nullptr;
     GLuint ViewportProgram = 0;
     GLuint ViewportVertexArray = 0;
     GLuint ViewportVertexBuffer = 0;
@@ -831,7 +862,7 @@ bool EditorPresenterOpenGLES::Initialize(void* nativeWindow, int width, int heig
 
 void EditorPresenterOpenGLES::Shutdown() noexcept
 {
-    Impl_->Shutdown();
+    Impl_->Shutdown();Impl_->AbortFrameAccess();
 }
 
 bool EditorPresenterOpenGLES::Resize(int width, int height)
@@ -847,9 +878,11 @@ bool EditorPresenterOpenGLES::BeginFrame(
     int viewportWidth,
     int viewportHeight)
 {
-    return Impl_->BeginFrame(
+    const bool success=Impl_->BeginFrame(
         viewportImage, viewportRevision, viewportX, viewportY,
         viewportWidth, viewportHeight);
+    if(!success)Impl_->AbortFrameAccess();
+    return success;
 }
 
 void EditorPresenterOpenGLES::DrawImgui()
@@ -859,12 +892,7 @@ void EditorPresenterOpenGLES::DrawImgui()
 
 bool EditorPresenterOpenGLES::EndFrame()
 {
-    return Impl_->EndFrame();
-}
-
-bool EditorPresenterOpenGLES::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
+    const bool success=Impl_->EndFrame();if(!success)Impl_->AbortFrameAccess();return success;
 }
 
 bool EditorPresenterOpenGLES::IsInitialized() const noexcept

@@ -7,7 +7,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 
 #if defined(_WIN32)
@@ -166,6 +168,12 @@ struct FaceCorner
     bool HasNormal = false;
 };
 
+// Preserve explicit OBJ corner identity for topology-aware LOD. Equal positions
+// alone do not imply a shared vertex: UV/normal seams and separate source shells
+// must remain distinct. Missing normals keep the original per-triangle shading.
+using CornerKey = std::tuple<std::size_t, std::size_t, std::size_t>;
+using CornerCache = std::map<CornerKey, std::uint32_t>;
+
 [[nodiscard]] std::size_t ResolveIndex(
     int parsed,
     std::size_t elementCount,
@@ -245,6 +253,7 @@ void EnsureSection(MeshAsset& mesh, const std::string& materialName)
 
 void AppendTriangle(
     MeshAsset& mesh,
+    CornerCache& cornerCache,
     const FaceCorner& corner0,
     const FaceCorner& corner1,
     const FaceCorner& corner2,
@@ -260,12 +269,21 @@ void AppendTriangle(
     const FaceCorner corners[] = {corner0, corner1, corner2};
     for (const FaceCorner& corner : corners)
     {
+        constexpr std::size_t MissingTexCoord = std::numeric_limits<std::size_t>::max();
+        const CornerKey key{corner.Position, corner.HasTexCoord ? corner.TexCoord : MissingTexCoord, corner.Normal};
+        if (corner.HasNormal)
+        {
+            const auto found = cornerCache.find(key);
+            if (found != cornerCache.end()) { mesh.Indices.push_back(found->second); continue; }
+        }
         Vertex vertex;
         vertex.Position = positions[corner.Position];
         vertex.TexCoord = corner.HasTexCoord ? texCoords[corner.TexCoord] : Float2{};
         vertex.Normal = corner.HasNormal ? normals[corner.Normal] : flatNormal;
-        mesh.Indices.push_back(static_cast<std::uint32_t>(mesh.Vertices.size()));
+        const auto index = static_cast<std::uint32_t>(mesh.Vertices.size());
+        mesh.Indices.push_back(index);
         mesh.Vertices.push_back(vertex);
+        if (corner.HasNormal) cornerCache.emplace(key, index);
     }
     mesh.Sections.back().IndexCount += 3;
 }
@@ -536,6 +554,7 @@ ObjDocument ResourceParser::ParseObj(std::string_view source)
     document.Meshes.push_back({"Default"});
     MeshAsset* currentMesh = &document.Meshes.back();
     std::string currentMaterial;
+    CornerCache cornerCache;
 
     std::istringstream stream{std::string(source)};
     std::string ownedLine;
@@ -563,6 +582,7 @@ ObjDocument ResourceParser::ParseObj(std::string_view source)
         }
         else if (command == "o" || command == "g")
         {
+            cornerCache.clear();
             const std::string name = arguments.empty() ? "Unnamed" : std::string(arguments);
             if (currentMesh->Indices.empty())
             {
@@ -576,6 +596,7 @@ ObjDocument ResourceParser::ParseObj(std::string_view source)
         }
         else if (command == "usemtl")
         {
+            if (currentMaterial != arguments) cornerCache.clear();
             currentMaterial = std::string(arguments);
         }
         else if (command == "mtllib")
@@ -609,6 +630,7 @@ ObjDocument ResourceParser::ParseObj(std::string_view source)
             {
                 AppendTriangle(
                     *currentMesh,
+                    cornerCache,
                     corners[0],
                     corners[index],
                     corners[index + 1],
@@ -695,6 +717,9 @@ std::vector<Material> ResourceParser::ParseMtl(std::string_view source)
             current->Opacity = 1.0f - ParseScalar(arguments, lineNumber);
             current->Diffuse.A = current->Opacity;
         }
+        else if (command == "Pr") current->Roughness = ParseScalar(arguments, lineNumber);
+        else if (command == "Pm") current->Metallic = ParseScalar(arguments, lineNumber);
+        else if (command == "map_MetallicRoughness") current->MetallicRoughnessTexture = LastWord(arguments);
         else if (command == "map_Kd")
         {
             current->DiffuseTexture = LastWord(arguments);
@@ -761,42 +786,38 @@ std::shared_ptr<const ImageAsset> FileResourceLoader::LoadImage(
 #endif
 }
 
+std::vector<Material> FileResourceLoader::LoadMaterialLibrary(const std::filesystem::path& path)
+{
+    auto materials = ResourceParser::ParseMtl(ReadTextFile(path));
+    std::unordered_map<std::string, std::shared_ptr<const ImageAsset>> cache;
+    const auto load = [&](std::string& name, std::shared_ptr<const ImageAsset>& image)
+    {
+        if (name.empty()) return;
+        name = (path.parent_path() / name).lexically_normal().string();
+        auto& cached = cache[name];
+        if (!cached) cached = LoadImage(name);
+        image = cached;
+    };
+    for (auto& material : materials)
+    {
+        load(material.DiffuseTexture, material.DiffuseImage);
+        load(material.NormalTexture, material.NormalImage);
+        load(material.OpacityTexture, material.OpacityImage);
+        load(material.MetallicRoughnessTexture, material.MetallicRoughnessImage);
+    }
+    return materials;
+}
+
 LoadedModel FileResourceLoader::LoadObj(const std::filesystem::path& path)
 {
     LoadedModel model;
     model.Geometry = ResourceParser::ParseObj(ReadTextFile(path));
     std::unordered_map<std::string, std::size_t> materialIndices;
-    std::unordered_map<std::string, std::shared_ptr<const ImageAsset>> imageCache;
     for (const std::string& library : model.Geometry.MaterialLibraries)
     {
-        const auto libraryPath = path.parent_path() / std::filesystem::path(library);
-        std::vector<Material> loadedMaterials = ResourceParser::ParseMtl(ReadTextFile(libraryPath));
+        auto loadedMaterials = LoadMaterialLibrary(path.parent_path() / library);
         for (Material& material : loadedMaterials)
         {
-            const auto resolveTexture = [&libraryPath, &imageCache](
-                std::string& textureName,
-                std::shared_ptr<const ImageAsset>& image,
-                bool decode)
-            {
-                if (textureName.empty()) return;
-                const std::filesystem::path resolved =
-                    (libraryPath.parent_path() / std::filesystem::path(textureName))
-                        .lexically_normal();
-                textureName = resolved.string();
-                if (!decode) return;
-                const auto found = imageCache.find(textureName);
-                if (found != imageCache.end())
-                {
-                    image = found->second;
-                    return;
-                }
-                image = FileResourceLoader::LoadImage(resolved);
-                imageCache.emplace(textureName, image);
-            };
-            resolveTexture(material.DiffuseTexture, material.DiffuseImage, true);
-            resolveTexture(material.OpacityTexture, material.OpacityImage, true);
-            resolveTexture(material.NormalTexture, material.NormalImage, true);
-
             const auto existing = materialIndices.find(material.Name);
             if (existing == materialIndices.end())
             {

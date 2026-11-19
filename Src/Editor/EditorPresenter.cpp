@@ -58,6 +58,8 @@ EditorPresentationAPI ResolvePresentationAPI(
     std::string_view backendId,
     EditorPresentationAPI lastRealtimeAPI) noexcept
 {
+    if (backendId == "rasterizer.cuda" || backendId == "rasterizer.compute") return EditorPresentationAPI::DX11;
+    if (backendId == "rasterizer.metal") return EditorPresentationAPI::Metal;
     if (backendId == "renderer.dx11") return EditorPresentationAPI::DX11;
     if (backendId == "renderer.dx12") return EditorPresentationAPI::DX12;
     if (backendId == "renderer.dxr")
@@ -65,10 +67,9 @@ EditorPresentationAPI ResolvePresentationAPI(
         return EditorPresentationAPI::DX12;
     }
     if (backendId == "renderer.metal") return EditorPresentationAPI::Metal;
-    // OpenGL ES renders offscreen through ANGLE and publishes a CPU Image like
-    // every other backend. Reuse the last window presenter so the UI and RHI do
-    // not create independent contexts on ANGLE's process-global EGL display.
-    if (backendId == "renderer.opengles") return lastRealtimeAPI;
+    // The GL presenter borrows the producer's serialized EGL context so native
+    // textures remain available while the context moves between threads.
+    if (backendId == "renderer.opengles") return EditorPresentationAPI::OpenGLES;
     if (backendId == "renderer.vulkan") return EditorPresentationAPI::Vulkan;
     return lastRealtimeAPI;
 }

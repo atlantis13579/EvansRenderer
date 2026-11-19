@@ -8,10 +8,14 @@
 
 namespace Evans::Rasterizer
 {
+namespace Detail { class ParallelExecutor; }
+
+struct ScreenTriangle;
 
 struct CpuRasterResources
 {
-    std::vector<std::vector<std::uint32_t>> TileBins;
+    std::shared_ptr<Detail::ParallelExecutor> Workers;
+    std::vector<std::vector<const ScreenTriangle*>> TileBins, ShadowTileBins;
     std::vector<std::uint8_t> SelectionMask;
 };
 

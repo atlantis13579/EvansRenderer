@@ -2,6 +2,8 @@
 
 #include "BackendCommon.hpp"
 #include "CudaRasterPtx.h"
+#include "Rasterizer/D3D11GpuOutput.h"
+#include "GpuGeometryFrame.h"
 #include "GpuRasterCommon.hpp"
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
+#include <dxgi.h>
 #endif
 
 namespace Evans::Rasterizer
@@ -31,147 +34,6 @@ namespace
 
 using GpuTriangle = Detail::GpuRasterTriangle;
 using GpuTexture = Detail::GpuRasterTexture;
-using GpuConstants = Detail::GpuRasterConstants;
-
-[[nodiscard]] std::vector<GpuTriangle> BuildGpuTriangles(const RasterScene& scene)
-{
-    return Detail::BuildGpuRasterTriangles(scene);
-}
-
-[[nodiscard]] GpuConstants BuildConstants(
-    const RasterScene& scene,
-    const RasterSettings& settings,
-    const RenderTarget& target,
-    bool shadowsEnabled,
-    std::uint32_t shadowWidth,
-    std::uint32_t shadowHeight)
-{
-    return Detail::BuildGpuRasterConstants(
-        scene,
-        settings,
-        target,
-        shadowsEnabled,
-        shadowWidth,
-        shadowHeight);
-}
-
-struct TileBins
-{
-    std::vector<std::uint32_t> Offsets;
-    std::vector<std::uint32_t> TriangleIndices;
-    std::uint32_t TilesX = 0;
-    std::uint32_t TilesY = 0;
-    std::uint32_t MaximumListLength = 0;
-};
-
-[[nodiscard]] Float4 TransformForBinning(
-    const RasterVertex& vertex,
-    const RasterSettings& settings,
-    bool lightPass) noexcept
-{
-    if (settings.InputSpace == VertexInputSpace::Clip)
-    {
-        return lightPass ? vertex.ShadowClipPosition : vertex.ClipPosition;
-    }
-    const Float4 local{vertex.Position.X, vertex.Position.Y, vertex.Position.Z, 1.0f};
-    const Float4 world = settings.World * local;
-    return lightPass
-               ? settings.LightViewProjection * world
-               : settings.Projection * (settings.View * world);
-}
-
-[[nodiscard]] TileBins BuildTileBins(
-    const RasterScene& scene,
-    const RasterSettings& settings,
-    std::uint32_t width,
-    std::uint32_t height,
-    bool lightPass)
-{
-    constexpr std::uint32_t tileSize = 16U;
-    TileBins result;
-    result.TilesX = (width + tileSize - 1U) / tileSize;
-    result.TilesY = (height + tileSize - 1U) / tileSize;
-    const std::uint32_t tileCount = result.TilesX * result.TilesY;
-    std::vector<std::uint32_t> counts(tileCount, 0U);
-    struct Bounds { int MinimumX; int MinimumY; int MaximumX; int MaximumY; bool Valid; };
-    std::vector<Bounds> bounds(scene.Triangles.size());
-    for (std::size_t triangleIndex = 0; triangleIndex < scene.Triangles.size(); ++triangleIndex)
-    {
-        float screenX[3]{};
-        float screenY[3]{};
-        bool valid = true;
-        for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
-        {
-            const Float4 clip = TransformForBinning(
-                scene.Triangles[triangleIndex].Vertices[vertexIndex], settings, lightPass);
-            if (!std::isfinite(clip.W) || clip.W <= 1.0e-6f)
-            {
-                valid = false;
-                break;
-            }
-            const float inverseW = 1.0f / clip.W;
-            screenX[vertexIndex] = (clip.X * inverseW * 0.5f + 0.5f) * width;
-            screenY[vertexIndex] = (0.5f - clip.Y * inverseW * 0.5f) * height;
-        }
-        if (!valid)
-        {
-            bounds[triangleIndex] = {0, 0, -1, -1, false};
-            continue;
-        }
-        const int minimumX = std::max(
-            0, static_cast<int>(std::floor(std::min({screenX[0], screenX[1], screenX[2]}))));
-        const int minimumY = std::max(
-            0, static_cast<int>(std::floor(std::min({screenY[0], screenY[1], screenY[2]}))));
-        const int maximumX = std::min(
-            static_cast<int>(width) - 1,
-            static_cast<int>(std::ceil(std::max({screenX[0], screenX[1], screenX[2]}))));
-        const int maximumY = std::min(
-            static_cast<int>(height) - 1,
-            static_cast<int>(std::ceil(std::max({screenY[0], screenY[1], screenY[2]}))));
-        valid = minimumX <= maximumX && minimumY <= maximumY;
-        bounds[triangleIndex] = {minimumX, minimumY, maximumX, maximumY, valid};
-        if (!valid) continue;
-        for (std::uint32_t tileY = static_cast<std::uint32_t>(minimumY) / tileSize;
-             tileY <= static_cast<std::uint32_t>(maximumY) / tileSize;
-             ++tileY)
-        {
-            for (std::uint32_t tileX = static_cast<std::uint32_t>(minimumX) / tileSize;
-                 tileX <= static_cast<std::uint32_t>(maximumX) / tileSize;
-                 ++tileX)
-            {
-                ++counts[tileY * result.TilesX + tileX];
-            }
-        }
-    }
-    result.Offsets.resize(static_cast<std::size_t>(tileCount) + 1U, 0U);
-    for (std::uint32_t tile = 0; tile < tileCount; ++tile)
-    {
-        result.MaximumListLength = std::max(result.MaximumListLength, counts[tile]);
-        result.Offsets[tile + 1U] = result.Offsets[tile] + counts[tile];
-    }
-    result.TriangleIndices.resize(result.Offsets.back());
-    std::vector<std::uint32_t> writeOffsets = result.Offsets;
-    for (std::uint32_t triangleIndex = 0;
-         triangleIndex < static_cast<std::uint32_t>(bounds.size());
-         ++triangleIndex)
-    {
-        const Bounds& triangleBounds = bounds[triangleIndex];
-        if (!triangleBounds.Valid) continue;
-        for (std::uint32_t tileY = static_cast<std::uint32_t>(triangleBounds.MinimumY) / tileSize;
-             tileY <= static_cast<std::uint32_t>(triangleBounds.MaximumY) / tileSize;
-             ++tileY)
-        {
-            for (std::uint32_t tileX = static_cast<std::uint32_t>(triangleBounds.MinimumX) / tileSize;
-                 tileX <= static_cast<std::uint32_t>(triangleBounds.MaximumX) / tileSize;
-                 ++tileX)
-            {
-                const std::uint32_t tile = tileY * result.TilesX + tileX;
-                result.TriangleIndices[writeOffsets[tile]++] = triangleIndex;
-            }
-        }
-    }
-    return result;
-}
 
 [[nodiscard]] const std::string& EmbeddedCudaRasterPtx()
 {
@@ -235,6 +97,9 @@ public:
                 "cuModuleLoadData(embedded PTX)",
                 error) ||
             !Check(CuModuleGetFunction_(&Kernel_, Module_, "RasterKernel"), "cuModuleGetFunction(RasterKernel)", error) ||
+            !Check(CuModuleGetFunction_(&TransformKernel_,Module_,"TransformKernel"),"Load CUDA transform kernel",error) ||
+            !Check(CuModuleGetFunction_(&SetupKernel_,Module_,"SetupKernel"),"Load CUDA setup kernel",error) ||
+            !Check(CuModuleGetFunction_(&OutlineKernel_,Module_,"OutlineKernel"),"Load CUDA outline kernel",error) ||
             !Check(CuModuleGetFunction_(&ShadowKernel_, Module_, "ShadowDepthKernel"), "cuModuleGetFunction(ShadowDepthKernel)", error))
         {
             Shutdown();
@@ -250,6 +115,14 @@ public:
         {
             (void)CuCtxSetCurrent_(Context_);
         }
+        ReleaseInterop();
+        for(auto buffer:{&Source_,&Transformed_,&Projected_,&Bins_,&Constants_,&Shadow_,&Colors_,&Depths_,&Visibility_}) {
+            if(buffer->Pointer && CuMemFree_)(void)CuMemFree_(buffer->Pointer); *buffer={};
+        }
+        ResidentScene_.reset(); GpuOutput_.Shutdown();
+        if(TextureDescriptors_ && CuMemFree_)(void)CuMemFree_(TextureDescriptors_);
+        if(TextureTexels_ && CuMemFree_)(void)CuMemFree_(TextureTexels_);
+        TextureDescriptors_=TextureTexels_=0;TextureGeneration_=0;TextureCache_.Reset();
         if (Module_ != nullptr && CuModuleUnload_ != nullptr) (void)CuModuleUnload_(Module_);
         if (Context_ != nullptr && CuCtxDestroy_ != nullptr) (void)CuCtxDestroy_(Context_);
         Module_ = nullptr;
@@ -270,400 +143,175 @@ public:
         const std::atomic<bool>& backendCancellation,
         RasterStatistics& statistics)
     {
-        if (externalCancellation.IsCancellationRequested() ||
-            backendCancellation.load(std::memory_order_relaxed))
+        const auto cancelled = [&] { return Detail::IsGpuRasterCancelled(externalCancellation,backendCancellation); };
+        if (cancelled()) return RasterStatus::Cancelled;
+        const auto start = std::chrono::steady_clock::now();
+        const Detail::GpuGeometryFrame frame(scene,settings,target);
+        Require(CuCtxSetCurrent_(Context_),"Set CUDA context");
+        struct CurrentContext { CudaRuntime& Runtime; ~CurrentContext() { (void)Runtime.CuCtxSetCurrent_(nullptr); } } current{*this};
+        const auto bytes = std::size_t(frame.TriangleCount)*sizeof(GpuTriangle);
+        auto source = Reserve(Source_,bytes);
+        const bool upload = settings.ImmutableScene.get()!=&scene || ResidentScene_.lock().get()!=&scene;
+        if (upload)
         {
-            return RasterStatus::Cancelled;
+            ResidentScene_.reset();
+            const auto packed=Detail::BuildGpuRasterTriangles(scene);
+            if (bytes) Require(CuMemcpyHtoD_(source,packed.data(),bytes),"Upload CUDA source geometry");
+            ResidentScene_=settings.ImmutableScene.get()==&scene ? settings.ImmutableScene : nullptr;
         }
-
-        const bool hasExternalShadowMap =
-            settings.ShadowsEnabled && settings.SceneShadowMap != nullptr &&
-            settings.SceneShadowMap->IsValid();
-        const bool generateShadowMap =
-            settings.ShadowsEnabled && !hasExternalShadowMap &&
-            settings.AutoGenerateShadowMap;
-        const bool shadowsEnabled = hasExternalShadowMap || generateShadowMap;
-        const std::uint32_t shadowWidth = hasExternalShadowMap
-                                              ? settings.SceneShadowMap->Width
-                                              : (generateShadowMap
-                                                     ? std::clamp(settings.ShadowMapSize, 16U, 4096U)
-                                                     : 0U);
-        const std::uint32_t shadowHeight = hasExternalShadowMap
-                                               ? settings.SceneShadowMap->Height
-                                               : shadowWidth;
-
-        const auto transformBegin = std::chrono::steady_clock::now();
-        Detail::PreparedGpuRasterScenes prepared = Detail::PrepareGpuRasterScenes(
-            scene,
-            settings,
-            generateShadowMap,
-            externalCancellation,
-            backendCancellation);
-        if (prepared.Cancelled ||
-            externalCancellation.IsCancellationRequested() ||
-            backendCancellation.load(std::memory_order_relaxed))
-        {
-            return RasterStatus::Cancelled;
-        }
-        const RasterScene& mainScene = prepared.Main;
-        const RasterScene& shadowScene = prepared.Shadow;
-        const RasterSettings& gpuSettings = prepared.Settings;
-        const auto triangles = BuildGpuTriangles(mainScene);
-        const auto shadowTriangles = generateShadowMap
-                                         ? BuildGpuTriangles(shadowScene)
-                                         : std::vector<GpuTriangle>{};
-        const Detail::GpuRasterTextureData textureData =
-            Detail::BuildGpuRasterTextures(mainScene);
-        const TileBins mainBins =
-            BuildTileBins(
-                mainScene,
-                gpuSettings,
-                target.Width(),
-                target.Height(),
-                false);
-        const TileBins shadowBins = generateShadowMap
-                                        ? BuildTileBins(
-                                              shadowScene,
-                                              gpuSettings,
-                                              shadowWidth,
-                                              shadowHeight,
-                                              true)
-                                        : TileBins{};
-        const GpuConstants constants = BuildConstants(
-            mainScene,
-            gpuSettings,
-            target,
-            shadowsEnabled,
-            shadowWidth,
-            shadowHeight);
-        statistics.TransformMilliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - transformBegin)
-                .count();
-
         std::string error;
-        if (!Check(CuCtxSetCurrent_(Context_), "cuCtxSetCurrent", error))
-        {
-            throw std::runtime_error(error);
-        }
-
-        const std::size_t triangleBytes =
-            std::max<std::size_t>(triangles.size() * sizeof(GpuTriangle), 1U);
-        const std::size_t shadowTriangleBytes = std::max<std::size_t>(
-            shadowTriangles.size() * sizeof(GpuTriangle),
-            1U);
-        const std::size_t mainOffsetBytes =
-            mainBins.Offsets.size() * sizeof(std::uint32_t);
-        const std::size_t mainIndexBytes = std::max<std::size_t>(
-            mainBins.TriangleIndices.size() * sizeof(std::uint32_t),
-            sizeof(std::uint32_t));
-        const std::size_t shadowOffsetBytes = std::max<std::size_t>(
-            shadowBins.Offsets.size() * sizeof(std::uint32_t),
-            sizeof(std::uint32_t));
-        const std::size_t shadowIndexBytes = std::max<std::size_t>(
-            shadowBins.TriangleIndices.size() * sizeof(std::uint32_t),
-            sizeof(std::uint32_t));
-        const std::size_t pixelCount =
-            static_cast<std::size_t>(target.Width()) * target.Height();
-        const std::size_t colorBytes = pixelCount * sizeof(float) * 4U;
-        const std::size_t depthBytes = pixelCount * sizeof(float);
-        const std::size_t shadowBytes = std::max<std::size_t>(
-            static_cast<std::size_t>(shadowWidth) * shadowHeight * sizeof(float),
-            sizeof(float));
-        const std::size_t textureDescriptorBytes = std::max<std::size_t>(
-            textureData.Descriptors.size() * sizeof(GpuTexture),
-            sizeof(GpuTexture));
-        const std::size_t textureTexelBytes = std::max<std::size_t>(
-            textureData.TexelsRGBA8.size() * sizeof(std::uint32_t),
-            sizeof(std::uint32_t));
-
-        CuDevicePointer deviceTriangles = 0;
-        CuDevicePointer deviceShadowTriangles = 0;
-        CuDevicePointer deviceConstants = 0;
-        CuDevicePointer deviceMainOffsets = 0;
-        CuDevicePointer deviceMainIndices = 0;
-        CuDevicePointer deviceShadowOffsets = 0;
-        CuDevicePointer deviceShadowIndices = 0;
-        CuDevicePointer deviceShadowDepths = 0;
-        CuDevicePointer deviceTextureDescriptors = 0;
-        CuDevicePointer deviceTextureTexels = 0;
-        CuDevicePointer deviceColors = 0;
-        CuDevicePointer deviceDepths = 0;
-        const auto release = [&]() noexcept
-        {
-            if (deviceDepths != 0) (void)CuMemFree_(deviceDepths);
-            if (deviceColors != 0) (void)CuMemFree_(deviceColors);
-            if (deviceTextureTexels != 0) (void)CuMemFree_(deviceTextureTexels);
-            if (deviceTextureDescriptors != 0)
-            {
-                (void)CuMemFree_(deviceTextureDescriptors);
-            }
-            if (deviceShadowDepths != 0) (void)CuMemFree_(deviceShadowDepths);
-            if (deviceShadowIndices != 0) (void)CuMemFree_(deviceShadowIndices);
-            if (deviceShadowOffsets != 0) (void)CuMemFree_(deviceShadowOffsets);
-            if (deviceMainIndices != 0) (void)CuMemFree_(deviceMainIndices);
-            if (deviceMainOffsets != 0) (void)CuMemFree_(deviceMainOffsets);
-            if (deviceConstants != 0) (void)CuMemFree_(deviceConstants);
-            if (deviceShadowTriangles != 0)
-            {
-                (void)CuMemFree_(deviceShadowTriangles);
-            }
-            if (deviceTriangles != 0) (void)CuMemFree_(deviceTriangles);
-            (void)CuCtxSetCurrent_(nullptr);
+        if (!EnsureGpuTextures(TextureCache_.Get(scene),error)) throw std::runtime_error(error);
+        if (cancelled()) return RasterStatus::Cancelled;
+        auto triangles=Reserve(Transformed_,bytes);
+        auto projected=Reserve(Projected_,std::size_t(frame.TriangleCount)*9*32);
+        auto bins=Reserve(Bins_,4*std::max(frame.MainBins.StorageWords(),frame.GenerateShadow?frame.ShadowBins.StorageWords():0));
+        auto constants=Reserve(Constants_,sizeof(frame.Constants));
+        auto shadow=Reserve(Shadow_,std::size_t(frame.ShadowWidth)*frame.ShadowHeight*sizeof(float));
+        Require(CuMemcpyHtoD_(constants,&frame.Constants,sizeof(frame.Constants)),"Upload CUDA frame constants");
+        if (frame.ExternalShadow) Require(CuMemcpyHtoD_(shadow,settings.SceneShadowMap->Depth.data(),settings.SceneShadowMap->Depth.size()*sizeof(float)),"Upload external shadow map");
+        const auto rasterStart=std::chrono::steady_clock::now();
+        statistics.TransformMilliseconds=std::chrono::duration<double,std::milli>(rasterStart-start).count();
+        const auto launch=[&](CuFunction kernel,unsigned gx,unsigned gy,unsigned bx,unsigned by,void** args) {
+            if (gx && gy) Require(CuLaunchKernel_(kernel,gx,gy,1,bx,by,1,0,nullptr,args,nullptr),"Launch CUDA raster stage");
         };
+        void* transformArgs[]{&source,&triangles,&constants};
+        launch(TransformKernel_,frame.GroupsX,frame.GroupsY,64,1,transformArgs);
+        auto setup=[&](unsigned light,const Detail::GpuBinLayout& layout) {
+            Require(CuMemsetD32_(bins,0,layout.StorageWords()),"Clear CUDA tile masks");
+            void* args[]{&triangles,&projected,&bins,&constants,&light};
+            launch(SetupKernel_,frame.GroupsX,frame.GroupsY,64,1,args);
+        };
+        if (frame.GenerateShadow)
+        {
+            setup(1,frame.ShadowBins);
+            void* args[]{&triangles,&constants,&bins,&projected,&shadow,&TextureDescriptors_,&TextureTexels_};
+            launch(ShadowKernel_,(frame.ShadowWidth+7)/8,(frame.ShadowHeight+7)/8,8,8,args);
+        }
+        if (cancelled()) return RasterStatus::Cancelled;
+        setup(0,frame.MainBins);
+        const auto pixels=std::size_t(target.Width())*target.Height();
+        CuDevicePointer colors=0,depths=0;
+        CuDevicePointer visibility=settings.OutlineEnabled?Reserve(Visibility_,pixels*sizeof(float)):0;
+        bool mapped=false;
         try
         {
-            if (!Check(CuMemAlloc_(&deviceTriangles, triangleBytes), "cuMemAlloc(triangles)", error) ||
-                (generateShadowMap &&
-                 !Check(
-                     CuMemAlloc_(
-                         &deviceShadowTriangles,
-                         shadowTriangleBytes),
-                     "cuMemAlloc(shadow triangles)",
-                     error)) ||
-                !Check(CuMemAlloc_(&deviceConstants, sizeof(constants)), "cuMemAlloc(constants)", error) ||
-                !Check(CuMemAlloc_(&deviceMainOffsets, mainOffsetBytes), "cuMemAlloc(tile offsets)", error) ||
-                !Check(CuMemAlloc_(&deviceMainIndices, mainIndexBytes), "cuMemAlloc(tile indices)", error) ||
-                !Check(CuMemAlloc_(&deviceShadowDepths, shadowBytes), "cuMemAlloc(shadow depths)", error) ||
-                !Check(
-                    CuMemAlloc_(
-                        &deviceTextureDescriptors,
-                        textureDescriptorBytes),
-                    "cuMemAlloc(texture descriptors)",
-                    error) ||
-                !Check(
-                    CuMemAlloc_(&deviceTextureTexels, textureTexelBytes),
-                    "cuMemAlloc(texture texels)",
-                    error) ||
-                !Check(CuMemAlloc_(&deviceColors, colorBytes), "cuMemAlloc(colors)", error) ||
-                !Check(CuMemAlloc_(&deviceDepths, depthBytes), "cuMemAlloc(depths)", error))
+            if(settings.GpuPresentation)
             {
-                throw std::runtime_error(error);
+                EnsureInterop(pixels);
+                Require(CuGraphicsMapResources_(1,&Interop_,nullptr),"Map CUDA output buffers");
+                mapped=true;
+                std::size_t colorBytes=0;
+                Require(CuGraphicsResourceGetMappedPointer_(&colors,&colorBytes,Interop_),"Get mapped CUDA color");
+                if(colorBytes<pixels*sizeof(Color)) throw std::runtime_error("CUDA output buffer is too small");
             }
-            if (!triangles.empty() &&
-                !Check(
-                    CuMemcpyHtoD_(
-                        deviceTriangles,
-                        triangles.data(),
-                        triangles.size() * sizeof(GpuTriangle)),
-                    "cuMemcpyHtoD(triangles)",
-                    error))
+            else {colors=Reserve(Colors_,pixels*sizeof(Color));depths=Reserve(Depths_,pixels*sizeof(float));}
+            void* args[]{&triangles,&constants,&bins,&projected,&shadow,&TextureDescriptors_,&TextureTexels_,&colors,&depths,&visibility};
+            launch(Kernel_,(target.Width()+7)/8,(target.Height()+7)/8,8,8,args);
+            if (settings.OutlineEnabled)
             {
-                throw std::runtime_error(error);
+                void* outlineArgs[]{&constants,&visibility,&colors};
+                launch(OutlineKernel_,(target.Width()+7)/8,(target.Height()+7)/8,8,8,outlineArgs);
             }
-            if (generateShadowMap && !shadowTriangles.empty() &&
-                !Check(
-                    CuMemcpyHtoD_(
-                        deviceShadowTriangles,
-                        shadowTriangles.data(),
-                        shadowTriangles.size() * sizeof(GpuTriangle)),
-                    "cuMemcpyHtoD(shadow triangles)",
-                    error))
+            if(mapped)
             {
-                throw std::runtime_error(error);
+                Require(CuGraphicsUnmapResources_(1,&Interop_,nullptr),"Unmap CUDA output buffers"); mapped=false;
+                target.GpuColor=GpuOutput_.Publish(InteropBuffer_.Get(),target.Width(),target.Height());
             }
-            if (!Check(
-                    CuMemcpyHtoD_(deviceConstants, &constants, sizeof(constants)),
-                    "cuMemcpyHtoD(constants)",
-                    error) ||
-                (!textureData.Descriptors.empty() &&
-                 !Check(
-                     CuMemcpyHtoD_(
-                         deviceTextureDescriptors,
-                         textureData.Descriptors.data(),
-                         textureData.Descriptors.size() * sizeof(GpuTexture)),
-                     "cuMemcpyHtoD(texture descriptors)",
-                     error)) ||
-                (!textureData.TexelsRGBA8.empty() &&
-                 !Check(
-                     CuMemcpyHtoD_(
-                         deviceTextureTexels,
-                         textureData.TexelsRGBA8.data(),
-                         textureData.TexelsRGBA8.size() *
-                             sizeof(std::uint32_t)),
-                     "cuMemcpyHtoD(texture texels)",
-                     error)) ||
-                !Check(
-                    CuMemcpyHtoD_(
-                        deviceMainOffsets,
-                        mainBins.Offsets.data(),
-                        mainOffsetBytes),
-                    "cuMemcpyHtoD(tile offsets)",
-                    error) ||
-                (!mainBins.TriangleIndices.empty() &&
-                 !Check(
-                     CuMemcpyHtoD_(
-                         deviceMainIndices,
-                         mainBins.TriangleIndices.data(),
-                         mainBins.TriangleIndices.size() * sizeof(std::uint32_t)),
-                     "cuMemcpyHtoD(tile indices)",
-                     error)))
+            else
             {
-                throw std::runtime_error(error);
+                Require(CuMemcpyDtoH_(target.MutableColors().data(),colors,pixels*sizeof(Color)),"Capture CUDA color");
+                Require(CuMemcpyDtoH_(target.MutableDepths().data(),depths,pixels*sizeof(float)),"Capture CUDA depth");
+                statistics.ShadedFragments=std::count_if(target.Depths().begin(),target.Depths().end(),[](float z){return z>=0 && z<=1;});
             }
-
-            const auto begin = std::chrono::steady_clock::now();
-            if (hasExternalShadowMap)
-            {
-                if (!Check(
-                        CuMemcpyHtoD_(
-                            deviceShadowDepths,
-                            settings.SceneShadowMap->Depth.data(),
-                            static_cast<std::size_t>(shadowWidth) * shadowHeight *
-                                sizeof(float)),
-                        "cuMemcpyHtoD(shadow map)",
-                        error))
-                {
-                    throw std::runtime_error(error);
-                }
-            }
-            else if (generateShadowMap)
-            {
-                if (!Check(
-                        CuMemAlloc_(&deviceShadowOffsets, shadowOffsetBytes),
-                        "cuMemAlloc(shadow tile offsets)",
-                        error) ||
-                    !Check(
-                        CuMemAlloc_(&deviceShadowIndices, shadowIndexBytes),
-                        "cuMemAlloc(shadow tile indices)",
-                        error) ||
-                    !Check(
-                        CuMemcpyHtoD_(
-                            deviceShadowOffsets,
-                            shadowBins.Offsets.data(),
-                            shadowBins.Offsets.size() * sizeof(std::uint32_t)),
-                        "cuMemcpyHtoD(shadow tile offsets)",
-                        error) ||
-                    (!shadowBins.TriangleIndices.empty() &&
-                     !Check(
-                         CuMemcpyHtoD_(
-                             deviceShadowIndices,
-                             shadowBins.TriangleIndices.data(),
-                             shadowBins.TriangleIndices.size() *
-                                 sizeof(std::uint32_t)),
-                         "cuMemcpyHtoD(shadow tile indices)",
-                         error)))
-                {
-                    throw std::runtime_error(error);
-                }
-                void* shadowArguments[] = {
-                    &deviceShadowTriangles,
-                    &deviceConstants,
-                    &deviceShadowOffsets,
-                    &deviceShadowIndices,
-                    &deviceShadowDepths,
-                    &deviceTextureDescriptors,
-                    &deviceTextureTexels};
-                const unsigned int shadowGridX = (shadowWidth + 7U) / 8U;
-                const unsigned int shadowGridY = (shadowHeight + 7U) / 8U;
-                if (!Check(
-                        CuLaunchKernel_(
-                            ShadowKernel_,
-                            shadowGridX,
-                            shadowGridY,
-                            1,
-                            8,
-                            8,
-                            1,
-                            0,
-                            nullptr,
-                            shadowArguments,
-                            nullptr),
-                        "cuLaunchKernel(ShadowDepthKernel)",
-                        error))
-                {
-                    throw std::runtime_error(error);
-                }
-            }
-
-            void* arguments[] = {
-                &deviceTriangles,
-                &deviceConstants,
-                &deviceMainOffsets,
-                &deviceMainIndices,
-                &deviceShadowDepths,
-                &deviceTextureDescriptors,
-                &deviceTextureTexels,
-                &deviceColors,
-                &deviceDepths};
-            const unsigned int gridX = (target.Width() + 7U) / 8U;
-            const unsigned int gridY = (target.Height() + 7U) / 8U;
-            if (!Check(
-                    CuLaunchKernel_(
-                        Kernel_,
-                        gridX,
-                        gridY,
-                        1,
-                        8,
-                        8,
-                        1,
-                        0,
-                        nullptr,
-                        arguments,
-                        nullptr),
-                    "cuLaunchKernel(RasterKernel)",
-                    error) ||
-                !Check(CuCtxSynchronize_(), "cuCtxSynchronize", error))
-            {
-                throw std::runtime_error(error);
-            }
-
-            std::vector<float> colors(pixelCount * 4U);
-            std::vector<float> depths(pixelCount);
-            if (!Check(
-                    CuMemcpyDtoH_(colors.data(), deviceColors, colorBytes),
-                    "cuMemcpyDtoH(colors)",
-                    error) ||
-                !Check(
-                    CuMemcpyDtoH_(depths.data(), deviceDepths, depthBytes),
-                    "cuMemcpyDtoH(depths)",
-                    error))
-            {
-                throw std::runtime_error(error);
-            }
-            for (std::size_t pixel = 0; pixel < pixelCount; ++pixel)
-            {
-                target.MutableColors()[pixel] = {
-                    colors[pixel * 4U],
-                    colors[pixel * 4U + 1U],
-                    colors[pixel * 4U + 2U],
-                    colors[pixel * 4U + 3U]};
-                target.MutableDepths()[pixel] = depths[pixel];
-            }
-
-            Detail::ApplyGpuSelectionOutline(mainScene, gpuSettings, target,
-                externalCancellation, backendCancellation);
-
-            statistics.InputTriangles = scene.Triangles.size();
-            statistics.PostClipTriangles = mainScene.Triangles.size();
-            statistics.DispatchedTiles =
-                static_cast<std::uint64_t>(mainBins.TilesX) * mainBins.TilesY +
-                static_cast<std::uint64_t>(shadowBins.TilesX) * shadowBins.TilesY;
-            statistics.WorkerThreads = 64;
-            statistics.ExecutionPath =
-                "Native CUDA Driver API embedded PTX, 16x16 bins=" +
-                std::to_string(mainBins.TilesX * mainBins.TilesY) +
-                ", max-list=" + std::to_string(mainBins.MaximumListLength) +
-                (generateShadowMap ? ", GPU shadow-depth pass" :
-                 hasExternalShadowMap ? ", uploaded shadow map" : "");
-            statistics.RasterMilliseconds =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - begin)
-                    .count();
         }
-        catch (...)
-        {
-            release();
-            throw;
+        catch (...) { if(mapped)(void)CuGraphicsUnmapResources_(1,&Interop_,nullptr);throw; }
+        statistics.PostClipCountAvailable=frame.Constants.CollectCounts!=0;
+        if(statistics.PostClipCountAvailable) {
+            unsigned count=0;Require(CuMemcpyDtoH_(&count,bins+frame.MainBins.Words*4,sizeof(count)),"Capture CUDA primitive count");
+            statistics.PostClipTriangles=count;
         }
-        release();
-        return externalCancellation.IsCancellationRequested() ||
-                       backendCancellation.load(std::memory_order_relaxed)
-                   ? RasterStatus::Cancelled
-                   : RasterStatus::Completed;
+        frame.Report(statistics,upload,"Native CUDA");
+        statistics.RasterMilliseconds=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-rasterStart).count();
+        return cancelled()?RasterStatus::Cancelled:RasterStatus::Completed;
     }
 
 private:
+    struct Buffer { CuDevicePointer Pointer = 0; std::size_t Capacity = 0; };
+    Buffer Source_, Transformed_, Projected_, Bins_, Constants_, Shadow_, Colors_, Depths_, Visibility_;
+    std::weak_ptr<const RasterScene> ResidentScene_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> InteropBuffer_;
+    void* Interop_=nullptr;
+    std::size_t InteropPixels_=0;
+    static void Require(CuResult result,const char* operation)
+    {
+        std::string error; if (!Check(result,operation,error)) throw std::runtime_error(error);
+    }
+    CuDevicePointer Reserve(Buffer& buffer,std::size_t bytes)
+    {
+        bytes=std::max<std::size_t>(bytes,4);
+        if(buffer.Capacity<bytes)
+        {
+            CuDevicePointer replacement=0; Require(CuMemAlloc_(&replacement,bytes),"Allocate CUDA raster buffer");
+            if(buffer.Pointer)(void)CuMemFree_(buffer.Pointer);buffer={replacement,bytes};
+        }
+        return buffer.Pointer;
+    }
+    void ReleaseInterop() noexcept
+    {
+        if (Interop_) (void)CuGraphicsUnregisterResource_(Interop_);
+        Interop_=nullptr; InteropBuffer_.Reset();
+        InteropPixels_=0;
+    }
+    void EnsureInterop(std::size_t pixels)
+    {
+        if(InteropPixels_>=pixels)return;
+        if(pixels>UINT32_MAX/sizeof(Color))throw std::length_error("CUDA viewport exceeds interop buffer limits");
+        EnsureGpuOutput();ReleaseInterop();
+        auto buffer=GpuOutput_.CreateInput(static_cast<unsigned>(pixels),sizeof(Color));
+        Require(CuGraphicsD3D11RegisterResource_(&Interop_,buffer.Get(),0),"Register CUDA color output");
+        InteropBuffer_=std::move(buffer); InteropPixels_=pixels;
+    }
+    bool EnsureGpuTextures(const Detail::GpuRasterTextureData& data,std::string& error)
+    {
+        if(TextureGeneration_==TextureCache_.Generation())return true;
+        CuDevicePointer descriptors=0,texels=0;
+        const auto descriptorBytes=std::max<std::size_t>(data.Descriptors.size()*sizeof(GpuTexture),sizeof(GpuTexture));
+        const auto texelBytes=std::max<std::size_t>(data.TexelsRGBA8.size()*sizeof(std::uint32_t),sizeof(std::uint32_t));
+        const bool ready=Check(CuMemAlloc_(&descriptors,descriptorBytes),"Allocate CUDA texture descriptors",error) &&
+            Check(CuMemAlloc_(&texels,texelBytes),"Allocate CUDA texture texels",error) &&
+            (data.Descriptors.empty() || Check(CuMemcpyHtoD_(descriptors,data.Descriptors.data(),data.Descriptors.size()*sizeof(GpuTexture)),"Upload CUDA texture descriptors",error)) &&
+            (data.TexelsRGBA8.empty() || Check(CuMemcpyHtoD_(texels,data.TexelsRGBA8.data(),data.TexelsRGBA8.size()*sizeof(std::uint32_t)),"Upload CUDA texture texels",error));
+        if(!ready){if(descriptors)(void)CuMemFree_(descriptors);if(texels)(void)CuMemFree_(texels);return false;}
+        if(TextureDescriptors_)(void)CuMemFree_(TextureDescriptors_);if(TextureTexels_)(void)CuMemFree_(TextureTexels_);
+        TextureDescriptors_=descriptors;TextureTexels_=texels;TextureGeneration_=TextureCache_.Generation();return true;
+    }
+    void EnsureGpuOutput()
+    {
+        if(GpuOutput_.Device())return;
+        if (!(
+            LoadDriver(CuD3D11GetDevice_, "cuD3D11GetDevice") &&
+            LoadDriver(CuGraphicsD3D11RegisterResource_, "cuGraphicsD3D11RegisterResource") &&
+            LoadDriver(CuGraphicsUnregisterResource_, "cuGraphicsUnregisterResource") &&
+            LoadDriver(CuGraphicsMapResources_, "cuGraphicsMapResources") &&
+            LoadDriver(CuGraphicsUnmapResources_, "cuGraphicsUnmapResources") &&
+            LoadDriver(CuGraphicsResourceGetMappedPointer_, "cuGraphicsResourceGetMappedPointer_v2")))
+            throw std::runtime_error("CUDA rendering is available, but CUDA-D3D11 display interop is unavailable");
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))throw std::runtime_error("Create CUDA presentation factory failed");
+        for(UINT index=0;;++index)
+        {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            if(factory->EnumAdapters1(index,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+            CuDevice device=-1;
+            if(CuD3D11GetDevice_(&device,adapter.Get())!=CuSuccess || device!=Device_)continue;
+            Microsoft::WRL::ComPtr<ID3D11Device> outputDevice;
+            D3D_FEATURE_LEVEL level;
+            if(FAILED(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,0,nullptr,0,
+                D3D11_SDK_VERSION,&outputDevice,&level,nullptr)))break;
+            GpuOutput_.Initialize(outputDevice.Get());return;
+        }
+        throw std::runtime_error("No D3D11 presentation device matches the CUDA renderer");
+    }
     template <typename Function>
     [[nodiscard]] bool LoadDriver(Function& function, const char* name)
     {
@@ -688,7 +336,7 @@ private:
             LoadDriver(CuMemcpyHtoD_, "cuMemcpyHtoD_v2") &&
             LoadDriver(CuMemcpyDtoH_, "cuMemcpyDtoH_v2") &&
             LoadDriver(CuLaunchKernel_, "cuLaunchKernel") &&
-            LoadDriver(CuCtxSynchronize_, "cuCtxSynchronize");
+            LoadDriver(CuMemsetD32_, "cuMemsetD32_v2");
         if (!driverLoaded)
         {
             error = "CUDA Driver API is missing required entry points";
@@ -711,15 +359,26 @@ private:
         CuCtxSetCurrent_ = nullptr; CuModuleLoadData_ = nullptr; CuModuleUnload_ = nullptr;
         CuModuleGetFunction_ = nullptr; CuMemAlloc_ = nullptr; CuMemFree_ = nullptr;
         CuMemcpyHtoD_ = nullptr; CuMemcpyDtoH_ = nullptr; CuLaunchKernel_ = nullptr;
-        CuCtxSynchronize_ = nullptr;
+        CuMemsetD32_ = nullptr;
     }
 
+    CuDevicePointer TextureDescriptors_=0,TextureTexels_=0;
+    std::uint64_t TextureGeneration_=0;
+    Detail::GpuRasterTextureCache TextureCache_;
+    Detail::D3D11GpuOutput GpuOutput_;
+    CuResult (*CuD3D11GetDevice_)(CuDevice*,IDXGIAdapter*) = nullptr;
+    CuResult (*CuGraphicsD3D11RegisterResource_)(void**,ID3D11Resource*,unsigned int) = nullptr;
+    CuResult (*CuGraphicsUnregisterResource_)(void*) = nullptr;
+    CuResult (*CuGraphicsMapResources_)(unsigned int,void**,void*) = nullptr;
+    CuResult (*CuGraphicsUnmapResources_)(unsigned int,void**,void*) = nullptr;
+    CuResult (*CuGraphicsResourceGetMappedPointer_)(CuDevicePointer*,std::size_t*,void*) = nullptr;
     HMODULE DriverLibrary_ = nullptr;
     CuDevice Device_ = 0;
     CuContext Context_ = nullptr;
     CuModule Module_ = nullptr;
     CuFunction Kernel_ = nullptr;
-    CuFunction ShadowKernel_ = nullptr;
+    CuFunction TransformKernel_=nullptr, SetupKernel_=nullptr;
+    CuFunction ShadowKernel_ = nullptr, OutlineKernel_ = nullptr;
 
     CuResult (*CuInit_)(unsigned int) = nullptr;
     CuResult (*CuDeviceGetCount_)(int*) = nullptr;
@@ -736,7 +395,7 @@ private:
     CuResult (*CuMemcpyDtoH_)(void*, CuDevicePointer, std::size_t) = nullptr;
     CuResult (*CuLaunchKernel_)(CuFunction, unsigned int, unsigned int, unsigned int,
         unsigned int, unsigned int, unsigned int, unsigned int, void*, void**, void**) = nullptr;
-    CuResult (*CuCtxSynchronize_)() = nullptr;
+    CuResult (*CuMemsetD32_)(CuDevicePointer,unsigned,std::size_t) = nullptr;
 
 };
 

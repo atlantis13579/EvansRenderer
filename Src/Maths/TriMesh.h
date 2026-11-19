@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -15,6 +16,9 @@ namespace Evans::Maths
 		bool CullBackFaces = false;
 		float MinimumDistance = 1.0e-5f;
 		float MaximumDistance = std::numeric_limits<float>::infinity();
+		// Rejecting a candidate must not shorten the search interval. This lets
+		// material-aware callers trace through cutouts, including coplanar layers.
+		std::function<bool(std::uint32_t, const RayTriangleHit&)> AcceptHit;
 	};
 
 	struct TriMeshHit : RayTriangleHit

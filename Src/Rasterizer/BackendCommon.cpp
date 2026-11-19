@@ -1,5 +1,6 @@
 #include "BackendCommon.hpp"
 #include "SoftwareRasterCore.hpp"
+#include "Rasterizer/ParallelExecutor.h"
 
 #include <cmath>
 #include <vector>
@@ -240,16 +241,16 @@ void PreparePass(
     RasterScene& destination,
     const RasterCancellationToken& externalCancellation,
     const std::atomic<bool>& backendCancellation,
-    bool& cancelled)
+    bool& cancelled, std::size_t first, std::size_t last)
 {
     std::vector<PreparedVertex> polygon;
     std::vector<PreparedVertex> temporary;
     polygon.reserve(10);
     temporary.reserve(10);
-    destination.Triangles.reserve(source.Triangles.size());
+    destination.Triangles.reserve(last-first);
 
-    for (std::size_t triangleIndex = 0;
-         triangleIndex < source.Triangles.size();
+    for (std::size_t triangleIndex = first;
+         triangleIndex < last;
          ++triangleIndex)
     {
         if ((triangleIndex & 255U) == 0U &&
@@ -266,7 +267,17 @@ void PreparePass(
             TransformVertex(sourceTriangle.Vertices[0], settings),
             TransformVertex(sourceTriangle.Vertices[1], settings),
             TransformVertex(sourceTriangle.Vertices[2], settings)};
-        for (int plane = 0; plane < 6 && !polygon.empty(); ++plane)
+        unsigned outside=0,common=63;
+        for(const auto& vertex:polygon)
+        {
+            unsigned mask=0;
+            for(int plane=0;plane<6;++plane)if(!(PlaneDistance(vertex, plane, settings.DepthRange, shadowPass)>=0))mask|=1u<<plane;
+            outside|=mask;common&=mask;
+        }
+        if(common)continue;
+        // Most triangles are wholly inside or outside the view. Only boundary
+        // triangles need the polygon clipper and its repeated vertex copies.
+        for (int plane = 0; outside && plane < 6 && !polygon.empty(); ++plane)
         {
             ClipAgainstPlane(
                 polygon,
@@ -287,6 +298,28 @@ void PreparePass(
             destination.Triangles.push_back(std::move(output));
         }
     }
+}
+
+void PreparePassParallel(const RasterScene& source,const RasterSettings& settings,bool shadow,
+    RasterScene& destination,const RasterCancellationToken& cancellation,const std::atomic<bool>& backendCancellation,
+    bool& cancelled, ParallelExecutor* executor)
+{
+    if(!executor)
+    {
+        PreparePass(source,settings,shadow,destination,cancellation,backendCancellation,cancelled,0,source.Triangles.size());return;
+    }
+    constexpr std::size_t BatchSize=256;
+    struct Batch {RasterScene Scene;bool Cancelled=false;};
+    std::vector<Batch> batches((source.Triangles.size()+BatchSize-1)/BatchSize);
+    executor->Run(static_cast<std::uint32_t>(batches.size()),0,[&](std::uint32_t index) {
+        const auto first=std::size_t(index)*BatchSize;
+        PreparePass(source,settings,shadow,batches[index].Scene,cancellation,backendCancellation,batches[index].Cancelled,
+            first,std::min(first+BatchSize,source.Triangles.size()));
+    });
+    std::size_t count=0;for(const auto& batch:batches){count+=batch.Scene.Triangles.size();cancelled|=batch.Cancelled;}
+    destination.Triangles.reserve(count);
+    for(auto& batch:batches)destination.Triangles.insert(destination.Triangles.end(),
+        std::make_move_iterator(batch.Scene.Triangles.begin()),std::make_move_iterator(batch.Scene.Triangles.end()));
 }
 
 } // namespace
@@ -390,31 +423,31 @@ PreparedGpuRasterScenes PrepareGpuRasterScenes(
     const RasterSettings& settings,
     bool prepareShadowScene,
     const RasterCancellationToken& externalCancellation,
-    const std::atomic<bool>& backendCancellation)
+    const std::atomic<bool>& backendCancellation, ParallelExecutor* workers)
 {
     PreparedGpuRasterScenes result;
     result.Settings = settings;
     result.Settings.InputSpace = VertexInputSpace::Clip;
     result.Main.Textures = scene.Textures;
-    PreparePass(
+    PreparePassParallel(
         scene,
         settings,
         false,
         result.Main,
         externalCancellation,
         backendCancellation,
-        result.Cancelled);
+        result.Cancelled, workers);
     if (!result.Cancelled && prepareShadowScene)
     {
         result.Shadow.Textures = scene.Textures;
-        PreparePass(
+        PreparePassParallel(
             scene,
             settings,
             true,
             result.Shadow,
             externalCancellation,
             backendCancellation,
-            result.Cancelled);
+            result.Cancelled, workers);
     }
     return result;
 }

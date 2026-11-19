@@ -1,6 +1,9 @@
+#include "Techniques/LightRange.h"
 #include "Rasterizer/ComputeShaderRasterRHI.h"
 
 #include "BackendCommon.hpp"
+#include "Rasterizer/D3D11GpuOutput.h"
+#include "GpuGeometryFrame.h"
 #include "GpuRasterCommon.hpp"
 
 #include <algorithm>
@@ -24,434 +27,13 @@
 #endif
 #include <Windows.h>
 #include <d3d11.h>
-#include <d3dcompiler.h>
+#include "Renderer/D3DShaderCache.h"
 #endif
 
 namespace Evans::Rasterizer
 {
 namespace
 {
-
-struct GpuVertex
-{
-    float Clip[4]{};
-    float Color[4]{};
-    float Position[4]{};
-    float Normal[4]{};
-    float ShadowClip[4]{};
-    float TexCoord[4]{};
-};
-
-struct GpuTriangle
-{
-    GpuVertex Vertices[3];
-    float BaseColor[4]{};
-    float SpecularColor[4]{};
-    float EmissiveColor[4]{};
-    float Shininess = 1.0f;
-    float AlphaCutoff = 0.0f;
-    std::uint32_t DiffuseTextureIndex = InvalidRasterTextureIndex;
-    std::uint32_t OpacityTextureIndex = InvalidRasterTextureIndex;
-    std::uint32_t Selected = 0;
-    std::uint32_t Padding[3]{};
-};
-
-struct alignas(16) GpuLight
-{
-    float PositionType[4]{};
-    float DirectionIntensity[4]{};
-    float ColorCastShadows[4]{};
-    float AreaSizePadding[4]{};
-};
-
-struct alignas(16) GpuConstants
-{
-    float World[16]{};
-    float View[16]{};
-    float Projection[16]{};
-    float LightViewProjection[16]{};
-    std::uint32_t Width = 0;
-    std::uint32_t Height = 0;
-    std::uint32_t TriangleCount = 0;
-    std::uint32_t InputSpace = 0;
-    std::uint32_t DepthRange = 0;
-    std::uint32_t FillModeValue = 0;
-    std::uint32_t ShadingValue = 0;
-    std::uint32_t BackFaceCulling = 0;
-    std::uint32_t FrontFaceCounterClockwise = 0;
-    std::uint32_t OutlineEnabled = 0;
-    std::uint32_t ShadowsEnabled = 0;
-    std::uint32_t ShadowWidth = 0;
-    std::uint32_t ShadowHeight = 0;
-    std::uint32_t TilesX = 0;
-    float WireframeWidth = 1.0f;
-    float OutlineWidth = 1.0f;
-    float ShadowBias = 0.001f;
-    float ShadowStrength = 0.55f;
-    std::uint32_t DepthTest = 1;
-    std::uint32_t ShadowPCFRadius = 1;
-    float ClearColor[4]{};
-    float WireframeColor[4]{};
-    float OutlineColor[4]{};
-    float CameraPosition[4]{};
-    float LightDirectionIntensity[4]{};
-    float LightColorAmbientStrength[4]{};
-    float AmbientColor[4]{};
-    std::uint32_t LightCount = 0;
-    std::int32_t ShadowLightIndex = -1;
-    std::uint32_t TextureCount = 0;
-    std::uint32_t TextureTexelCount = 0;
-    GpuLight Lights[MaximumRasterLights]{};
-    float ShadowRasterBias[4]{};
-};
-
-static_assert(sizeof(GpuVertex) == 96, "Compute raster vertex ABI mismatch");
-static_assert(sizeof(GpuTriangle) == 368, "Compute raster triangle ABI mismatch");
-static_assert(sizeof(GpuLight) == 64, "Compute raster light ABI mismatch");
-static_assert(sizeof(GpuConstants) == 736, "Compute raster constants ABI mismatch");
-static_assert(alignof(GpuConstants) == 16, "Compute raster constants alignment mismatch");
-static_assert(
-    offsetof(GpuLight, DirectionIntensity) == 16 &&
-        offsetof(GpuLight, ColorCastShadows) == 32 &&
-        offsetof(GpuLight, AreaSizePadding) == 48,
-    "Compute raster light field offsets mismatch");
-static_assert(
-    offsetof(GpuVertex, TexCoord) == 80 &&
-        offsetof(GpuTriangle, BaseColor) == 288 &&
-        offsetof(GpuTriangle, Shininess) == 336 &&
-        offsetof(GpuTriangle, Selected) == 352 &&
-        offsetof(GpuConstants, LightCount) == 448 &&
-        offsetof(GpuConstants, TextureCount) == 456 &&
-        offsetof(GpuConstants, Lights) == 464 &&
-        offsetof(GpuConstants, ShadowRasterBias) == 720,
-    "Compute raster buffer offsets mismatch");
-
-void CopyColor(float (&destination)[4], const Color& source) noexcept
-{
-    destination[0] = source.R;
-    destination[1] = source.G;
-    destination[2] = source.B;
-    destination[3] = source.A;
-}
-
-void CopyMatrix(float (&destination)[16], const Matrix4& source) noexcept
-{
-    std::copy(source.Values.begin(), source.Values.end(), destination);
-}
-
-void CopyLight(GpuLight& destination, const RasterLight& source) noexcept
-{
-    destination.PositionType[0] = source.Position.X;
-    destination.PositionType[1] = source.Position.Y;
-    destination.PositionType[2] = source.Position.Z;
-    destination.PositionType[3] = static_cast<float>(source.Type);
-    destination.DirectionIntensity[0] = source.Direction.X;
-    destination.DirectionIntensity[1] = source.Direction.Y;
-    destination.DirectionIntensity[2] = source.Direction.Z;
-    destination.DirectionIntensity[3] = source.Intensity;
-    destination.ColorCastShadows[0] = source.LightColor.R;
-    destination.ColorCastShadows[1] = source.LightColor.G;
-    destination.ColorCastShadows[2] = source.LightColor.B;
-    destination.ColorCastShadows[3] = source.CastShadows ? 1.0f : 0.0f;
-    destination.AreaSizePadding[0] = source.AreaSize.X;
-    destination.AreaSizePadding[1] = source.AreaSize.Y;
-}
-
-[[nodiscard]] std::vector<GpuTriangle> BuildGpuTriangles(const RasterScene& scene)
-{
-    std::vector<GpuTriangle> result(scene.Triangles.size());
-    for (std::size_t triangleIndex = 0; triangleIndex < scene.Triangles.size(); ++triangleIndex)
-    {
-        const RasterTriangle& source = scene.Triangles[triangleIndex];
-        GpuTriangle& destination = result[triangleIndex];
-        for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
-        {
-            const RasterVertex& vertex = source.Vertices[vertexIndex];
-            GpuVertex& gpuVertex = destination.Vertices[vertexIndex];
-            const float clip[] = {
-                vertex.ClipPosition.X,
-                vertex.ClipPosition.Y,
-                vertex.ClipPosition.Z,
-                vertex.ClipPosition.W};
-            const float color[] = {
-                vertex.VertexColor.R,
-                vertex.VertexColor.G,
-                vertex.VertexColor.B,
-                vertex.VertexColor.A};
-            const float position[] = {
-                vertex.Position.X, vertex.Position.Y, vertex.Position.Z, 1.0f};
-            const float normal[] = {
-                vertex.Normal.X, vertex.Normal.Y, vertex.Normal.Z, 0.0f};
-            const float shadowClip[] = {
-                vertex.ShadowClipPosition.X,
-                vertex.ShadowClipPosition.Y,
-                vertex.ShadowClipPosition.Z,
-                vertex.ShadowClipPosition.W};
-            const float texCoord[] = {
-                vertex.TexCoord.X, vertex.TexCoord.Y, 0.0f, 0.0f};
-            std::copy(std::begin(clip), std::end(clip), gpuVertex.Clip);
-            std::copy(std::begin(color), std::end(color), gpuVertex.Color);
-            std::copy(std::begin(position), std::end(position), gpuVertex.Position);
-            std::copy(std::begin(normal), std::end(normal), gpuVertex.Normal);
-            std::copy(std::begin(shadowClip), std::end(shadowClip), gpuVertex.ShadowClip);
-            std::copy(std::begin(texCoord), std::end(texCoord), gpuVertex.TexCoord);
-        }
-        CopyColor(destination.BaseColor, source.Material.BaseColor);
-        CopyColor(destination.SpecularColor, source.Material.SpecularColor);
-        CopyColor(destination.EmissiveColor, source.Material.EmissiveColor);
-        destination.Shininess = source.Material.Shininess;
-        destination.AlphaCutoff = source.Material.AlphaCutoff;
-        destination.DiffuseTextureIndex = source.Material.DiffuseTextureIndex;
-        destination.OpacityTextureIndex = source.Material.OpacityTextureIndex;
-        destination.Selected = source.Selected ? 1U : 0U;
-    }
-    return result;
-}
-
-[[nodiscard]] GpuConstants BuildConstants(
-    const RasterScene& scene,
-    const RasterSettings& settings,
-    const RenderTarget& target,
-    bool shadowsEnabled,
-    std::uint32_t shadowWidth,
-    std::uint32_t shadowHeight,
-    std::uint32_t textureCount,
-    std::uint32_t textureTexelCount) noexcept
-{
-    GpuConstants constants;
-    CopyMatrix(constants.World, settings.World);
-    CopyMatrix(constants.View, settings.View);
-    CopyMatrix(constants.Projection, settings.Projection);
-    CopyMatrix(constants.LightViewProjection, settings.LightViewProjection);
-    constants.Width = target.Width();
-    constants.Height = target.Height();
-    constants.TriangleCount = static_cast<std::uint32_t>(scene.Triangles.size());
-    constants.InputSpace = static_cast<std::uint32_t>(settings.InputSpace);
-    constants.DepthRange = static_cast<std::uint32_t>(settings.DepthRange);
-    constants.FillModeValue = static_cast<std::uint32_t>(settings.Mode);
-    constants.ShadingValue = static_cast<std::uint32_t>(settings.Shading);
-    constants.BackFaceCulling = settings.BackFaceCulling ? 1U : 0U;
-    constants.FrontFaceCounterClockwise = settings.FrontFaceCounterClockwise ? 1U : 0U;
-    constants.OutlineEnabled = settings.OutlineEnabled ? 1U : 0U;
-    constants.ShadowsEnabled = shadowsEnabled ? 1U : 0U;
-    constants.ShadowWidth = shadowWidth;
-    constants.ShadowHeight = shadowHeight;
-    constants.TilesX = (target.Width() + 15U) / 16U;
-    constants.WireframeWidth = settings.WireframeWidth;
-    constants.OutlineWidth = settings.OutlineWidth;
-    constants.ShadowBias = settings.ShadowBias;
-    constants.ShadowRasterBias[0] = std::max(settings.ShadowSlopeScaledBias, 0.0f);
-    constants.ShadowStrength = settings.ShadowStrength;
-    constants.DepthTest = settings.DepthTest ? 1U : 0U;
-    constants.ShadowPCFRadius = settings.ShadowPCFRadius;
-    CopyColor(constants.ClearColor, settings.ClearColor);
-    CopyColor(constants.WireframeColor, settings.WireframeColor);
-    CopyColor(constants.OutlineColor, settings.OutlineColor);
-    constants.CameraPosition[0] = settings.CameraPosition.X;
-    constants.CameraPosition[1] = settings.CameraPosition.Y;
-    constants.CameraPosition[2] = settings.CameraPosition.Z;
-    constants.CameraPosition[3] = 1.0f;
-    constants.LightDirectionIntensity[0] = settings.Light.DirectionToLight.X;
-    constants.LightDirectionIntensity[1] = settings.Light.DirectionToLight.Y;
-    constants.LightDirectionIntensity[2] = settings.Light.DirectionToLight.Z;
-    constants.LightDirectionIntensity[3] = settings.Light.Intensity;
-    constants.LightColorAmbientStrength[0] = settings.Light.LightColor.R;
-    constants.LightColorAmbientStrength[1] = settings.Light.LightColor.G;
-    constants.LightColorAmbientStrength[2] = settings.Light.LightColor.B;
-    constants.LightColorAmbientStrength[3] = settings.AmbientStrength;
-    CopyColor(constants.AmbientColor, settings.AmbientColor);
-    constants.LightCount = EffectiveRasterLightCount(settings);
-    constants.ShadowLightIndex =
-        settings.ShadowLightIndex >= 0 &&
-                static_cast<std::uint32_t>(settings.ShadowLightIndex) < constants.LightCount
-            ? settings.ShadowLightIndex
-            : -1;
-    constants.TextureCount = textureCount;
-    constants.TextureTexelCount = textureTexelCount;
-    for (std::uint32_t index = 0; index < constants.LightCount; ++index)
-    {
-        CopyLight(constants.Lights[index], EffectiveRasterLight(settings, index));
-    }
-    return constants;
-}
-
-struct TileBins
-{
-    std::vector<std::uint32_t> Offsets;
-    std::vector<std::uint32_t> TriangleIndices;
-    std::uint32_t TilesX = 0;
-    std::uint32_t TilesY = 0;
-    std::uint32_t MaximumListLength = 0;
-    std::uint64_t BinnedTriangles = 0;
-    bool Cancelled = false;
-};
-
-[[nodiscard]] bool IsCancelled(
-    const RasterCancellationToken& externalCancellation,
-    const std::atomic<bool>& backendCancellation) noexcept
-{
-    return externalCancellation.IsCancellationRequested() ||
-           backendCancellation.load(std::memory_order_relaxed);
-}
-
-[[nodiscard]] Float4 TransformForBinning(
-    const RasterVertex& vertex,
-    const RasterSettings& settings,
-    bool lightPass) noexcept
-{
-    if (settings.InputSpace == VertexInputSpace::Clip)
-    {
-        return lightPass ? vertex.ShadowClipPosition : vertex.ClipPosition;
-    }
-    const Float4 local{vertex.Position.X, vertex.Position.Y, vertex.Position.Z, 1.0f};
-    const Float4 world = settings.World * local;
-    return lightPass
-               ? settings.LightViewProjection * world
-               : settings.Projection * (settings.View * world);
-}
-
-[[nodiscard]] TileBins BuildTileBins(
-    const RasterScene& scene,
-    const RasterSettings& settings,
-    std::uint32_t width,
-    std::uint32_t height,
-    bool lightPass,
-    const RasterCancellationToken& externalCancellation,
-    const std::atomic<bool>& backendCancellation)
-{
-    constexpr std::uint32_t tileSize = 16U;
-    struct Bounds
-    {
-        int MinimumX = 0;
-        int MinimumY = 0;
-        int MaximumX = -1;
-        int MaximumY = -1;
-        bool Valid = false;
-    };
-
-    TileBins result;
-    result.TilesX = (width + tileSize - 1U) / tileSize;
-    result.TilesY = (height + tileSize - 1U) / tileSize;
-    const std::uint32_t tileCount = result.TilesX * result.TilesY;
-    std::vector<std::uint32_t> counts(tileCount, 0U);
-    std::vector<Bounds> triangleBounds(scene.Triangles.size());
-    for (std::size_t triangleIndex = 0; triangleIndex < scene.Triangles.size(); ++triangleIndex)
-    {
-        if ((triangleIndex & 255U) == 0U &&
-            IsCancelled(externalCancellation, backendCancellation))
-        {
-            result.Cancelled = true;
-            return result;
-        }
-
-        float screenX[3]{};
-        float screenY[3]{};
-        bool valid = true;
-        for (std::size_t vertexIndex = 0; vertexIndex < 3; ++vertexIndex)
-        {
-            const Float4 clip = TransformForBinning(
-                scene.Triangles[triangleIndex].Vertices[vertexIndex],
-                settings,
-                lightPass);
-            if (!std::isfinite(clip.X) || !std::isfinite(clip.Y) ||
-                !std::isfinite(clip.W) || clip.W <= 1.0e-6f)
-            {
-                valid = false;
-                break;
-            }
-            const float inverseW = 1.0f / clip.W;
-            screenX[vertexIndex] =
-                (clip.X * inverseW * 0.5f + 0.5f) * static_cast<float>(width);
-            screenY[vertexIndex] =
-                (0.5f - clip.Y * inverseW * 0.5f) * static_cast<float>(height);
-        }
-        if (!valid)
-        {
-            continue;
-        }
-
-        const float padding = !lightPass && settings.Mode != FillMode::Solid
-            ? std::max(settings.WireframeWidth, 1.0f) * 0.5f : 0.0f;
-        Bounds bounds;
-        bounds.MinimumX = std::max(
-            0,
-            static_cast<int>(std::floor(
-                std::min({screenX[0], screenX[1], screenX[2]}) - padding)));
-        bounds.MinimumY = std::max(
-            0,
-            static_cast<int>(std::floor(
-                std::min({screenY[0], screenY[1], screenY[2]}) - padding)));
-        bounds.MaximumX = std::min(
-            static_cast<int>(width) - 1,
-            static_cast<int>(std::ceil(
-                std::max({screenX[0], screenX[1], screenX[2]}) + padding)));
-        bounds.MaximumY = std::min(
-            static_cast<int>(height) - 1,
-            static_cast<int>(std::ceil(
-                std::max({screenY[0], screenY[1], screenY[2]}) + padding)));
-        bounds.Valid = bounds.MinimumX <= bounds.MaximumX &&
-                       bounds.MinimumY <= bounds.MaximumY;
-        triangleBounds[triangleIndex] = bounds;
-        if (!bounds.Valid)
-        {
-            continue;
-        }
-        ++result.BinnedTriangles;
-        for (std::uint32_t tileY =
-                 static_cast<std::uint32_t>(bounds.MinimumY) / tileSize;
-             tileY <= static_cast<std::uint32_t>(bounds.MaximumY) / tileSize;
-             ++tileY)
-        {
-            for (std::uint32_t tileX =
-                     static_cast<std::uint32_t>(bounds.MinimumX) / tileSize;
-                 tileX <= static_cast<std::uint32_t>(bounds.MaximumX) / tileSize;
-                 ++tileX)
-            {
-                ++counts[tileY * result.TilesX + tileX];
-            }
-        }
-    }
-
-    result.Offsets.resize(static_cast<std::size_t>(tileCount) + 1U, 0U);
-    for (std::uint32_t tile = 0; tile < tileCount; ++tile)
-    {
-        result.MaximumListLength = std::max(result.MaximumListLength, counts[tile]);
-        result.Offsets[tile + 1U] = result.Offsets[tile] + counts[tile];
-    }
-    result.TriangleIndices.resize(result.Offsets.back());
-    std::vector<std::uint32_t> writeOffsets = result.Offsets;
-    for (std::uint32_t triangleIndex = 0;
-         triangleIndex < static_cast<std::uint32_t>(triangleBounds.size());
-         ++triangleIndex)
-    {
-        if ((triangleIndex & 255U) == 0U &&
-            IsCancelled(externalCancellation, backendCancellation))
-        {
-            result.Cancelled = true;
-            return result;
-        }
-        const Bounds& bounds = triangleBounds[triangleIndex];
-        if (!bounds.Valid)
-        {
-            continue;
-        }
-        for (std::uint32_t tileY =
-                 static_cast<std::uint32_t>(bounds.MinimumY) / tileSize;
-             tileY <= static_cast<std::uint32_t>(bounds.MaximumY) / tileSize;
-             ++tileY)
-        {
-            for (std::uint32_t tileX =
-                     static_cast<std::uint32_t>(bounds.MinimumX) / tileSize;
-                 tileX <= static_cast<std::uint32_t>(bounds.MaximumX) / tileSize;
-                 ++tileX)
-            {
-                const std::uint32_t tile = tileY * result.TilesX + tileX;
-                result.TriangleIndices[writeOffsets[tile]++] = triangleIndex;
-            }
-        }
-    }
-    return result;
-}
 
 constexpr const char* ComputeShaderSource = R"hlsl(
 struct Vertex {
@@ -461,9 +43,9 @@ struct Vertex {
 struct RasterTriangleGpu {
     Vertex Vertices[3]; float4 BaseColor; float4 SpecularColor; float4 EmissiveColor;
     float Shininess; float AlphaCutoff; uint DiffuseTextureIndex; uint OpacityTextureIndex;
-    uint Selected; uint Padding0; uint Padding1; uint Padding2;
+    uint Selected; uint NormalTextureIndex; float SubsurfaceWeight; uint ReceivesLightmap;
 };
-struct RasterTextureGpu { uint OffsetTexels; uint Width; uint Height; uint Padding; };
+struct RasterTextureGpu { uint OffsetTexels; uint Width; uint Height; uint FirstMip; };
 struct RasterLightGpu {
     float4 PositionType; float4 DirectionIntensity;
     float4 ColorCastShadows; float4 AreaSizePadding;
@@ -481,15 +63,21 @@ cbuffer Constants : register(b0) {
     uint LightCount; int ShadowLightIndex; uint TextureCount, TextureTexelCount;
     RasterLightGpu Lights[4];
     float4 ShadowRasterBias;
+    uint MaterialOptions, FrontLightmap, BackLightmap, ACESColor;
+    float4 DisplayParameters;
+    uint SkyTexture, SkyDiffuseTexture; float SkyIntensity, SkyDiffuseIntensity;
+    float4 SubsurfaceScattering;
+    float4 NormalRows[3]; uint MainTileSize, ShadowTileSize, GroupsX, CollectCounts;
 };
 StructuredBuffer<RasterTriangleGpu> Triangles : register(t0);
-StructuredBuffer<uint> TileOffsets : register(t1);
-StructuredBuffer<uint> TileTriangleIndices : register(t2);
+StructuredBuffer<uint> Bins : register(t1);
 StructuredBuffer<float> ShadowDepths : register(t3);
 StructuredBuffer<RasterTextureGpu> TextureDescriptors : register(t4);
 StructuredBuffer<uint> TextureTexels : register(t5);
 RWStructuredBuffer<float4> OutputColors : register(u0);
 RWStructuredBuffer<float> OutputDepths : register(u1);
+RWStructuredBuffer<float> OutputVisibility : register(u6);
+StructuredBuffer<float> OutlineVisibility : register(t0);
 RWStructuredBuffer<float> GeneratedShadowDepths : register(u2);
 
 float Edge(float2 a,float2 b,float2 p) {
@@ -503,46 +91,59 @@ float3 NormalizeOr(float3 value,float3 fallback) {
     float lengthSquared=dot(value,value);
     return lengthSquared<1.0e-12?fallback:value*rsqrt(lengthSquared);
 }
-float SRGBToLinearChannel(float value) {
-    value=saturate(value);
-    return value<=0.04045?value/12.92:pow((value+0.055)/1.055,2.4);
-}
-int WrapTextureCoordinate(int value,uint size) {
-    int result=value%(int)size;
-    return result<0?result+(int)size:result;
-}
-float4 ReadTextureTexel(RasterTextureGpu descriptor,int x,int y,bool decodeSRGB) {
-    x=WrapTextureCoordinate(x,descriptor.Width);
-    y=WrapTextureCoordinate(y,descriptor.Height);
-    uint packed=TextureTexels[descriptor.OffsetTexels+(uint)y*descriptor.Width+(uint)x];
-    float4 value=float4(
-        packed&255U,(packed>>8U)&255U,(packed>>16U)&255U,(packed>>24U)&255U)/255.0;
-    if(decodeSRGB) {
-        value.rgb=float3(
-            SRGBToLinearChannel(value.r),
-            SRGBToLinearChannel(value.g),
-            SRGBToLinearChannel(value.b));
-    }
-    return value;
-}
-float4 SampleTexture(uint textureIndex,float2 texCoord,bool decodeSRGB) {
-    if(textureIndex>=TextureCount)return 1.0.xxxx;
-    RasterTextureGpu descriptor=TextureDescriptors[textureIndex];
-    uint texelCount=descriptor.Width*descriptor.Height;
-    if(descriptor.Width==0||descriptor.Height==0||descriptor.OffsetTexels>=TextureTexelCount||
-       texelCount>TextureTexelCount-descriptor.OffsetTexels)return 1.0.xxxx;
-    float x=frac(texCoord.x)*descriptor.Width-0.5;
-    float y=frac(1.0-texCoord.y)*descriptor.Height-0.5;
-    int x0=(int)floor(x),y0=(int)floor(y);
-    float blendX=x-floor(x),blendY=y-floor(y);
-    float4 top=lerp(
-        ReadTextureTexel(descriptor,x0,y0,decodeSRGB),
-        ReadTextureTexel(descriptor,x0+1,y0,decodeSRGB),blendX);
-    float4 bottom=lerp(
-        ReadTextureTexel(descriptor,x0,y0+1,decodeSRGB),
-        ReadTextureTexel(descriptor,x0+1,y0+1,decodeSRGB),blendX);
-    return lerp(top,bottom,blendY);
-}
+)hlsl"
+#define R_FN
+#define R_TRI RasterTriangleGpu
+#define R_TEX RasterTextureGpu
+#define R_READ(T) StructuredBuffer<T>
+#define R_MIN min
+#define R_MAX max
+#define R_FLOOR floor
+#define R_CEIL ceil
+#define R_ABS abs
+#define R_SQRT sqrt
+#define R_LOG2 log2
+#define R_POW pow
+#define R_EXP2 exp2
+#define R_FINITE isfinite
+#define R_ATAN2 atan2
+#define R_ACOS acos
+#define R_DOT dot
+#define R_CROSS cross
+#define R_FLOAT2 float2
+#define R_FLOAT3 float3
+#define R_FLOAT4 float4
+#define R_XYZ(v) (v).xyz
+#define R_NORMALIZE_OR NormalizeOr
+#define EVANS_MATERIAL_STRING(...) #__VA_ARGS__ "\n"
+#define EVANS_GPU_CODE(...) EVANS_MATERIAL_STRING(__VA_ARGS__)
+#include "GpuMaterials.inc"
+#undef EVANS_MATERIAL_STRING
+#undef R_FN
+#undef R_TRI
+#undef R_TEX
+#undef R_READ
+#undef R_MIN
+#undef R_MAX
+#undef R_FLOOR
+#undef R_CEIL
+#undef R_ABS
+#undef R_SQRT
+#undef R_LOG2
+#undef R_POW
+#undef R_EXP2
+#undef R_FINITE
+#undef R_ATAN2
+#undef R_ACOS
+#undef R_DOT
+#undef R_CROSS
+#undef R_FLOAT2
+#undef R_FLOAT3
+#undef R_FLOAT4
+#undef R_XYZ
+#undef R_NORMALIZE_OR
+#undef EVANS_GPU_CODE
+R"hlsl(
 float4 SampleSurface(
     RasterTriangleGpu primitive,float p0,float p1,float p2,float denominator) {
     float4 vertex=(primitive.Vertices[0].Color*p0+
@@ -551,24 +152,40 @@ float4 SampleSurface(
     float2 texCoord=(primitive.Vertices[0].TexCoord.xy*p0+
                      primitive.Vertices[1].TexCoord.xy*p1+
                      primitive.Vertices[2].TexCoord.xy*p2)/denominator;
-    float4 diffuse=SampleTexture(primitive.DiffuseTextureIndex,texCoord,true);
-    float opacity=SampleTexture(primitive.OpacityTextureIndex,texCoord,false).r;
+    const bool aniso = (MaterialOptions & 8) != 0;
+    RasterTextureGradients gradients = GpuTextureGradients(primitive, texCoord, denominator, Width, Height);
+    float4 diffuse=GpuSampleTexture((MaterialOptions & 1) != 0 ? primitive.DiffuseTextureIndex : 0xffffffffu,
+        texCoord,1,gradients,TextureCount,aniso,TextureDescriptors,TextureTexels);
+    float opacity=GpuSampleTexture((MaterialOptions & 4) != 0 ? primitive.OpacityTextureIndex : 0xffffffffu,
+        texCoord,0,gradients,TextureCount,aniso,TextureDescriptors,TextureTexels).r;
     return float4(
         vertex.rgb*primitive.BaseColor.rgb*diffuse.rgb,
         saturate(vertex.a*primitive.BaseColor.a*diffuse.a*opacity));
 }
+// Smooth finite support for inverse-square point and rectangle samples.
+// Karis' attenuation window; Filament, Punctual lights / Attenuation function.
+float LightRangeWindow(float3 toEmitter, float radius)
+{
+    if (radius <= 0.0f) return 1.0f;
+    if (any(abs(toEmitter) >= radius)) return 0.0f;
+    float3 relative = toEmitter / radius;
+    float distanceRatioSquared = dot(relative, relative);
+    float window = saturate(1.0f - distanceRatioSquared * distanceRatioSquared);
+    return window * window;
+}
+
 void AccumulateLightSample(
     float3 lightDirection,float3 radiance,float visibility,float3 normal,
-    float3 viewDirection,float shininess,uint shading,
+    float3 viewDirection,float shininess,uint shading, float3 scatter,
     inout float3 diffuseLight,inout float3 specularLight) {
     float directionLengthSquared=dot(lightDirection,lightDirection);
     if(directionLengthSquared<=1.0e-12)return;
     float3 direction=lightDirection*rsqrt(directionLengthSquared);
-    float normalToLight=max(dot(normal,direction),0.0);
-    if(normalToLight<=0.0)return;
+    float cosine = dot(normal, direction);
+    float normalToLight = max(cosine, 0.0f);
     float3 visibleRadiance=radiance*visibility;
-    diffuseLight+=visibleRadiance*normalToLight;
-    if(shading==2) {
+    diffuseLight += visibleRadiance * max(cosine + scatter, 0.0f) / (1.0f + scatter);
+    if (shading == 2 && normalToLight > 0) {
         float3 halfVector=NormalizeOr(direction+viewDirection,normal);
         float specularAmount=pow(max(dot(normal,halfVector),0.0),max(shininess,1.0));
         specularLight+=visibleRadiance*specularAmount;
@@ -576,7 +193,7 @@ void AccumulateLightSample(
 }
 void AccumulateSceneLight(
     uint lightIndex,float3 position,float3 normal,float3 viewDirection,
-    float shininess,uint shading,float shadowVisibility,
+    float shininess,uint shading, float3 scatter,float shadowVisibility,
     inout float3 diffuseLight,inout float3 specularLight) {
     RasterLightGpu light=Lights[lightIndex];
     uint type=(uint)(light.PositionType.w+0.5);
@@ -586,14 +203,14 @@ void AccumulateSceneLight(
         max(light.DirectionIntensity.w,0.0);
     if(type==0) {
         AccumulateLightSample(light.DirectionIntensity.xyz,radiance,visibility,normal,
-            viewDirection,shininess,shading,diffuseLight,specularLight);
+            viewDirection,shininess,shading, scatter,diffuseLight,specularLight);
         return;
     }
     if(type==1) {
         float3 toLight=light.PositionType.xyz-position;
         float distanceSquared=max(dot(toLight,toLight),1.0e-6);
-        AccumulateLightSample(toLight,radiance/distanceSquared,visibility,normal,
-            viewDirection,shininess,shading,diffuseLight,specularLight);
+        AccumulateLightSample(toLight,radiance * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared,visibility,normal,
+            viewDirection,shininess,shading, scatter,diffuseLight,specularLight);
         return;
     }
     float3 emissionDirection=NormalizeOr(
@@ -613,34 +230,70 @@ void AccumulateSceneLight(
             float3 direction=toLight*rsqrt(distanceSquared);
             float emitterCosine=max(dot(emissionDirection,-direction),0.0);
             AccumulateLightSample(direction,
-                radiance*(0.25*emitterCosine/distanceSquared),visibility,normal,
-                viewDirection,shininess,shading,diffuseLight,specularLight);
+                radiance*(0.25*emitterCosine * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared),visibility,normal,
+                viewDirection,shininess,shading, scatter,diffuseLight,specularLight);
         }
     }
 }
-float4 LightClip(Vertex vertex) {
-    return InputSpace==0?vertex.ShadowClip:
-        mul(LightViewProjection,mul(World,vertex.Position));
+#define R_FN
+#define R_TRI RasterTriangleGpu
+#define R_READ(T) StructuredBuffer<T>
+#define R_WRITE(T) RWStructuredBuffer<T>
+#define R_INOUT(T) inout T
+#define R_OUT(T) out T
+#define R_FLOAT4 float4
+#define R_LOWBIT firstbitlow
+#define R_MIN min
+#define R_MAX max
+#define R_ABS abs
+#define R_ADD(value,bits) InterlockedAdd(value,bits)
+#define R_OR(value,bits) InterlockedOr(value,bits)
+)hlsl"
+#define EVANS_GPU_CODE(...) #__VA_ARGS__ "\n"
+#include "GpuGeometry.inc"
+#undef EVANS_GPU_CODE
+R"hlsl(
+StructuredBuffer<ProjectedVertex> Projected : register(t2);
+RWStructuredBuffer<RasterTriangleGpu> Transformed : register(u3);
+RWStructuredBuffer<ProjectedVertex> ProjectedOutput : register(u4);
+RWStructuredBuffer<uint> BinOutput : register(u5);
+[numthreads(64,1,1)] void TransformMain(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {
+    uint id=(group.y*GroupsX+group.x)*64+lane;
+    if (id>=TriangleCount) return;
+    RasterTriangleGpu primitive=Triangles[id];
+    [unroll]for(uint corner=0;corner<3;++corner) {
+        Vertex vert=primitive.Vertices[corner];float3 normal=vert.Normal.xyz;
+        if (InputSpace!=0) {
+            float4 world=mul(World,vert.Position);
+            if(abs(world.w)>1e-6 && abs(world.w-1.0)>1e-6) {world/=world.w;world.w=1;}
+            vert.Position=world;vert.Clip=mul(Projection,mul(View,world));vert.ShadowClip=mul(LightViewProjection,world);
+            normal=float3(dot(NormalRows[0].xyz,normal),dot(NormalRows[1].xyz,normal),dot(NormalRows[2].xyz,normal));
+        }
+        vert.Normal=float4(NormalizeSafe(normal),0);primitive.Vertices[corner]=vert;
+    }
+    Transformed[id]=primitive;
 }
-
+[numthreads(64,1,1)] void SetupMain(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {
+    ProjectAndBin((group.y*GroupsX+group.x)*64+lane,TriangleCount,Width,Height,MainTileSize,DepthRange,false,CollectCounts!=0,FillModeValue==0,Triangles,ProjectedOutput,BinOutput);
+}
+[numthreads(64,1,1)] void SetupShadow(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {
+    ProjectAndBin((group.y*GroupsX+group.x)*64+lane,TriangleCount,ShadowWidth,ShadowHeight,ShadowTileSize,DepthRange,true,false,true,Triangles,ProjectedOutput,BinOutput);
+}
 [numthreads(8,8,1)]
 void ShadowMain(uint3 id:SV_DispatchThreadID) {
     uint x=id.x,y=id.y;if(x>=ShadowWidth||y>=ShadowHeight)return;
     uint pixel=y*ShadowWidth+x;
-    uint tile=(y/16U)*((ShadowWidth+15U)/16U)+x/16U;
     float2 samplePosition=float2(x+0.5,y+0.5);float bestDepth=1.0e30;
-    [loop]for(uint binIndex=TileOffsets[tile];binIndex<TileOffsets[tile+1U];++binIndex) {
-        RasterTriangleGpu primitive=Triangles[TileTriangleIndices[binIndex]];
-        float2 screen[3];float inverseW[3],vertexDepth[3];bool valid=true;
-        [unroll]for(uint vertexIndex=0;vertexIndex<3;++vertexIndex) {
-            float4 clip=LightClip(primitive.Vertices[vertexIndex]);
-            if(clip.w<=1.0e-6){valid=false;break;}
-            inverseW[vertexIndex]=rcp(clip.w);float3 ndc=clip.xyz*inverseW[vertexIndex];
-            screen[vertexIndex]=float2(
-                (ndc.x*0.5+0.5)*ShadowWidth,(0.5-ndc.y*0.5)*ShadowHeight);
-            vertexDepth[vertexIndex]=DepthRange==0?ndc.z:ndc.z*0.5+0.5;
-        }
-        if(!valid)continue;
+    BinCursor cursor=OpenBin((y/ShadowTileSize)*((ShadowWidth+ShadowTileSize-1)/ShadowTileSize)+x/ShadowTileSize,TriangleCount);
+    uint sourceId;
+    while (NextCandidate(cursor,Bins,sourceId)) {
+        ProjectedVertex first=Projected[sourceId*3];
+        uint corners=((uint)first.Weights.w)&15u;
+        for(uint fan=1;fan+1<corners;++fan) {
+        ProjectedVertex second=Projected[VertexSlot(sourceId,fan,TriangleCount)],third=Projected[VertexSlot(sourceId,fan+1,TriangleCount)];
+        float2 screen[3]={float2(first.Screen.x,first.Screen.y),float2(second.Screen.x,second.Screen.y),float2(third.Screen.x,third.Screen.y)};
+        float inverseW[3]={first.Screen.w,second.Screen.w,third.Screen.w}, vertexDepth[3]={first.Screen.z,second.Screen.z,third.Screen.z};
+        if(inverseW[0]<=0 || inverseW[1]<=0 || inverseW[2]<=0)continue;
         float area=Edge(screen[0],screen[1],screen[2]);if(abs(area)<1.0e-6)continue;
         float w0=Edge(screen[1],screen[2],samplePosition)/area;
         float w1=Edge(screen[2],screen[0],samplePosition)/area;
@@ -654,11 +307,15 @@ void ShadowMain(uint3 id:SV_DispatchThreadID) {
             depth=min(depth+ShadowRasterBias.x*max(abs(slopeX),abs(slopeY)),1.0);
         }
         if(depth>=bestDepth)continue;
+        RasterTriangleGpu primitive=FanAttributes(Triangles[sourceId],first,second,third);
+        if((MaterialOptions&4)!=0 && primitive.AlphaCutoff>0) {
         float p0=w0*inverseW[0],p1=w1*inverseW[1],p2=w2*inverseW[2];
         float denominator=p0+p1+p2;if(abs(denominator)<1.0e-8)continue;
         float alpha=SampleSurface(primitive,p0,p1,p2,denominator).a;
         if(primitive.AlphaCutoff>0.0&&alpha<primitive.AlphaCutoff)continue;
+        }
         bestDepth=depth;
+    }
     }
     GeneratedShadowDepths[pixel]=bestDepth;
 }
@@ -668,31 +325,23 @@ R"hlsl(
 [numthreads(8,8,1)]
 void RasterMain(uint3 id:SV_DispatchThreadID) {
     uint x=id.x,y=id.y;if(x>=Width||y>=Height)return;
-    uint pixel=y*Width+x,tile=(y/16U)*TilesX+x/16U;
+    uint pixel=y*Width+x;
     float2 samplePosition=float2(x+0.5,y+0.5);
+    float visibilityDepth=1.0e30;bool selected=false;
+    uint winningId=0, winningFan=0;
+    float winningP0=0, winningP1=0, winningP2=0, winningDenominator=1;
+    bool winningFront=false;
     float bestDepth=1.0e30,bestWireDepth=1.0e30;float4 bestColor=ClearColor;
-    [loop]for(uint binIndex=TileOffsets[tile];binIndex<TileOffsets[tile+1U];++binIndex) {
-        RasterTriangleGpu primitive=Triangles[TileTriangleIndices[binIndex]];
-        float4 clip[3],world[3],shadowClip[3];float3 normal[3];
-        float2 screen[3];float inverseW[3],vertexDepth[3];bool valid=true;
-        [unroll]for(uint vertexIndex=0;vertexIndex<3;++vertexIndex) {
-            Vertex vertex=primitive.Vertices[vertexIndex];
-            if(InputSpace==0) {
-                clip[vertexIndex]=vertex.Clip;world[vertexIndex]=vertex.Position;
-                normal[vertexIndex]=vertex.Normal.xyz;shadowClip[vertexIndex]=vertex.ShadowClip;
-            } else {
-                world[vertexIndex]=mul(World,vertex.Position);
-                clip[vertexIndex]=mul(Projection,mul(View,world[vertexIndex]));
-                normal[vertexIndex]=NormalizeSafe(mul((float3x3)World,vertex.Normal.xyz));
-                shadowClip[vertexIndex]=mul(LightViewProjection,world[vertexIndex]);
-            }
-            if(clip[vertexIndex].w<=1.0e-6){valid=false;break;}
-            inverseW[vertexIndex]=rcp(clip[vertexIndex].w);
-            float3 ndc=clip[vertexIndex].xyz*inverseW[vertexIndex];
-            screen[vertexIndex]=float2((ndc.x*0.5+0.5)*Width,(0.5-ndc.y*0.5)*Height);
-            vertexDepth[vertexIndex]=DepthRange==0?ndc.z:ndc.z*0.5+0.5;
-        }
-        if(!valid)continue;
+    BinCursor cursor=OpenBin((y/MainTileSize)*((Width+MainTileSize-1)/MainTileSize)+x/MainTileSize,TriangleCount);
+    uint sourceId;
+    while (NextCandidate(cursor,Bins,sourceId)) {
+        ProjectedVertex first=Projected[sourceId*3];
+        uint corners=((uint)first.Weights.w)&15u;
+        for(uint fan=1;fan+1<corners;++fan) {
+        ProjectedVertex second=Projected[VertexSlot(sourceId,fan,TriangleCount)],third=Projected[VertexSlot(sourceId,fan+1,TriangleCount)];
+        float2 screen[3]={float2(first.Screen.x,first.Screen.y),float2(second.Screen.x,second.Screen.y),float2(third.Screen.x,third.Screen.y)};
+        float inverseW[3]={first.Screen.w,second.Screen.w,third.Screen.w}, vertexDepth[3]={first.Screen.z,second.Screen.z,third.Screen.z};
+        if(inverseW[0]<=0 || inverseW[1]<=0 || inverseW[2]<=0)continue;
         float area=Edge(screen[0],screen[1],screen[2]);if(abs(area)<1.0e-6)continue;
         bool front=FrontFaceCounterClockwise!=0?area<0:area>0;
         if(BackFaceCulling!=0&&!front)continue;
@@ -717,6 +366,8 @@ void RasterMain(uint3 id:SV_DispatchThreadID) {
             float halfWidth=max(WireframeWidth,1.0)*0.5;
             wire=nearestEdge<=halfWidth*halfWidth;
         }
+        if(!inside && !wire)continue;
+        RasterTriangleGpu primitive=FanAttributes(Triangles[sourceId],first,second,third);
         if(wire){
             float wireDepth=dot(edgeWeights,float3(vertexDepth[0],vertexDepth[1],vertexDepth[2]));
             float3 edgePerspective=edgeWeights*float3(inverseW[0],inverseW[1],inverseW[2]);
@@ -724,21 +375,41 @@ void RasterMain(uint3 id:SV_DispatchThreadID) {
             if(wireDepth>=0&&wireDepth<=1&&abs(edgeDenominator)>1.0e-8){
                 float edgeAlpha=SampleSurface(primitive,edgePerspective.x,edgePerspective.y,
                     edgePerspective.z,edgeDenominator).a;
-                if(primitive.AlphaCutoff<=0||edgeAlpha>=primitive.AlphaCutoff)
+                if((MaterialOptions&4)==0 || primitive.AlphaCutoff<=0||edgeAlpha>=primitive.AlphaCutoff)
                     bestWireDepth=min(bestWireDepth,wireDepth);
             }
+        }
+        if(OutlineEnabled!=0 && inside) {
+            float z=dot(float3(w0,w1,w2),float3(vertexDepth[0],vertexDepth[1],vertexDepth[2]));
+            float3 p=float3(w0,w1,w2)*float3(inverseW[0],inverseW[1],inverseW[2]);
+            float d=p.x+p.y+p.z;
+            if(z>=0 && z<=1 && z<visibilityDepth && abs(d)>1e-8 &&
+                ((MaterialOptions&4)==0 || primitive.AlphaCutoff<=0 || SampleSurface(primitive,p.x,p.y,p.z,d).a>=primitive.AlphaCutoff))
+            {visibilityDepth=z;selected=primitive.Selected!=0;}
         }
         if(FillModeValue==1||!inside)continue;
         float depth=w0*vertexDepth[0]+w1*vertexDepth[1]+w2*vertexDepth[2];
         if(depth<0||depth>1||(DepthTest!=0&&depth>=bestDepth))continue;
         float p0=w0*inverseW[0],p1=w1*inverseW[1],p2=w2*inverseW[2];
         float denominator=p0+p1+p2;if(abs(denominator)<1.0e-8)continue;
+        if((MaterialOptions&4)!=0 && primitive.AlphaCutoff>0.0 && SampleSurface(primitive,p0,p1,p2,denominator).a<primitive.AlphaCutoff)continue;
+        bestDepth=depth;winningId=sourceId;winningFan=fan;winningFront=front;
+        winningP0=p0;winningP1=p1;winningP2=p2;winningDenominator=denominator;
+        }
+    }
+    if(winningFan!=0) {
+        RasterTriangleGpu primitive=FanAttributes(Triangles[winningId],Projected[winningId*3],
+            Projected[VertexSlot(winningId,winningFan,TriangleCount)],Projected[VertexSlot(winningId,winningFan+1,TriangleCount)]);
+        float p0=winningP0,p1=winningP1,p2=winningP2,denominator=winningDenominator;
+        bool front=winningFront;
         float4 color=SampleSurface(primitive,p0,p1,p2,denominator);
-        if(primitive.AlphaCutoff>0.0&&color.a<primitive.AlphaCutoff)continue;
-
         float shadowVisibility=1.0;
         if(ShadowsEnabled!=0&&ShadowWidth>0&&ShadowHeight>0) {
-            float4 shadow=(shadowClip[0]*p0+shadowClip[1]*p1+shadowClip[2]*p2)/denominator;
+            float3 shadowNormal = NormalizeSafe((primitive.Vertices[0].Normal.xyz*p0+
+                primitive.Vertices[1].Normal.xyz*p1+primitive.Vertices[2].Normal.xyz*p2)/denominator) * (front?1.0f:-1.0f);
+            float receiverBias = GpuShadowBias(ShadowBias, ShadowRasterBias.z, shadowNormal,
+                Lights[clamp(ShadowLightIndex,0,3)].DirectionIntensity.xyz);
+            float4 shadow=(primitive.Vertices[0].ShadowClip*p0+primitive.Vertices[1].ShadowClip*p1+primitive.Vertices[2].ShadowClip*p2)/denominator;
             if(shadow.w>1.0e-6) {
                 float inverseShadowW=rcp(shadow.w);
                 float shadowX=shadow.x*inverseShadowW*0.5+0.5;
@@ -755,7 +426,7 @@ void RasterMain(uint3 id:SV_DispatchThreadID) {
                         [loop]for(int offsetX=-radius;offsetX<=radius;++offsetX) {
                             int sx=centerX+offsetX;if(sx<0||sx>=(int)ShadowWidth)continue;
                             ++validSamples;
-                            if(shadowZ-ShadowBias>ShadowDepths[sy*ShadowWidth+sx])++occluded;
+                            if(shadowZ-receiverBias>ShadowDepths[sy*ShadowWidth+sx])++occluded;
                         }
                     }
                     if(validSamples>0)
@@ -768,25 +439,45 @@ void RasterMain(uint3 id:SV_DispatchThreadID) {
         if(ShadingValue==0) {
             color.rgb+=primitive.EmissiveColor.rgb;
         } else {
-            float3 n=NormalizeSafe((normal[0]*p0+normal[1]*p1+normal[2]*p2)/denominator);
+            float3 n=NormalizeSafe((primitive.Vertices[0].Normal.xyz*p0+primitive.Vertices[1].Normal.xyz*p1+primitive.Vertices[2].Normal.xyz*p2)/denominator);
             if(!front)n=-n;
-            float3 position=((world[0]*p0+world[1]*p1+world[2]*p2)/denominator).xyz;
+            float4 uv = (primitive.Vertices[0].TexCoord*p0+primitive.Vertices[1].TexCoord*p1+primitive.Vertices[2].TexCoord*p2)/denominator;
+            RasterTextureGradients gradients = GpuTextureGradients(primitive, uv.xy, denominator, Width, Height);
+            if ((MaterialOptions&2)!=0 && primitive.NormalTextureIndex<TextureCount)
+                n = GpuMappedNormal(primitive,n,GpuSampleTexture(primitive.NormalTextureIndex,uv.xy,0,
+                    gradients,TextureCount,(MaterialOptions&8)!=0,TextureDescriptors,TextureTexels));
+            float3 position=((primitive.Vertices[0].Position*p0+primitive.Vertices[1].Position*p1+primitive.Vertices[2].Position*p2)/denominator).xyz;
             float3 viewDirection=NormalizeOr(CameraPosition.xyz-position,n);
             float3 diffuseLight=0.0.xxx,specularLight=0.0.xxx;
             [loop]for(uint lightIndex=0;lightIndex<min(LightCount,4U);++lightIndex)
                 AccumulateSceneLight(lightIndex,position,n,viewDirection,primitive.Shininess,
-                    ShadingValue,shadowVisibility,diffuseLight,specularLight);
+                    ShadingValue,SubsurfaceScattering.xyz*primitive.SubsurfaceWeight,shadowVisibility,diffuseLight,specularLight);
+            if (SkyDiffuseIntensity > 0 && SkyDiffuseTexture < TextureCount)
+                diffuseLight += GpuSampleSky(n,SkyDiffuseTexture,TextureCount,TextureDescriptors,TextureTexels)*SkyDiffuseIntensity;
+            uint atlas = front || BackLightmap>=TextureCount ? FrontLightmap : BackLightmap;
+            if (primitive.ReceivesLightmap != 0 && atlas<TextureCount)
+                diffuseLight += GpuSampleTexture(atlas,uv.zw,2,gradients,TextureCount,false,TextureDescriptors,TextureTexels).xyz*DisplayParameters.w;
             color.rgb=color.rgb*(AmbientColor.rgb*LightColorAmbientStrength.w+diffuseLight)+
                 primitive.SpecularColor.rgb*specularLight+primitive.EmissiveColor.rgb;
         }
-        color.rgb=max(color.rgb,0.0);
-        color.rgb/=max(1.0,max(color.r,max(color.g,color.b)));
-        bestDepth=depth;bestColor=float4(saturate(color.rgb),saturate(color.a));
+        color.rgb=GpuDisplayColor(color.rgb,ACESColor,DisplayParameters);
+        bestColor=float4(saturate(color.rgb),saturate(color.a));
     }
     if(FillModeValue==1)bestDepth=bestWireDepth;
     if(FillModeValue!=0&&bestWireDepth<=1.0&&(DepthTest==0||bestWireDepth<=bestDepth+1.0e-4))
     {bestColor=WireframeColor;bestDepth=min(bestDepth,bestWireDepth);}
-    OutputColors[pixel]=bestColor;OutputDepths[pixel]=bestDepth;
+    if (bestDepth > 1.0f && FillModeValue != 1 && SkyIntensity > 0 && SkyTexture < TextureCount) {
+        float3 ray = GpuSkyRay(id.x+0.5f,id.y+0.5f,Width,Height,View[0].xyz,View[1].xyz,View[2].xyz,Projection[0][0],Projection[1][1]);
+        bestColor = float4(GpuDisplayColor(GpuSampleSky(ray,SkyTexture,TextureCount,TextureDescriptors,TextureTexels)*SkyIntensity,
+            ACESColor,DisplayParameters),1);
+    }
+    OutputColors[pixel]=bestColor; OutputDepths[pixel]=bestDepth;
+    if (OutlineEnabled!=0) OutputVisibility[pixel]=selected?-visibilityDepth-1:visibilityDepth;
+}
+[numthreads(8,8,1)]
+void OutlineMain(uint3 id:SV_DispatchThreadID) {
+    if(id.x<Width && id.y<Height && IsOutlinePixel(id.x,id.y,Width,Height,(int)OutlineWidth,OutlineVisibility))
+        OutputColors[id.y*Width+id.x]=OutlineColor;
 }
 )hlsl";
 
@@ -811,18 +502,15 @@ public:
     {
         Shutdown();
         D3D11Library_ = LoadLibraryA("d3d11.dll");
-        CompilerLibrary_ = LoadLibraryA("d3dcompiler_47.dll");
-        if (D3D11Library_ == nullptr || CompilerLibrary_ == nullptr)
+        if (D3D11Library_ == nullptr)
         {
-            error = "D3D11 or D3DCompiler system library is unavailable";
+            error = "D3D11 system library is unavailable";
             Shutdown();
             return false;
         }
         CreateDevice_ = reinterpret_cast<CreateDeviceFunction>(
             GetProcAddress(D3D11Library_, "D3D11CreateDevice"));
-        Compile_ = reinterpret_cast<CompileFunction>(
-            GetProcAddress(CompilerLibrary_, "D3DCompile"));
-        if (CreateDevice_ == nullptr || Compile_ == nullptr)
+        if (CreateDevice_ == nullptr)
         {
             error = "D3D11 system libraries are missing required entry points";
             Shutdown();
@@ -850,13 +538,19 @@ public:
             return false;
         }
 
+        return true;
+    }
+
+    bool EnsureShaders(std::string& error)
+    {
         const auto compileShader = [&](
             const char* entryPoint,
             ID3D11ComputeShader** output) -> bool
         {
+            if (*output) return true;
             ID3DBlob* byteCode = nullptr;
             ID3DBlob* compilerErrors = nullptr;
-            const HRESULT compileResult = Compile_(
+            const HRESULT compileResult = Renderer::CompileCachedD3DShader(
                 ComputeShaderSource,
                 std::strlen(ComputeShaderSource),
                 "EvansComputeRaster.hlsl",
@@ -898,9 +592,10 @@ public:
             return true;
         };
         if (!compileShader("RasterMain", &RasterShader_) ||
-            !compileShader("ShadowMain", &ShadowShader_))
+            !compileShader("ShadowMain", &ShadowShader_) ||
+            !compileShader("TransformMain",&TransformShader_) || !compileShader("SetupMain",&SetupMain_) ||
+            !compileShader("SetupShadow",&SetupShadow_) || !compileShader("OutlineMain",&OutlineShader_))
         {
-            Shutdown();
             return false;
         }
         return true;
@@ -908,17 +603,18 @@ public:
 
     void Shutdown() noexcept
     {
+        GpuOutput_.Shutdown();TextureCache_.Reset();TextureGeneration_=0;
+        for(auto buffer:{&Source_,&Transformed_,&Projected_,&Bins_,&Shadow_,&Colors_,&Depths_,&Visibility_,&Descriptors_,&Texels_}) *buffer={};
+        ResidentScene_.reset(); Constants_.Reset();CounterReadback_.Reset();
+        Release(TransformShader_);Release(SetupMain_);Release(SetupShadow_); Release(OutlineShader_);
         Release(ShadowShader_);
         Release(RasterShader_);
         if (ImmediateContext_ != nullptr) ImmediateContext_->ClearState();
         Release(ImmediateContext_);
         Release(Device_);
-        if (CompilerLibrary_ != nullptr) FreeLibrary(CompilerLibrary_);
         if (D3D11Library_ != nullptr) FreeLibrary(D3D11Library_);
-        CompilerLibrary_ = nullptr;
         D3D11Library_ = nullptr;
         CreateDevice_ = nullptr;
-        Compile_ = nullptr;
     }
 
     [[nodiscard]] RasterStatus Render(
@@ -929,575 +625,156 @@ public:
         const std::atomic<bool>& backendCancellation,
         RasterStatistics& statistics)
     {
-        if (IsCancelled(externalCancellation, backendCancellation))
+        const auto cancelled=[&]{return Detail::IsGpuRasterCancelled(externalCancellation,backendCancellation);};
+        if(cancelled())return RasterStatus::Cancelled;
+        const auto start=std::chrono::steady_clock::now();
+        std::string shaderError;
+        if (!EnsureShaders(shaderError)) throw std::runtime_error(shaderError);
+        const Detail::GpuGeometryFrame frame(scene,settings,target);
+        Ensure(Source_,frame.TriangleCount,sizeof(Detail::GpuRasterTriangle),false);
+        const bool upload=settings.ImmutableScene.get()!=&scene || ResidentScene_.lock().get()!=&scene;
+        if(upload)
         {
-            return RasterStatus::Cancelled;
+            ResidentScene_.reset();
+            const auto packed=Detail::BuildGpuRasterTriangles(scene);
+            Upload(Source_,packed.data(),packed.size()*sizeof(Detail::GpuRasterTriangle));
+            ResidentScene_=settings.ImmutableScene.get()==&scene ? settings.ImmutableScene : nullptr;
         }
-
-        const bool hasExternalShadowMap =
-            settings.ShadowsEnabled && settings.SceneShadowMap != nullptr &&
-            settings.SceneShadowMap->IsValid();
-        const bool generateShadowMap =
-            settings.ShadowsEnabled && !hasExternalShadowMap &&
-            settings.AutoGenerateShadowMap;
-        const bool shadowsEnabled = hasExternalShadowMap || generateShadowMap;
-        const std::uint32_t shadowWidth = hasExternalShadowMap
-                                              ? settings.SceneShadowMap->Width
-                                              : (generateShadowMap
-                                                     ? std::clamp(
-                                                           settings.ShadowMapSize,
-                                                           16U,
-                                                           4096U)
-                                                     : 0U);
-        const std::uint32_t shadowHeight = hasExternalShadowMap
-                                               ? settings.SceneShadowMap->Height
-                                               : shadowWidth;
-
-        const auto transformBegin = std::chrono::steady_clock::now();
-        Detail::PreparedGpuRasterScenes prepared = Detail::PrepareGpuRasterScenes(
-            scene,
-            settings,
-            generateShadowMap,
-            externalCancellation,
-            backendCancellation);
-        if (prepared.Cancelled ||
-            IsCancelled(externalCancellation, backendCancellation))
+        const auto& textures=TextureCache_.Get(scene);
+        if(TextureGeneration_!=TextureCache_.Generation() || !Descriptors_.Resource)
         {
-            return RasterStatus::Cancelled;
+            Ensure(Descriptors_,textures.Descriptors.size(),sizeof(Detail::GpuRasterTexture),false);
+            Ensure(Texels_,textures.TexelsRGBA8.size(),sizeof(unsigned),false);
+            Upload(Descriptors_,textures.Descriptors.data(),textures.Descriptors.size()*sizeof(Detail::GpuRasterTexture));
+            Upload(Texels_,textures.TexelsRGBA8.data(),textures.TexelsRGBA8.size()*sizeof(unsigned));
+            TextureGeneration_=TextureCache_.Generation();
         }
-        const RasterScene& mainScene = prepared.Main;
-        const RasterScene& shadowScene = prepared.Shadow;
-        const RasterSettings& gpuSettings = prepared.Settings;
-        const TileBins mainBins = BuildTileBins(
-            mainScene,
-            gpuSettings,
-            target.Width(),
-            target.Height(),
-            false,
-            externalCancellation,
-            backendCancellation);
-        if (mainBins.Cancelled ||
-            IsCancelled(externalCancellation, backendCancellation))
+        const auto pixels=std::size_t(target.Width())*target.Height();
+        Ensure(Transformed_,frame.TriangleCount,sizeof(Detail::GpuRasterTriangle),true);
+        Ensure(Projected_,std::size_t(frame.TriangleCount)*9,32,true);
+        Ensure(Bins_,std::max(frame.MainBins.StorageWords(),frame.GenerateShadow?frame.ShadowBins.StorageWords():0),4,true);
+        Ensure(Shadow_,std::size_t(frame.ShadowWidth)*frame.ShadowHeight,4,true);
+        Ensure(Colors_,pixels,sizeof(Color),true); Ensure(Depths_,pixels,sizeof(float),true);
+        if(settings.OutlineEnabled) Ensure(Visibility_,pixels,sizeof(float),true);
+        if(frame.ExternalShadow) Upload(Shadow_,settings.SceneShadowMap->Depth.data(),settings.SceneShadowMap->Depth.size()*sizeof(float));
+        if(!Constants_)
         {
-            return RasterStatus::Cancelled;
+            D3D11_BUFFER_DESC desc{};desc.ByteWidth=sizeof(frame.Constants);desc.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+            Check(Device_->CreateBuffer(&desc,nullptr,&Constants_),"Create geometry constants");
         }
-        const TileBins shadowBins = generateShadowMap
-                                        ? BuildTileBins(
-                                              shadowScene,
-                                              gpuSettings,
-                                              shadowWidth,
-                                              shadowHeight,
-                                              true,
-                                              externalCancellation,
-                                              backendCancellation)
-                                        : TileBins{};
-        if (shadowBins.Cancelled ||
-            IsCancelled(externalCancellation, backendCancellation))
+        ImmediateContext_->UpdateSubresource(Constants_.Get(),0,nullptr,&frame.Constants,0,0);
+        if(cancelled())return RasterStatus::Cancelled;
+        const auto rasterStart=std::chrono::steady_clock::now();
+        statistics.TransformMilliseconds=std::chrono::duration<double,std::milli>(rasterStart-start).count();
+        auto context=ImmediateContext_;
+        ID3D11Buffer* cb=Constants_.Get(); context->CSSetConstantBuffers(0,1,&cb);
+        const auto dispatch=[&](ID3D11ComputeShader* shader,unsigned groupsX,unsigned groupsY,
+            std::initializer_list<ID3D11ShaderResourceView*> inputs,unsigned outputSlot,
+            std::initializer_list<ID3D11UnorderedAccessView*> outputs)
         {
-            return RasterStatus::Cancelled;
-        }
-        const std::vector<GpuTriangle> triangles =
-            BuildGpuTriangles(mainScene);
-        const std::vector<GpuTriangle> shadowTriangles =
-            generateShadowMap
-                ? BuildGpuTriangles(shadowScene)
-                : std::vector<GpuTriangle>{};
-        const Detail::GpuRasterTextureData textures =
-            Detail::BuildGpuRasterTextures(mainScene);
-        if (IsCancelled(externalCancellation, backendCancellation))
-        {
-            return RasterStatus::Cancelled;
-        }
-        const GpuConstants constants = BuildConstants(
-            mainScene,
-            gpuSettings,
-            target,
-            shadowsEnabled,
-            shadowWidth,
-            shadowHeight,
-            static_cast<std::uint32_t>(textures.Descriptors.size()),
-            static_cast<std::uint32_t>(textures.TexelsRGBA8.size()));
-        statistics.TransformMilliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - transformBegin)
-                .count();
-
-        const std::size_t pixelCount =
-            static_cast<std::size_t>(target.Width()) * target.Height();
-        const std::size_t shadowPixelCount = std::max<std::size_t>(
-            static_cast<std::size_t>(shadowWidth) * shadowHeight,
-            1U);
-        ID3D11Buffer* triangleBuffer = nullptr;
-        ID3D11ShaderResourceView* triangleView = nullptr;
-        ID3D11Buffer* shadowTriangleBuffer = nullptr;
-        ID3D11ShaderResourceView* shadowTriangleView = nullptr;
-        ID3D11Buffer* mainOffsetBuffer = nullptr;
-        ID3D11ShaderResourceView* mainOffsetView = nullptr;
-        ID3D11Buffer* mainIndexBuffer = nullptr;
-        ID3D11ShaderResourceView* mainIndexView = nullptr;
-        ID3D11Buffer* shadowOffsetBuffer = nullptr;
-        ID3D11ShaderResourceView* shadowOffsetView = nullptr;
-        ID3D11Buffer* shadowIndexBuffer = nullptr;
-        ID3D11ShaderResourceView* shadowIndexView = nullptr;
-        ID3D11Buffer* shadowDepthBuffer = nullptr;
-        ID3D11ShaderResourceView* shadowDepthView = nullptr;
-        ID3D11UnorderedAccessView* shadowDepthUnorderedView = nullptr;
-        ID3D11Buffer* textureDescriptorBuffer = nullptr;
-        ID3D11ShaderResourceView* textureDescriptorView = nullptr;
-        ID3D11Buffer* textureTexelBuffer = nullptr;
-        ID3D11ShaderResourceView* textureTexelView = nullptr;
-        ID3D11Buffer* constantBuffer = nullptr;
-        ID3D11Buffer* colorBuffer = nullptr;
-        ID3D11UnorderedAccessView* colorView = nullptr;
-        ID3D11Buffer* depthBuffer = nullptr;
-        ID3D11UnorderedAccessView* depthView = nullptr;
-        ID3D11Buffer* colorReadback = nullptr;
-        ID3D11Buffer* depthReadback = nullptr;
-        bool colorsMapped = false;
-        bool depthsMapped = false;
-        const auto releaseResources = [&]() noexcept
-        {
-            if (depthsMapped)
-            {
-                ImmediateContext_->Unmap(depthReadback, 0);
-                depthsMapped = false;
-            }
-            if (colorsMapped)
-            {
-                ImmediateContext_->Unmap(colorReadback, 0);
-                colorsMapped = false;
-            }
-            ImmediateContext_->ClearState();
-            Release(depthReadback);
-            Release(colorReadback);
-            Release(depthView);
-            Release(depthBuffer);
-            Release(colorView);
-            Release(colorBuffer);
-            Release(constantBuffer);
-            Release(textureTexelView);
-            Release(textureTexelBuffer);
-            Release(textureDescriptorView);
-            Release(textureDescriptorBuffer);
-            Release(shadowDepthUnorderedView);
-            Release(shadowDepthView);
-            Release(shadowDepthBuffer);
-            Release(shadowIndexView);
-            Release(shadowIndexBuffer);
-            Release(shadowOffsetView);
-            Release(shadowOffsetBuffer);
-            Release(mainIndexView);
-            Release(mainIndexBuffer);
-            Release(mainOffsetView);
-            Release(mainOffsetBuffer);
-            Release(shadowTriangleView);
-            Release(shadowTriangleBuffer);
-            Release(triangleView);
-            Release(triangleBuffer);
-            // Software rendering can leave this context idle indefinitely. Submit
-            // deferred D3D11 destruction before retiring the frame's large buffers.
-            ImmediateContext_->Flush();
+            if(!groupsX || !groupsY)return;
+            context->CSSetShader(shader,nullptr,0);
+            context->CSSetShaderResources(0,static_cast<UINT>(inputs.size()),inputs.begin());
+            context->CSSetUnorderedAccessViews(outputSlot,static_cast<UINT>(outputs.size()),outputs.begin(),nullptr);
+            context->Dispatch(groupsX,groupsY,1);
+            ID3D11ShaderResourceView* noInputs[6]{};
+            ID3D11UnorderedAccessView* noOutputs[2]{};
+            context->CSSetUnorderedAccessViews(outputSlot,static_cast<UINT>(outputs.size()),noOutputs,nullptr);
+            context->CSSetShaderResources(0,static_cast<UINT>(inputs.size()),noInputs);
         };
-
-        try
+        dispatch(TransformShader_,frame.GroupsX,frame.GroupsY,{Source_.Read.Get()},3,{Transformed_.Write.Get()});
+        const auto setup=[&](ID3D11ComputeShader* shader) {
+            const unsigned zeros[4]{};
+            context->ClearUnorderedAccessViewUint(Bins_.Write.Get(),zeros);
+            dispatch(shader,frame.GroupsX,frame.GroupsY,{Transformed_.Read.Get()},4,{Projected_.Write.Get(),Bins_.Write.Get()});
+        };
+        if(frame.GenerateShadow)
         {
-            triangleBuffer = CreateStructuredBuffer(
-                std::max<std::size_t>(triangles.size(), 1U),
-                sizeof(GpuTriangle),
-                triangles.empty() ? nullptr : triangles.data(),
-                D3D11_BIND_SHADER_RESOURCE);
-            triangleView = CreateShaderView(
-                triangleBuffer,
-                static_cast<UINT>(std::max<std::size_t>(
-                    triangles.size(),
-                    1U)));
-
-            if (generateShadowMap)
-            {
-                shadowTriangleBuffer = CreateStructuredBuffer(
-                    std::max<std::size_t>(shadowTriangles.size(), 1U),
-                    sizeof(GpuTriangle),
-                    shadowTriangles.empty()
-                        ? nullptr
-                        : shadowTriangles.data(),
-                    D3D11_BIND_SHADER_RESOURCE);
-                shadowTriangleView = CreateShaderView(
-                    shadowTriangleBuffer,
-                    static_cast<UINT>(std::max<std::size_t>(
-                        shadowTriangles.size(),
-                        1U)));
-            }
-
-            mainOffsetBuffer = CreateStructuredBuffer(
-                mainBins.Offsets.size(),
-                sizeof(std::uint32_t),
-                mainBins.Offsets.data(),
-                D3D11_BIND_SHADER_RESOURCE);
-            mainOffsetView = CreateShaderView(
-                mainOffsetBuffer,
-                static_cast<UINT>(mainBins.Offsets.size()));
-            mainIndexBuffer = CreateStructuredBuffer(
-                std::max<std::size_t>(
-                    mainBins.TriangleIndices.size(),
-                    1U),
-                sizeof(std::uint32_t),
-                mainBins.TriangleIndices.empty()
-                    ? nullptr
-                    : mainBins.TriangleIndices.data(),
-                D3D11_BIND_SHADER_RESOURCE);
-            mainIndexView = CreateShaderView(
-                mainIndexBuffer,
-                static_cast<UINT>(std::max<std::size_t>(
-                    mainBins.TriangleIndices.size(),
-                    1U)));
-
-            if (generateShadowMap)
-            {
-                shadowOffsetBuffer = CreateStructuredBuffer(
-                    shadowBins.Offsets.size(),
-                    sizeof(std::uint32_t),
-                    shadowBins.Offsets.data(),
-                    D3D11_BIND_SHADER_RESOURCE);
-                shadowOffsetView = CreateShaderView(
-                    shadowOffsetBuffer,
-                    static_cast<UINT>(shadowBins.Offsets.size()));
-                shadowIndexBuffer = CreateStructuredBuffer(
-                    std::max<std::size_t>(
-                        shadowBins.TriangleIndices.size(),
-                        1U),
-                    sizeof(std::uint32_t),
-                    shadowBins.TriangleIndices.empty()
-                        ? nullptr
-                        : shadowBins.TriangleIndices.data(),
-                    D3D11_BIND_SHADER_RESOURCE);
-                shadowIndexView = CreateShaderView(
-                    shadowIndexBuffer,
-                    static_cast<UINT>(std::max<std::size_t>(
-                        shadowBins.TriangleIndices.size(),
-                        1U)));
-                shadowDepthBuffer = CreateStructuredBuffer(
-                    shadowPixelCount,
-                    sizeof(float),
-                    nullptr,
-                    D3D11_BIND_SHADER_RESOURCE |
-                        D3D11_BIND_UNORDERED_ACCESS);
-                shadowDepthUnorderedView = CreateUnorderedView(
-                    shadowDepthBuffer,
-                    static_cast<UINT>(shadowPixelCount));
-            }
-            else
-            {
-                const float emptyShadow =
-                    std::numeric_limits<float>::infinity();
-                const void* shadowData = hasExternalShadowMap
-                                             ? static_cast<const void*>(
-                                                   settings.SceneShadowMap
-                                                       ->Depth.data())
-                                             : static_cast<const void*>(
-                                                   &emptyShadow);
-                shadowDepthBuffer = CreateStructuredBuffer(
-                    shadowPixelCount,
-                    sizeof(float),
-                    shadowData,
-                    D3D11_BIND_SHADER_RESOURCE);
-            }
-            shadowDepthView = CreateShaderView(
-                shadowDepthBuffer,
-                static_cast<UINT>(shadowPixelCount));
-
-            textureDescriptorBuffer = CreateStructuredBuffer(
-                std::max<std::size_t>(textures.Descriptors.size(), 1U),
-                sizeof(Detail::GpuRasterTexture),
-                textures.Descriptors.empty()
-                    ? nullptr
-                    : textures.Descriptors.data(),
-                D3D11_BIND_SHADER_RESOURCE);
-            textureDescriptorView = CreateShaderView(
-                textureDescriptorBuffer,
-                static_cast<UINT>(std::max<std::size_t>(
-                    textures.Descriptors.size(),
-                    1U)));
-            textureTexelBuffer = CreateStructuredBuffer(
-                std::max<std::size_t>(textures.TexelsRGBA8.size(), 1U),
-                sizeof(std::uint32_t),
-                textures.TexelsRGBA8.empty()
-                    ? nullptr
-                    : textures.TexelsRGBA8.data(),
-                D3D11_BIND_SHADER_RESOURCE);
-            textureTexelView = CreateShaderView(
-                textureTexelBuffer,
-                static_cast<UINT>(std::max<std::size_t>(
-                    textures.TexelsRGBA8.size(),
-                    1U)));
-
-            D3D11_BUFFER_DESC constantDescription{};
-            constantDescription.ByteWidth =
-                static_cast<UINT>((sizeof(constants) + 15U) & ~15U);
-            constantDescription.Usage = D3D11_USAGE_IMMUTABLE;
-            constantDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-            D3D11_SUBRESOURCE_DATA constantData{&constants, 0, 0};
-            Check(
-                Device_->CreateBuffer(
-                    &constantDescription,
-                    &constantData,
-                    &constantBuffer),
-                "CreateBuffer(constants)");
-
-            colorBuffer = CreateStructuredBuffer(
-                pixelCount,
-                sizeof(float) * 4U,
-                nullptr,
-                D3D11_BIND_UNORDERED_ACCESS);
-            depthBuffer = CreateStructuredBuffer(
-                pixelCount,
-                sizeof(float),
-                nullptr,
-                D3D11_BIND_UNORDERED_ACCESS);
-            colorView = CreateUnorderedView(
-                colorBuffer,
-                static_cast<UINT>(pixelCount));
-            depthView = CreateUnorderedView(
-                depthBuffer,
-                static_cast<UINT>(pixelCount));
-            colorReadback = CreateReadbackBuffer(colorBuffer);
-            depthReadback = CreateReadbackBuffer(depthBuffer);
-
-            const auto rasterBegin = std::chrono::steady_clock::now();
-            ImmediateContext_->CSSetConstantBuffers(0, 1, &constantBuffer);
-            if (generateShadowMap)
-            {
-                ImmediateContext_->CSSetShader(
-                    ShadowShader_,
-                    nullptr,
-                    0);
-                ID3D11ShaderResourceView* shadowResources[] = {
-                    shadowTriangleView,
-                    shadowOffsetView,
-                    shadowIndexView,
-                    nullptr,
-                    textureDescriptorView,
-                    textureTexelView};
-                ImmediateContext_->CSSetShaderResources(
-                    0,
-                    6,
-                    shadowResources);
-                ID3D11UnorderedAccessView* shadowUnorderedViews[] = {
-                    nullptr,
-                    nullptr,
-                    shadowDepthUnorderedView};
-                ImmediateContext_->CSSetUnorderedAccessViews(
-                    0,
-                    3,
-                    shadowUnorderedViews,
-                    nullptr);
-                ImmediateContext_->Dispatch(
-                    (shadowWidth + 7U) / 8U,
-                    (shadowHeight + 7U) / 8U,
-                    1);
-                ID3D11UnorderedAccessView* nullShadowUnordered[] = {
-                    nullptr,
-                    nullptr,
-                    nullptr};
-                ID3D11ShaderResourceView* nullShadowResources[] = {
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    nullptr,
-                    nullptr};
-                ImmediateContext_->CSSetUnorderedAccessViews(
-                    0,
-                    3,
-                    nullShadowUnordered,
-                    nullptr);
-                ImmediateContext_->CSSetShaderResources(
-                    0,
-                    6,
-                    nullShadowResources);
-            }
-
-            if (IsCancelled(externalCancellation, backendCancellation))
-            {
-                ID3D11Buffer* nullBuffer = nullptr;
-                ImmediateContext_->CSSetConstantBuffers(
-                    0,
-                    1,
-                    &nullBuffer);
-                ImmediateContext_->CSSetShader(nullptr, nullptr, 0);
-                releaseResources();
-                return RasterStatus::Cancelled;
-            }
-
-            ImmediateContext_->CSSetShader(RasterShader_, nullptr, 0);
-            ID3D11ShaderResourceView* rasterResources[] = {
-                triangleView,
-                mainOffsetView,
-                mainIndexView,
-                shadowDepthView,
-                textureDescriptorView,
-                textureTexelView};
-            ImmediateContext_->CSSetShaderResources(
-                0,
-                6,
-                rasterResources);
-            ID3D11UnorderedAccessView* rasterUnorderedViews[] = {
-                colorView,
-                depthView};
-            ImmediateContext_->CSSetUnorderedAccessViews(
-                0,
-                2,
-                rasterUnorderedViews,
-                nullptr);
-            const UINT groupsX = (target.Width() + 7U) / 8U;
-            const UINT groupsY = (target.Height() + 7U) / 8U;
-            ImmediateContext_->Dispatch(groupsX, groupsY, 1);
-
-            ID3D11UnorderedAccessView* nullUnordered[] = {
-                nullptr,
-                nullptr,
-                nullptr};
-            ID3D11ShaderResourceView* nullResources[] = {
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr};
-            ID3D11Buffer* nullBuffer = nullptr;
-            ImmediateContext_->CSSetUnorderedAccessViews(
-                0,
-                3,
-                nullUnordered,
-                nullptr);
-            ImmediateContext_->CSSetShaderResources(
-                0,
-                6,
-                nullResources);
-            ImmediateContext_->CSSetConstantBuffers(
-                0,
-                1,
-                &nullBuffer);
-            ImmediateContext_->CSSetShader(nullptr, nullptr, 0);
-
-            ImmediateContext_->CopyResource(colorReadback, colorBuffer);
-            ImmediateContext_->CopyResource(depthReadback, depthBuffer);
-            D3D11_MAPPED_SUBRESOURCE mappedColors{};
-            D3D11_MAPPED_SUBRESOURCE mappedDepths{};
-            Check(
-                ImmediateContext_->Map(
-                    colorReadback,
-                    0,
-                    D3D11_MAP_READ,
-                    0,
-                    &mappedColors),
-                "Map(colors)");
-            colorsMapped = true;
-            Check(
-                ImmediateContext_->Map(
-                    depthReadback,
-                    0,
-                    D3D11_MAP_READ,
-                    0,
-                    &mappedDepths),
-                "Map(depths)");
-            depthsMapped = true;
-
-            const float* colors =
-                static_cast<const float*>(mappedColors.pData);
-            const float* depths =
-                static_cast<const float*>(mappedDepths.pData);
-            std::uint64_t shadedPixels = 0;
-            for (std::size_t pixel = 0; pixel < pixelCount; ++pixel)
-            {
-                target.MutableColors()[pixel] = {
-                    colors[pixel * 4U],
-                    colors[pixel * 4U + 1U],
-                    colors[pixel * 4U + 2U],
-                    colors[pixel * 4U + 3U]};
-                target.MutableDepths()[pixel] = depths[pixel];
-                if (std::isfinite(depths[pixel]) &&
-                    depths[pixel] >= 0.0f &&
-                    depths[pixel] <= 1.0f)
-                {
-                    ++shadedPixels;
-                }
-            }
-            ImmediateContext_->Unmap(depthReadback, 0);
-            depthsMapped = false;
-            ImmediateContext_->Unmap(colorReadback, 0);
-            colorsMapped = false;
-
-            Detail::ApplyGpuSelectionOutline(mainScene, gpuSettings, target,
-                externalCancellation, backendCancellation);
-
-            statistics.InputTriangles = scene.Triangles.size();
-            statistics.PostClipTriangles = mainScene.Triangles.size();
-            statistics.ShadedFragments = shadedPixels;
-            statistics.DispatchedTiles =
-                static_cast<std::uint64_t>(mainBins.TilesX) *
-                    mainBins.TilesY +
-                static_cast<std::uint64_t>(shadowBins.TilesX) *
-                    shadowBins.TilesY;
-            statistics.WorkerThreads = 64;
-            statistics.ExecutionPath =
-                "Native D3D11 CS 5.0, 16x16 bins=" +
-                std::to_string(mainBins.TilesX * mainBins.TilesY) +
-                ", refs=" +
-                std::to_string(mainBins.TriangleIndices.size()) +
-                ", max-list=" +
-                std::to_string(mainBins.MaximumListLength) +
-                (generateShadowMap
-                     ? ", GPU shadow-depth pass"
-                     : hasExternalShadowMap
-                           ? ", uploaded shadow map"
-                           : "");
-            statistics.RasterMilliseconds =
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - rasterBegin)
-                    .count();
+            setup(SetupShadow_);
+            dispatch(ShadowShader_,(frame.ShadowWidth+7)/8,(frame.ShadowHeight+7)/8,
+                {Transformed_.Read.Get(),Bins_.Read.Get(),Projected_.Read.Get(),nullptr,Descriptors_.Read.Get(),Texels_.Read.Get()},
+                2,{Shadow_.Write.Get()});
         }
-        catch (...)
+        if(cancelled()) return RasterStatus::Cancelled;
+        setup(SetupMain_);
+        ID3D11UnorderedAccessView* visibility=settings.OutlineEnabled?Visibility_.Write.Get():nullptr;
+        if (visibility) context->CSSetUnorderedAccessViews(6,1,&visibility,nullptr);
+        dispatch(RasterShader_,(target.Width()+7)/8,(target.Height()+7)/8,
+            {Transformed_.Read.Get(),Bins_.Read.Get(),Projected_.Read.Get(),Shadow_.Read.Get(),Descriptors_.Read.Get(),Texels_.Read.Get()},
+            0,{Colors_.Write.Get(),Depths_.Write.Get()});
+        if (visibility)
         {
-            ID3D11UnorderedAccessView* nullUnordered[] = {
-                nullptr,
-                nullptr,
-                nullptr};
-            ID3D11ShaderResourceView* nullResources[] = {
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr};
-            ID3D11Buffer* nullBuffer = nullptr;
-            ImmediateContext_->CSSetUnorderedAccessViews(
-                0,
-                3,
-                nullUnordered,
-                nullptr);
-            ImmediateContext_->CSSetShaderResources(
-                0,
-                6,
-                nullResources);
-            ImmediateContext_->CSSetConstantBuffers(
-                0,
-                1,
-                &nullBuffer);
-            ImmediateContext_->CSSetShader(nullptr, nullptr, 0);
-            releaseResources();
-            throw;
+            visibility=nullptr; context->CSSetUnorderedAccessViews(6,1,&visibility,nullptr);
+            dispatch(OutlineShader_,(target.Width()+7)/8,(target.Height()+7)/8,{Visibility_.Read.Get()},0,{Colors_.Write.Get()});
         }
-        releaseResources();
-        return IsCancelled(externalCancellation, backendCancellation)
-                   ? RasterStatus::Cancelled
-                   : RasterStatus::Completed;
+        if(settings.GpuPresentation)
+        {
+            if (!GpuOutput_.Device()) GpuOutput_.Initialize(Device_);
+            target.GpuColor=GpuOutput_.Publish(Colors_.Resource.Get(),target.Width(),target.Height());
+        }
+        else
+        {
+            Capture(Colors_,target.MutableColors().data(),pixels*sizeof(Color));
+            Capture(Depths_,target.MutableDepths().data(),pixels*sizeof(float));
+            statistics.ShadedFragments=std::count_if(target.Depths().begin(),target.Depths().end(),[](float z){return z>=0 && z<=1;});
+        }
+        statistics.PostClipCountAvailable=frame.Constants.CollectCounts!=0;
+        if(statistics.PostClipCountAvailable) {
+            if(!CounterReadback_) {
+                D3D11_BUFFER_DESC desc{};desc.ByteWidth=4;desc.Usage=D3D11_USAGE_STAGING;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+                Check(Device_->CreateBuffer(&desc,nullptr,&CounterReadback_),"Create primitive count readback");
+            }
+            const UINT offset=static_cast<UINT>(frame.MainBins.Words*4);
+            D3D11_BOX box{offset,0,0,offset+4,1,1};
+            context->CopySubresourceRegion(CounterReadback_.Get(),0,0,0,0,Bins_.Resource.Get(),0,&box);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            Check(context->Map(CounterReadback_.Get(),0,D3D11_MAP_READ,0,&mapped),"Capture compute primitive count");
+            statistics.PostClipTriangles=*static_cast<const unsigned*>(mapped.pData);context->Unmap(CounterReadback_.Get(),0);
+        }
+        frame.Report(statistics,upload,"Native D3D11 CS 5.0");
+        statistics.RasterMilliseconds=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-rasterStart).count();
+        return cancelled()?RasterStatus::Cancelled:RasterStatus::Completed;
     }
 
 private:
+    struct Buffer
+    {
+        std::size_t Capacity=0;
+        Microsoft::WRL::ComPtr<ID3D11Buffer> Resource, Staging;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> Read;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> Write;
+    };
+    Buffer Source_, Transformed_, Projected_, Bins_, Shadow_, Colors_, Depths_, Visibility_, Descriptors_, Texels_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> Constants_,CounterReadback_;
+    std::weak_ptr<const RasterScene> ResidentScene_;
+    ID3D11ComputeShader *TransformShader_=nullptr, *SetupMain_=nullptr, *SetupShadow_=nullptr, *OutlineShader_=nullptr;
+    void Ensure(Buffer& buffer,std::size_t count,unsigned stride,bool writable)
+    {
+        count=std::max<std::size_t>(1,count);
+        if(buffer.Capacity>=count)return;
+        Buffer next;
+        next.Resource.Attach(CreateStructuredBuffer(count,stride,nullptr,D3D11_BIND_SHADER_RESOURCE|(writable?D3D11_BIND_UNORDERED_ACCESS:0)));
+        next.Read.Attach(CreateShaderView(next.Resource.Get(),static_cast<UINT>(count)));
+        if(writable)next.Write.Attach(CreateUnorderedView(next.Resource.Get(),static_cast<UINT>(count)));
+        next.Capacity=count;buffer=std::move(next);
+    }
+    void Upload(Buffer& buffer,const void* data,std::size_t bytes)
+    {
+        if(!bytes)return;
+        D3D11_BOX box{0,0,0,static_cast<UINT>(bytes),1,1};
+        ImmediateContext_->UpdateSubresource(buffer.Resource.Get(),0,&box,data,0,0);
+    }
+    void Capture(Buffer& buffer,void* destination,std::size_t bytes)
+    {
+        if(!buffer.Staging)buffer.Staging.Attach(CreateReadbackBuffer(buffer.Resource.Get()));
+        ImmediateContext_->CopyResource(buffer.Staging.Get(),buffer.Resource.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        Check(ImmediateContext_->Map(buffer.Staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Capture compute raster output");
+        std::memcpy(destination,mapped.pData,bytes);
+        ImmediateContext_->Unmap(buffer.Staging.Get(),0);
+    }
     using CreateDeviceFunction = HRESULT(WINAPI*)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT,
         const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
-    using CompileFunction = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
-        LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
     static void Check(HRESULT result, const char* operation)
     {
@@ -1576,9 +853,10 @@ private:
     }
 
     HMODULE D3D11Library_ = nullptr;
-    HMODULE CompilerLibrary_ = nullptr;
     CreateDeviceFunction CreateDevice_ = nullptr;
-    CompileFunction Compile_ = nullptr;
+    std::uint64_t TextureGeneration_=0;
+    Detail::GpuRasterTextureCache TextureCache_;
+    Detail::D3D11GpuOutput GpuOutput_;
     ID3D11Device* Device_ = nullptr;
     ID3D11DeviceContext* ImmediateContext_ = nullptr;
     ID3D11ComputeShader* RasterShader_ = nullptr;

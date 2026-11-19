@@ -1,3 +1,6 @@
+#include "Renderer/Types.h"
+#include "Renderer/DX12/DX12PipelineCache.h"
+#include "Renderer/D3DShaderCache.h"
 #include "Editor/EditorPresenterDX12.h"
 
 #if defined(_WIN32)
@@ -73,12 +76,6 @@ D3D12_RESOURCE_DESC BufferDescription(UINT64 size) noexcept
     return description;
 }
 
-struct ViewportVertex
-{
-    float Position[2];
-    float TexCoord[2];
-};
-
 } // namespace
 
 struct EditorPresenterDX12::Impl
@@ -88,6 +85,7 @@ struct EditorPresenterDX12::Impl
         ID3D12CommandAllocator* Allocator = nullptr;
         UINT64 FenceValue = 0;
         std::vector<IUnknown*> DeferredReleases;
+        std::vector<std::shared_ptr<const Renderer::GpuImage>> GpuLeases;
     };
 
     ~Impl()
@@ -134,6 +132,7 @@ struct EditorPresenterDX12::Impl
             }
         }
         frame.DeferredReleases.clear();
+        frame.GpuLeases.clear();
     }
 
     bool CreateDevice(IDXGIFactory4* factory)
@@ -199,7 +198,17 @@ struct EditorPresenterDX12::Impl
             return Fail(HResultMessage("CreateCommandQueue", result));
         }
 
+        BOOL tearing = FALSE;
+        IDXGIFactory5* factory5 = nullptr;
+        if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory5))))
+        {
+            AllowTearing = SUCCEEDED(factory5->CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing;
+            SafeRelease(factory5);
+        }
+
         DXGI_SWAP_CHAIN_DESC1 swapChainDescription = {};
+        swapChainDescription.Flags = AllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
         swapChainDescription.Width = static_cast<UINT>(width);
         swapChainDescription.Height = static_cast<UINT>(height);
         swapChainDescription.Format = BackBufferFormat;
@@ -312,6 +321,8 @@ struct EditorPresenterDX12::Impl
         {
             ReleaseDeferred(frame);
         }
+        SafeRelease(OverlayTexture);SafeRelease(OverlayHeap);SafeRelease(OverlayPipelineState);
+        OverlayWidth=OverlayHeight=0;OverlayState=D3D12_RESOURCE_STATE_COMMON;OverlayRevision=std::numeric_limits<std::uint64_t>::max();
         SafeRelease(ImageTexture);
         SafeRelease(ViewportTextureHeap);
         SafeRelease(ViewportPipelineState);
@@ -334,6 +345,7 @@ struct EditorPresenterDX12::Impl
             FenceEvent = nullptr;
         }
         SafeRelease(SwapChain);
+        AllowTearing = false;
         SafeRelease(CommandQueue);
         SafeRelease(Device);
         Window = nullptr;
@@ -342,7 +354,6 @@ struct EditorPresenterDX12::Impl
         CurrentFrameIndex = 0;
         NextFenceValue = 0;
         FrameRecording = false;
-        FrameReadyToPresent = false;
         ImageWidth = 0;
         ImageHeight = 0;
         ImageState = D3D12_RESOURCE_STATE_COMMON;
@@ -424,11 +435,10 @@ struct EditorPresenterDX12::Impl
             return Fail(HResultMessage("Reset DX12 frame commands", result));
         }
         FrameRecording = true;
-        FrameReadyToPresent = false;
         return true;
     }
 
-    bool ExecuteRecording(bool signalFrame)
+    bool ExecuteRecording()
     {
         if (!FrameRecording)
         {
@@ -442,7 +452,7 @@ struct EditorPresenterDX12::Impl
         ID3D12CommandList* lists[] = {CommandList};
         CommandQueue->ExecuteCommandLists(ARRAYSIZE(lists), lists);
         FrameRecording = false;
-        return !signalFrame || SignalFrame(Frames[CurrentFrameIndex]);
+        return SignalFrame(Frames[CurrentFrameIndex]);
     }
 
     bool CreateBackBuffers()
@@ -534,7 +544,7 @@ struct EditorPresenterDX12::Impl
             return false;
         }
         SafeRelease(error);
-        result = Device->CreateRootSignature(
+        result = Evans::Renderer::CreateCachedRootSignature(Device,
             0, signature->GetBufferPointer(), signature->GetBufferSize(),
             IID_PPV_ARGS(&ViewportRootSignature));
         SafeRelease(signature);
@@ -546,13 +556,12 @@ struct EditorPresenterDX12::Impl
         static constexpr const char* ShaderSource = R"HLSL(
 Texture2D ViewportTexture : register(t0);
 SamplerState ViewportSampler : register(s0);
-struct VSInput { float2 Position : POSITION; float2 TexCoord : TEXCOORD0; };
 struct VSOutput { float4 Position : SV_POSITION; float2 TexCoord : TEXCOORD0; };
-VSOutput VS(VSInput input)
+VSOutput VS(uint vertex : SV_VertexID)
 {
     VSOutput output;
-    output.Position = float4(input.Position, 0.0f, 1.0f);
-    output.TexCoord = input.TexCoord;
+    output.TexCoord = float2((vertex << 1) & 2, vertex & 2);
+    output.Position = float4(output.TexCoord * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
     return output;
 }
 float4 PS(VSOutput input) : SV_TARGET
@@ -562,7 +571,7 @@ float4 PS(VSOutput input) : SV_TARGET
 )HLSL";
         ID3DBlob* vertexShader = nullptr;
         ID3DBlob* pixelShader = nullptr;
-        result = D3DCompile(
+        result = Evans::Renderer::CompileCachedD3DShader(
             ShaderSource, std::strlen(ShaderSource), "EvansEditorDX12Viewport",
             nullptr, nullptr, "VS", "vs_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0,
             &vertexShader, &error);
@@ -576,7 +585,7 @@ float4 PS(VSOutput input) : SV_TARGET
             return false;
         }
         SafeRelease(error);
-        result = D3DCompile(
+        result = Evans::Renderer::CompileCachedD3DShader(
             ShaderSource, std::strlen(ShaderSource), "EvansEditorDX12Viewport",
             nullptr, nullptr, "PS", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0,
             &pixelShader, &error);
@@ -592,11 +601,6 @@ float4 PS(VSOutput input) : SV_TARGET
         }
         SafeRelease(error);
 
-        const D3D12_INPUT_ELEMENT_DESC inputElements[] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
-                static_cast<UINT>(offsetof(ViewportVertex, Position)), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
-                static_cast<UINT>(offsetof(ViewportVertex, TexCoord)), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline = {};
         pipeline.pRootSignature = ViewportRootSignature;
         pipeline.VS = {vertexShader->GetBufferPointer(), vertexShader->GetBufferSize()};
@@ -609,12 +613,18 @@ float4 PS(VSOutput input) : SV_TARGET
         pipeline.DepthStencilState.DepthEnable = FALSE;
         pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        pipeline.InputLayout = {inputElements, ARRAYSIZE(inputElements)};
         pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pipeline.NumRenderTargets = 1;
         pipeline.RTVFormats[0] = BackBufferFormat;
         pipeline.SampleDesc.Count = 1;
-        result = Device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&ViewportPipelineState));
+        result = Evans::Renderer::CreateCachedGraphicsPipelineState(Device,&pipeline, IID_PPV_ARGS(&ViewportPipelineState));
+        if(SUCCEEDED(result))
+        {
+            auto& blend=pipeline.BlendState.RenderTarget[0];blend.BlendEnable=TRUE;
+            blend.SrcBlend=D3D12_BLEND_SRC_ALPHA;blend.DestBlend=D3D12_BLEND_INV_SRC_ALPHA;blend.BlendOp=D3D12_BLEND_OP_ADD;
+            blend.SrcBlendAlpha=D3D12_BLEND_ONE;blend.DestBlendAlpha=D3D12_BLEND_INV_SRC_ALPHA;blend.BlendOpAlpha=D3D12_BLEND_OP_ADD;
+            result=Evans::Renderer::CreateCachedGraphicsPipelineState(Device,&pipeline,IID_PPV_ARGS(&OverlayPipelineState));
+        }
         SafeRelease(pixelShader);
         SafeRelease(vertexShader);
         if (FAILED(result))
@@ -645,7 +655,6 @@ float4 PS(VSOutput input) : SV_TARGET
             (void)CommandList->Close();
             FrameRecording = false;
         }
-        FrameReadyToPresent = false;
         if (!WaitForGpu())
         {
             return false;
@@ -664,7 +673,7 @@ float4 PS(VSOutput input) : SV_TARGET
             static_cast<UINT>(width),
             static_cast<UINT>(height),
             BackBufferFormat,
-            0);
+            AllowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         if (FAILED(result))
         {
             return Fail(HResultMessage("IDXGISwapChain3::ResizeBuffers", result));
@@ -747,6 +756,21 @@ float4 PS(VSOutput input) : SV_TARGET
             return true;
         }
 
+        if (image.GpuColor)
+        {
+            if (image.GpuColor->Backend!=Renderer::RHIBackend::DX12) return Fail("Incompatible GPU viewport backend");
+            ID3D12Resource* source=nullptr;
+            auto status=Device->OpenSharedHandle(image.GpuColor->SharedHandle,IID_PPV_ARGS(&source));
+            if (FAILED(status)) return FailDeviceOperation("Import DX12 viewport",status);
+            Transition(CommandList,source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Transition(CommandList,ImageTexture,ImageState,D3D12_RESOURCE_STATE_COPY_DEST);
+            CommandList->CopyResource(ImageTexture,source);
+            Transition(CommandList,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+            Transition(CommandList,ImageTexture,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ImageState=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            Frames[CurrentFrameIndex].GpuLeases.push_back(image.GpuColor);
+            DeferRelease(source); UploadedRevision=revision; return true;
+        }
         const D3D12_RESOURCE_DESC textureDescription = ImageTexture->GetDesc();
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
         UINT64 uploadSize = 0;
@@ -805,66 +829,25 @@ float4 PS(VSOutput input) : SV_TARGET
         return true;
     }
 
-    void DrawViewport(int x, int y, int width, int height)
+    void DrawViewport(int x, int y, int width, int height, bool overlay = false)
     {
         if (ImageTexture == nullptr || ViewportTextureHeap == nullptr || width <= 0 || height <= 0)
         {
             return;
         }
-        const float left = static_cast<float>(x) * 2.0f / static_cast<float>(Width) - 1.0f;
-        const float right = static_cast<float>(x + width) * 2.0f / static_cast<float>(Width) - 1.0f;
-        const float top = 1.0f - static_cast<float>(y) * 2.0f / static_cast<float>(Height);
-        const float bottom = 1.0f - static_cast<float>(y + height) * 2.0f / static_cast<float>(Height);
-        const ViewportVertex vertices[6] = {
-            {{left, top}, {0.0f, 0.0f}},
-            {{right, top}, {1.0f, 0.0f}},
-            {{right, bottom}, {1.0f, 1.0f}},
-            {{left, top}, {0.0f, 0.0f}},
-            {{right, bottom}, {1.0f, 1.0f}},
-            {{left, bottom}, {0.0f, 1.0f}}};
-
-        const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
-        const D3D12_RESOURCE_DESC description = BufferDescription(sizeof(vertices));
-        ID3D12Resource* vertexBuffer = nullptr;
-        HRESULT result = Device->CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &description,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            nullptr,
-            IID_PPV_ARGS(&vertexBuffer));
-        if (FAILED(result))
-        {
-            return;
-        }
-        void* mapped = nullptr;
-        const D3D12_RANGE readRange = {0, 0};
-        result = vertexBuffer->Map(0, &readRange, &mapped);
-        if (FAILED(result))
-        {
-            SafeRelease(vertexBuffer);
-            return;
-        }
-        std::memcpy(mapped, vertices, sizeof(vertices));
-        vertexBuffer->Unmap(0, nullptr);
-        DeferRelease(vertexBuffer);
-
         const D3D12_VIEWPORT viewport = {
-            0.0f, 0.0f, static_cast<float>(Width), static_cast<float>(Height), 0.0f, 1.0f};
-        const D3D12_RECT scissor = {0, 0, Width, Height};
+            static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+        const D3D12_RECT scissor = {x, y, x + width, y + height};
         CommandList->RSSetViewports(1, &viewport);
         CommandList->RSSetScissorRects(1, &scissor);
-        CommandList->SetPipelineState(ViewportPipelineState);
+        CommandList->SetPipelineState(overlay?OverlayPipelineState:ViewportPipelineState);
         CommandList->SetGraphicsRootSignature(ViewportRootSignature);
         ID3D12DescriptorHeap* heaps[] = {ViewportTextureHeap};
         CommandList->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
         CommandList->SetGraphicsRootDescriptorTable(
             0, ViewportTextureHeap->GetGPUDescriptorHandleForHeapStart());
         CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VERTEX_BUFFER_VIEW view = {
-            vertexBuffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(ViewportVertex)};
-        CommandList->IASetVertexBuffers(0, 1, &view);
-        CommandList->DrawInstanced(ARRAYSIZE(vertices), 1, 0, 0);
+        CommandList->DrawInstanced(3, 1, 0, 0);
     }
 
     bool BeginFrame(
@@ -901,6 +884,17 @@ float4 PS(VSOutput input) : SV_TARGET
                 return false;
             }
             DrawViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+            if(image.Overlay && image.Overlay->IsValid())
+            {
+                const auto swap=[&]() {
+                    std::swap(ImageTexture,OverlayTexture);std::swap(ViewportTextureHeap,OverlayHeap);
+                    std::swap(ImageState,OverlayState);std::swap(ImageWidth,OverlayWidth);std::swap(ImageHeight,OverlayHeight);
+                    std::swap(UploadedRevision,OverlayRevision);
+                };
+                swap();const bool uploaded=UploadImage(*image.Overlay,revision);
+                if(uploaded)DrawViewport(viewportX,viewportY,viewportWidth,viewportHeight,true);
+                swap();if(!uploaded)return false;
+            }
         }
         return true;
     }
@@ -922,115 +916,16 @@ float4 PS(VSOutput input) : SV_TARGET
         {
             return false;
         }
-        if (FrameRecording)
-        {
-            Transition(
-                CommandList,
-                BackBuffers[CurrentFrameIndex],
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_PRESENT);
-            if (!ExecuteRecording(true))
-            {
-                return false;
-            }
-            FrameReadyToPresent = true;
-        }
-        if (!FrameReadyToPresent)
-        {
-            return Fail("The DX12 editor frame has not been recorded.");
-        }
-        const HRESULT result = SwapChain->Present(0, 0);
+        if (!FrameRecording) return Fail("The DX12 editor frame has not been recorded.");
+        Transition(CommandList, BackBuffers[CurrentFrameIndex], D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT);
+        if (!ExecuteRecording()) return false;
+        const HRESULT result = SwapChain->Present(0, AllowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(result))
         {
             return Fail(HResultMessage("IDXGISwapChain3::Present", result));
         }
-        FrameReadyToPresent = false;
         CurrentFrameIndex = SwapChain->GetCurrentBackBufferIndex();
-        return true;
-    }
-
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (!FrameRecording || Device == nullptr)
-        {
-            return Fail("A DX12 frame must be active before capture.");
-        }
-        ID3D12Resource* backBuffer = BackBuffers[CurrentFrameIndex];
-        const D3D12_RESOURCE_DESC textureDescription = backBuffer->GetDesc();
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-        UINT64 readbackSize = 0;
-        Device->GetCopyableFootprints(
-            &textureDescription, 0, 1, 0, &footprint, nullptr, nullptr, &readbackSize);
-        const D3D12_HEAP_PROPERTIES heap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
-        const D3D12_RESOURCE_DESC description = BufferDescription(readbackSize);
-        ID3D12Resource* readback = nullptr;
-        HRESULT result = Device->CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &description,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr,
-            IID_PPV_ARGS(&readback));
-        if (FAILED(result))
-        {
-            return Fail(HResultMessage("Create DX12 capture buffer", result));
-        }
-
-        Transition(
-            CommandList, backBuffer,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION source = {};
-        source.pResource = backBuffer;
-        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        source.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION destination = {};
-        destination.pResource = readback;
-        destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        destination.PlacedFootprint = footprint;
-        CommandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-        Transition(
-            CommandList, backBuffer,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_PRESENT);
-        if (!ExecuteRecording(true))
-        {
-            SafeRelease(readback);
-            return false;
-        }
-        FrameReadyToPresent = true;
-        if (!WaitForFence(Frames[CurrentFrameIndex].FenceValue))
-        {
-            SafeRelease(readback);
-            return false;
-        }
-
-        const std::size_t destinationPitch = static_cast<std::size_t>(textureDescription.Width) * 4u;
-        // GetCopyableFootprints may omit the unused padding after the final
-        // row. Mapping RowPitch * Height can therefore exceed the allocation.
-        const D3D12_RANGE readRange = {0, static_cast<SIZE_T>(readbackSize)};
-        void* mappedMemory = nullptr;
-        result = readback->Map(0, &readRange, &mappedMemory);
-        if (FAILED(result))
-        {
-            SafeRelease(readback);
-            return Fail(HResultMessage("Map DX12 capture buffer", result));
-        }
-        output.Width = static_cast<std::uint32_t>(textureDescription.Width);
-        output.Height = textureDescription.Height;
-        output.PixelsRGBA8.resize(destinationPitch * textureDescription.Height);
-        const std::uint8_t* mapped = static_cast<const std::uint8_t*>(mappedMemory);
-        for (UINT row = 0; row < textureDescription.Height; ++row)
-        {
-            std::memcpy(
-                output.PixelsRGBA8.data() + static_cast<std::size_t>(row) * destinationPitch,
-                mapped + footprint.Offset + static_cast<std::size_t>(row) * footprint.Footprint.RowPitch,
-                destinationPitch);
-        }
-        const D3D12_RANGE writtenRange = {0, 0};
-        readback->Unmap(0, &writtenRange);
-        SafeRelease(readback);
         return true;
     }
 
@@ -1040,6 +935,7 @@ float4 PS(VSOutput input) : SV_TARGET
     ID3D12Device* Device = nullptr;
     ID3D12CommandQueue* CommandQueue = nullptr;
     IDXGISwapChain3* SwapChain = nullptr;
+    bool AllowTearing = false;
     ID3D12DescriptorHeap* RenderTargetHeap = nullptr;
     std::array<ID3D12Resource*, FrameCount> BackBuffers = {};
     std::array<FrameResources, FrameCount> Frames = {};
@@ -1050,7 +946,6 @@ float4 PS(VSOutput input) : SV_TARGET
     UINT CurrentFrameIndex = 0;
     UINT64 NextFenceValue = 0;
     bool FrameRecording = false;
-    bool FrameReadyToPresent = false;
 
     ID3D12RootSignature* ViewportRootSignature = nullptr;
     ID3D12PipelineState* ViewportPipelineState = nullptr;
@@ -1060,6 +955,12 @@ float4 PS(VSOutput input) : SV_TARGET
     std::uint32_t ImageWidth = 0;
     std::uint32_t ImageHeight = 0;
     std::uint64_t UploadedRevision = std::numeric_limits<std::uint64_t>::max();
+    ID3D12Resource* OverlayTexture=nullptr;
+    ID3D12DescriptorHeap* OverlayHeap=nullptr;
+    ID3D12PipelineState* OverlayPipelineState=nullptr;
+    D3D12_RESOURCE_STATES OverlayState=D3D12_RESOURCE_STATE_COMMON;
+    std::uint32_t OverlayWidth=0,OverlayHeight=0;
+    std::uint64_t OverlayRevision=std::numeric_limits<std::uint64_t>::max();
     ImguiRenderDX12 ImguiRenderer;
     std::string LastError;
 };
@@ -1111,11 +1012,6 @@ void EditorPresenterDX12::DrawImgui()
 bool EditorPresenterDX12::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterDX12::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterDX12::IsInitialized() const noexcept

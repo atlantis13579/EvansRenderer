@@ -1,7 +1,7 @@
 #pragma once
 
-#include "DX11RHI.h"
-#include "DX12RHI.h"
-#include "MetalRHI.h"
-#include "OpenGLESRHI.h"
-#include "VulkanRHI.h"
+#include "Renderer/DX11/DX11RHI.h"
+#include "Renderer/DX12/DX12RHI.h"
+#include "Renderer/Metal/MetalRHI.h"
+#include "Renderer/OpenGLES/OpenGLESRHI.h"
+#include "Renderer/Vulkan/VulkanRHI.h"

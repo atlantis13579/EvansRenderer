@@ -1,8 +1,6 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.22.1)
 
 project(Evans VERSION 0.1.0 LANGUAGES CXX)
-
-include(CTest)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -17,6 +15,7 @@ if(APPLE)
     set(CMAKE_OBJCXX_EXTENSIONS OFF)
 endif()
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT EvansEditor)
 
 get_filename_component(EVANS_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 if(APPLE)
@@ -39,215 +38,240 @@ foreach(configuration Debug Release RelWithDebInfo MinSizeRel)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${configuration_upper} "${EVANS_ROOT}/Binaries/${configuration}")
 endforeach()
 
-function(evans_target target folder)
-    target_include_directories(${target} PUBLIC "${EVANS_ROOT}/Src")
-    target_compile_features(${target} PUBLIC cxx_std_17)
-    set_target_properties(${target} PROPERTIES FOLDER "${folder}")
-    if(MSVC)
-        set_target_properties(${target} PROPERTIES VS_GLOBAL_IntDir "${EVANS_ROOT}/Intermediate/VS2022/$(ProjectName)/$(Configuration)/")
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
-    else()
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-endfunction()
-
-add_library(EvansMaths STATIC
+add_executable(EvansEditor
     "${EVANS_ROOT}/Src/Maths/StaticAABBTree.cpp"
     "${EVANS_ROOT}/Src/Maths/TriMesh.cpp"
-)
-evans_target(EvansMaths Modules)
 
-add_library(EvansRenderer STATIC
-    "${EVANS_ROOT}/Src/Renderer/DX11RHI.cpp"
-    "${EVANS_ROOT}/Src/Renderer/DX12RHI.cpp"
-    "${EVANS_ROOT}/Src/Renderer/DxrRayTracingRHI.cpp"
-    "${EVANS_ROOT}/Src/Renderer/MetalRHI.cpp"
-    "${EVANS_ROOT}/Src/Renderer/OpenGLESRHI.cpp"
-    "${EVANS_ROOT}/Src/Renderer/RayTracing.cpp"
-    "${EVANS_ROOT}/Src/Renderer/RayTracingBackendCommon.cpp"
+    "${EVANS_ROOT}/Src/Techniques/TechniqueCatalog.cpp"
+
+    "${EVANS_ROOT}/Src/Renderer/ShaderCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/D3DShaderCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/OpenGLES/OpenGLESProgramCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DX12PipelineCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DXILShaderCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Vulkan/VulkanPipelineCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Shadows/CascadedShadowMap.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Shadows/ShadowProjection.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX11/DX11RHI.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX11/DX11Multisampling.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX11/DX11ForwardPlus.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX11/DX11ClusteredForward.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DX12RHI.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DX12ForwardPlus.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DX12ClusteredForward.cpp"
+    "${EVANS_ROOT}/Src/Renderer/DX12/DxrRayTracingRHI.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/FrustumCulling.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lighting/ForwardPlus.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lighting/ClusteredForward.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lighting/SceneLightCollection.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lighting/AreaLightSampling.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Transparency/DepthPeeling.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Transparency/RefractionGeometry.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/LevelOfDetail.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/MeshGeometry.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/SceneRayQuery.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/SceneRayUpload.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/RayTracedShadowScene.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/SceneRayShadingUpload.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightProbes.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedDiffuseLighting.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightmap.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightmapCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightingAssets.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/LightmapReceivers.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedProbeCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/LightmapAtlas.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/Instancing.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/GPUDrivenRendering.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Pipelines/VisibilityBuffer.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lighting/SubsurfaceDiffusion.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VoxelGI/VoxelRadiance.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VoxelGI/VoxelRadianceCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenMeshCards.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenMeshPartition.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenMeshRepresentation.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenHair.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenHairReceiver.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenHardwareRayTracing.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenScene.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenSceneCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenRenderCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenSurfaceCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenSurfaceLookup.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenSurfaceLighting.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenRadianceTrace.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenReflections.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenProbeSampling.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenEnvironment.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenProbeIntegration.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenTranslucency.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenProbeGather.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenTemporal.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenWorldRadianceCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenDistanceField.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenDistanceScene.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Lumen/LumenGlobalDistance.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Hair/HairGeometryCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Hair/HairStrands.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/HeightField.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/GeometryPreparation.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/TriangleSubdivision.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/DisplacementGeometry.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/PNTessellation.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryPages.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryResidency.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryHierarchy.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteHierarchy.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NanitePages.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteAsset.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteSceneBudget.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteStreaming.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteGpu.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteStream.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteVisibility.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteRaster.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteFrameVisibility.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteDraws.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteMaterials.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteInstances.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Nanite/NaniteHardware.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/GraphPartition.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryGpu.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryCache.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualGeometry/VirtualGeometryStreaming.cpp"
+    "${EVANS_ROOT}/Src/Renderer/PostProcessing/TemporalSuperResolution.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualShadowMaps/VirtualShadowMaps.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualShadowMaps/VirtualShadowScene.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Geometry/ParallaxOcclusionMapping.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Hair/HairScattering.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Hair/HairLighting.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Hair/HairShadowReceiver.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Metal/MetalRHI.cpp"
+    "${EVANS_ROOT}/Src/Renderer/OpenGLES/OpenGLESRHI.cpp"
+    "${EVANS_ROOT}/Src/Renderer/OpenGLES/OpenGLESContactShadows.cpp"
+    "${EVANS_ROOT}/Src/Renderer/OpenGLES/OpenGLESForwardPlus.cpp"
+    "${EVANS_ROOT}/Src/Renderer/OpenGLES/OpenGLESClusteredForward.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/RayTracing.cpp"
+    "${EVANS_ROOT}/Src/Renderer/RayTracing/RayTracingBackendCommon.cpp"
     "${EVANS_ROOT}/Src/Renderer/RealtimeShader.cpp"
     "${EVANS_ROOT}/Src/Renderer/Renderer.cpp"
+    "${EVANS_ROOT}/Src/Renderer/VirtualShadowMaps/RendererVirtualShadows.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Reflections/EnvironmentCapture.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Reflections/EnvironmentRadiance.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Atmosphere/Atmosphere.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Volumetrics/DensityVolume.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Reflections/PlanarReflection.cpp"
     "${EVANS_ROOT}/Src/Renderer/RHIBackends.cpp"
     "${EVANS_ROOT}/Src/Renderer/RHIThread.cpp"
-    "${EVANS_ROOT}/Src/Renderer/VulkanRHI.cpp"
-)
-evans_target(EvansRenderer Modules)
-target_compile_definitions(EvansRenderer PUBLIC EVANS_RENDERER_STATIC)
-target_link_libraries(EvansRenderer PUBLIC Threads::Threads)
-if(WIN32)
-    target_link_libraries(EvansRenderer PUBLIC d3d11 d3d12 dxgi d3dcompiler)
-endif()
+    "${EVANS_ROOT}/Src/Renderer/TechniqueShader.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Vulkan/VulkanRHI.cpp"
 
-add_library(EvansRasterizer STATIC
     "${EVANS_ROOT}/Src/Rasterizer/BackendCommon.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/Backends.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/ComputeShaderRasterRHI.cpp"
+    "${EVANS_ROOT}/Src/Rasterizer/D3D11GpuOutput.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/CpuRasterRHI.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/CudaRasterRHI.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/GpuRasterCommon.cpp"
+    "${EVANS_ROOT}/Src/Rasterizer/ParallelExecutor.cpp"
     "${EVANS_METAL_RASTER_SOURCE}"
     "${EVANS_ROOT}/Src/Rasterizer/Rasterizer.cpp"
     "${EVANS_ROOT}/Src/Rasterizer/SoftwareRasterCore.cpp"
-)
-evans_target(EvansRasterizer Modules)
-target_link_libraries(EvansRasterizer PUBLIC Threads::Threads)
-if(APPLE)
-    target_link_libraries(EvansRasterizer PUBLIC
-        "-framework Foundation"
-        "-framework Metal"
-    )
-endif()
 
-add_library(EvansEditorCore STATIC
+    "${EVANS_ROOT}/Src/Editor/AssetCooker.cpp"
+    "${EVANS_ROOT}/Src/Editor/DragonDemo.cpp"
+    "${EVANS_ROOT}/Src/Editor/HairDemo.cpp"
+    "${EVANS_ROOT}/Src/Editor/VolumeDemos.cpp"
+    "${EVANS_ROOT}/Src/Editor/BigWorld.cpp"
+    "${EVANS_ROOT}/Src/Editor/WaterWaves.cpp"
+    "${EVANS_ROOT}/Src/Editor/SponzaDemo.cpp"
     "${EVANS_ROOT}/Src/Editor/ContentRoot.cpp"
     "${EVANS_ROOT}/Src/Editor/Demos.cpp"
     "${EVANS_ROOT}/Src/Editor/Editor.cpp"
     "${EVANS_ROOT}/Src/Editor/ModuleAdapters.cpp"
     "${EVANS_ROOT}/Src/Editor/RenderAdapter.cpp"
     "${EVANS_ROOT}/Src/Editor/Resources.cpp"
+
+    "${EVANS_ROOT}/Src/Editor/Main.cpp"
 )
-evans_target(EvansEditorCore Modules)
-target_link_libraries(EvansEditorCore PUBLIC
-    Threads::Threads
-    EvansMaths
-    EvansRenderer
-    EvansRasterizer
+
+target_include_directories(EvansEditor PRIVATE "${EVANS_ROOT}/Src")
+target_compile_features(EvansEditor PRIVATE cxx_std_17)
+target_compile_definitions(EvansEditor PRIVATE
+    EVANS_RENDERER_STATIC
+    EVANS_NANITE_CACHE_DIRECTORY="${EVANS_ROOT}/Intermediate/Nanite"
+    EVANS_SHADER_SOURCE_DIRECTORY="${EVANS_ROOT}/Src/Shaders"
 )
-if(WIN32)
-    target_link_libraries(EvansEditorCore PUBLIC ole32 windowscodecs)
-elseif(APPLE)
-    target_link_libraries(EvansEditorCore PUBLIC
-        "-framework CoreGraphics"
-        "-framework ImageIO"
+target_link_libraries(EvansEditor PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(EvansEditor PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(EvansEditor PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(WIN32 OR APPLE)
+    target_sources(EvansEditor PRIVATE
+        "${EVANS_ROOT}/Src/Editor/EditorPresenter.cpp"
+        "${EVANS_ROOT}/Src/Editor/Imgui.cpp"
+        "${EVANS_ROOT}/Src/Editor/TechniqueControls.cpp"
+        "${EVANS_ROOT}/Src/Editor/HairControls.cpp"
+        "${EVANS_ROOT}/Src/Editor/DragonControls.cpp"
+        "${EVANS_ROOT}/Src/Editor/VolumeControls.cpp"
     )
 endif()
 
 if(WIN32)
-    add_executable(EvansEditor WIN32
-        "${EVANS_ROOT}/Src/Editor/EditorPresenter.cpp"
+    set_target_properties(EvansEditor PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_compile_definitions(EvansEditor PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_sources(EvansEditor PRIVATE
+        "${EVANS_ROOT}/Src/Renderer/Vulkan/VulkanContactShadows.cpp"
+        "${EVANS_ROOT}/Src/Renderer/Vulkan/VulkanForwardPlus.cpp"
+        "${EVANS_ROOT}/Src/Renderer/Vulkan/VulkanClusteredForward.cpp"
         "${EVANS_ROOT}/Src/Editor/EditorPresenterDX11.cpp"
         "${EVANS_ROOT}/Src/Editor/EditorPresenterDX12.cpp"
         "${EVANS_ROOT}/Src/Editor/EditorPresenterOpenGLES.cpp"
         "${EVANS_ROOT}/Src/Editor/EditorPresenterVulkan.cpp"
-        "${EVANS_ROOT}/Src/Editor/Imgui.cpp"
         "${EVANS_ROOT}/Src/Editor/ImguiRenderDX11.cpp"
         "${EVANS_ROOT}/Src/Editor/ImguiRenderDX12.cpp"
         "${EVANS_ROOT}/Src/Editor/ImguiRenderOpenGLES.cpp"
         "${EVANS_ROOT}/Src/Editor/ImguiRenderVulkan.cpp"
-        "${EVANS_ROOT}/Src/Editor/Main.cpp"
     )
-    target_link_libraries(EvansEditor PRIVATE
-        EvansEditorCore
-        d3d11
-        d3d12
-        d3dcompiler
-        dxgi
-        gdi32
-        shell32
-        user32
-    )
-    target_compile_definitions(EvansEditor PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(EvansEditor PRIVATE d3d11 d3d12 d3dcompiler dxgi gdi32 ole32 shell32 user32 windowscodecs)
+    include("${CMAKE_CURRENT_LIST_DIR}/VulkanRuntimeCompiler.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/DX12RuntimeCompiler.cmake")
+
+    # Browser updates can remove the system ANGLE runtime. A supplied standalone
+    # runtime keeps both the renderer and editor presenter independent of it.
+    set(EVANS_ANGLE_RUNTIME_DIR "" CACHE PATH "Directory containing standalone ANGLE runtime DLLs")
+    if(EVANS_ANGLE_RUNTIME_DIR)
+        foreach(runtime libEGL.dll libGLESv2.dll)
+            if(NOT EXISTS "${EVANS_ANGLE_RUNTIME_DIR}/${runtime}")
+                message(FATAL_ERROR "Missing ANGLE runtime: ${EVANS_ANGLE_RUNTIME_DIR}/${runtime}")
+            endif()
+            add_custom_command(TARGET EvansEditor POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${EVANS_ANGLE_RUNTIME_DIR}/${runtime}"
+                    "$<TARGET_FILE_DIR:EvansEditor>/${runtime}"
+                VERBATIM
+            )
+        endforeach()
+    endif()
 elseif(APPLE)
-    add_executable(EvansEditor
-        "${EVANS_ROOT}/Src/Editor/EditorPresenter.cpp"
+    target_sources(EvansEditor PRIVATE
+        "${EVANS_ROOT}/Src/Renderer/Metal/MetalShaderCache.mm"
+        "${EVANS_ROOT}/Src/Renderer/Metal/MetalContactShadows.mm"
+        "${EVANS_ROOT}/Src/Renderer/Metal/MetalForwardPlus.mm"
+        "${EVANS_ROOT}/Src/Renderer/Metal/MetalClusteredForward.mm"
         "${EVANS_ROOT}/Src/Editor/EditorPresenterMetal.mm"
-        "${EVANS_ROOT}/Src/Editor/Imgui.cpp"
-        "${EVANS_ROOT}/Src/Editor/Main.cpp"
         "${EVANS_ROOT}/Src/Editor/MainMac.mm"
     )
     target_link_libraries(EvansEditor PRIVATE
-        EvansEditorCore
         "-framework Cocoa"
         "-framework CoreGraphics"
+        "-framework Foundation"
+        "-framework ImageIO"
         "-framework Metal"
         "-framework QuartzCore"
     )
-else()
-    add_executable(EvansEditor "${EVANS_ROOT}/Src/Editor/Main.cpp")
-    target_link_libraries(EvansEditor PRIVATE EvansEditorCore)
-endif()
-evans_target(EvansEditor Editor)
-
-if(BUILD_TESTING)
-    add_executable(EvansRendererMatrix "${EVANS_ROOT}/Src/Validation/RendererMatrix.cpp")
-    evans_target(EvansRendererMatrix Validation)
-    target_link_libraries(EvansRendererMatrix PRIVATE EvansEditorCore)
-    add_test(NAME evans.renderer_matrix COMMAND $<TARGET_FILE:EvansRendererMatrix>)
-    set_tests_properties(evans.renderer_matrix PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
-
-    set(EVANS_TEST_OUTPUT_DIRECTORY "${EVANS_ROOT}/Intermediate/Validation")
-    file(MAKE_DIRECTORY "${EVANS_TEST_OUTPUT_DIRECTORY}")
-
-    add_test(
-        NAME evans.catalog
-        COMMAND $<TARGET_FILE:EvansEditor> --catalog-smoke)
-    add_test(
-        NAME evans.shader_parser
-        COMMAND $<TARGET_FILE:EvansEditor> --shader-parser-smoke)
-    add_test(
-        NAME evans.switch
-        COMMAND $<TARGET_FILE:EvansEditor>
-            --switch-smoke
-            --output "${EVANS_TEST_OUTPUT_DIRECTORY}/switch.ppm")
-    add_test(
-        NAME evans.switch_stress
-        COMMAND $<TARGET_FILE:EvansEditor>
-            --switch-stress-smoke
-            --output "${EVANS_TEST_OUTPUT_DIRECTORY}/switch-stress.ppm")
-
-    set_tests_properties(
-        evans.catalog
-        evans.shader_parser
-        PROPERTIES TIMEOUT 30)
-    set_tests_properties(
-        evans.switch
-        evans.switch_stress
-        PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
-
-    set(EVANS_ANIMATED_SOFTWARE_BACKENDS cpu)
-    if(WIN32)
-        list(APPEND EVANS_ANIMATED_SOFTWARE_BACKENDS cuda compute)
-    elseif(APPLE)
-        list(APPEND EVANS_ANIMATED_SOFTWARE_BACKENDS metal)
-    endif()
-    foreach(backend IN LISTS EVANS_ANIMATED_SOFTWARE_BACKENDS)
-        add_test(NAME evans.animation_${backend}
-            COMMAND $<TARGET_FILE:EvansEditor> --realtime-smoke
-                --backend rasterizer.${backend}
-                --output "${EVANS_TEST_OUTPUT_DIRECTORY}/animation-${backend}.ppm")
-        set_tests_properties(evans.animation_${backend} PROPERTIES
-            TIMEOUT 180 SKIP_RETURN_CODE 4 RUN_SERIAL TRUE)
-    endforeach()
-
-    if(WIN32)
-        add_test(
-            NAME evans.presentation_pair
-            COMMAND $<TARGET_FILE:EvansEditor> --presentation-pair-smoke
-                --demo sponza
-                --output "${EVANS_TEST_OUTPUT_DIRECTORY}/presentation-pair.txt")
-        set_tests_properties(evans.presentation_pair PROPERTIES
-            TIMEOUT 300 RUN_SERIAL TRUE)
-        foreach(EVANS_LIVE_DEMO triangle teapot sponza)
-            add_test(
-                NAME evans.presentation_live_${EVANS_LIVE_DEMO}
-                COMMAND $<TARGET_FILE:EvansEditor> --presentation-live-smoke
-                    --demo ${EVANS_LIVE_DEMO}
-                    --output "${EVANS_TEST_OUTPUT_DIRECTORY}/presentation-live-${EVANS_LIVE_DEMO}.txt")
-            set_tests_properties(evans.presentation_live_${EVANS_LIVE_DEMO}
-                PROPERTIES TIMEOUT 2400 RUN_SERIAL TRUE)
-        endforeach()
-        add_test(
-            NAME evans.presentation_switch
-            COMMAND $<TARGET_FILE:EvansEditor> --presentation-switch-smoke)
-        set_tests_properties(
-            evans.presentation_switch
-            PROPERTIES
-                TIMEOUT 180
-                SKIP_RETURN_CODE 4
-                RUN_SERIAL TRUE)
-    endif()
-endif()
-
-if(MSVC)
-    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT EvansEditor)
 endif()

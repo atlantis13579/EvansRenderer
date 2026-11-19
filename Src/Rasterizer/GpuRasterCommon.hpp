@@ -32,7 +32,9 @@ struct alignas(16) GpuRasterTriangle
     std::uint32_t DiffuseTextureIndex = InvalidRasterTextureIndex;
     std::uint32_t OpacityTextureIndex = InvalidRasterTextureIndex;
     std::uint32_t Selected = 0;
-    std::uint32_t Padding[3]{};
+    std::uint32_t NormalTextureIndex = InvalidRasterTextureIndex;
+    float SubsurfaceWeight = 0;
+    std::uint32_t ReceivesLightmap = 0;
 };
 
 struct alignas(16) GpuRasterTexture
@@ -40,7 +42,7 @@ struct alignas(16) GpuRasterTexture
     std::uint32_t OffsetTexels = 0;
     std::uint32_t Width = 0;
     std::uint32_t Height = 0;
-    std::uint32_t Padding = 0;
+    std::uint32_t FirstMip = 0;
 };
 
 struct GpuRasterTextureData
@@ -97,13 +99,21 @@ struct alignas(16) GpuRasterConstants
     std::uint32_t TextureTexelCount = 0;
     GpuRasterLight Lights[MaximumRasterLights]{};
     float ShadowRasterBias[4]{};
+    std::uint32_t MaterialOptions = 0;
+    std::uint32_t FrontLightmap = InvalidRasterTextureIndex;
+    std::uint32_t BackLightmap = InvalidRasterTextureIndex;
+    std::uint32_t ACESColor = 0;
+    float DisplayParameters[4]{}; // Exposure, contrast, saturation, lightmap intensity.
+    std::uint32_t SkyTexture = InvalidRasterTextureIndex, SkyDiffuseTexture = InvalidRasterTextureIndex;
+    float SkyIntensity = 0, SkyDiffuseIntensity = 0;
+    float SubsurfaceScattering[4]{};
 };
 
 static_assert(sizeof(GpuRasterVertex) == 96, "GPU raster vertex ABI mismatch");
 static_assert(sizeof(GpuRasterTriangle) == 368, "GPU raster triangle ABI mismatch");
 static_assert(sizeof(GpuRasterTexture) == 16, "GPU raster texture ABI mismatch");
 static_assert(sizeof(GpuRasterLight) == 64, "GPU raster light ABI mismatch");
-static_assert(sizeof(GpuRasterConstants) == 736, "GPU raster constants ABI mismatch");
+static_assert(sizeof(GpuRasterConstants) == 800, "GPU raster constants ABI mismatch");
 static_assert(
     alignof(GpuRasterVertex) == 16 &&
         alignof(GpuRasterTriangle) == 16 &&
@@ -145,6 +155,20 @@ static_assert(
         offsetof(GpuRasterConstants, Lights) == 464 &&
         offsetof(GpuRasterConstants, ShadowRasterBias) == 720,
     "GPU raster constant field offsets mismatch");
+
+// Texture pixels are immutable shared storage. Retain identity and dimensions
+// so camera changes do not repack or re-upload the material atlas.
+class GpuRasterTextureCache
+{
+public:
+    const GpuRasterTextureData& Get(const RasterScene& scene);
+    std::uint64_t Generation() const { return Generation_; }
+    void Reset() { Sources_.clear(); Data_={}; Generation_=0; }
+private:
+    std::vector<RasterTexture> Sources_;
+    GpuRasterTextureData Data_;
+    std::uint64_t Generation_=0;
+};
 
 struct GpuRasterTileBins
 {

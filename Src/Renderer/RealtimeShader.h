@@ -13,7 +13,7 @@ namespace Evans::Renderer
 		HLSL,
 		GLSLES,
 		Metal,
-		SPIRV
+		VulkanGLSL
 	};
 
 	enum class RealtimeShaderStage : std::uint8_t
@@ -58,7 +58,7 @@ namespace Evans::Renderer
 		std::string HLSL;
 		std::string GLSLES;
 		std::string Metal;
-		std::string SPIRV;
+		std::string VulkanGLSL;
 
 		const std::string& Entry(RealtimeShaderLanguage language) const;
 	};

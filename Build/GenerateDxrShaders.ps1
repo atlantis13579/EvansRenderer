@@ -70,7 +70,7 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 [void](New-Item -ItemType Directory -Path $temporaryRoot)
 
 try {
-    $dxrCppPath = Join-Path $repositoryRoot 'Src\Renderer\DxrRayTracingRHI.cpp'
+    $dxrCppPath = Join-Path $repositoryRoot 'Src\Renderer\DX12\DxrRayTracingRHI.cpp'
     $dxrCpp = [System.IO.File]::ReadAllText($dxrCppPath)
     $dxrPattern = 'constexpr const char\* DxrShaderSource = R"DXR\(\r?\n(?<shader>.*?)\r?\n\)DXR";'
     $dxrMatch = [regex]::Match(
@@ -78,7 +78,7 @@ try {
         $dxrPattern,
         [System.Text.RegularExpressions.RegexOptions]::Singleline)
     if (-not $dxrMatch.Success) {
-        throw 'Could not extract DxrShaderSource from Renderer/DxrRayTracingRHI.cpp.'
+        throw 'Could not extract DxrShaderSource from Renderer/DX12/DxrRayTracingRHI.cpp.'
     }
     $dxrShader = [regex]::Replace(
         $dxrMatch.Groups['shader'].Value,
@@ -118,7 +118,7 @@ try {
     $dxrOutput += '}'
     $dxrOutput += '}'
     $dxrOutput += '}'
-    Write-TextFile (Join-Path $repositoryRoot 'Src\Renderer\DxrShaderBytecode.h') $dxrOutput
+    Write-TextFile (Join-Path $repositoryRoot 'Src\Renderer\DX12\DxrShaderBytecode.h') $dxrOutput
     Write-Host "Regenerated DXR shaders with $resolvedDxc"
 }
 finally {

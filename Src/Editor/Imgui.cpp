@@ -21,6 +21,9 @@
 #include <string.h>
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <vector>
+#include <algorithm>
+#include <string>
 #include "Editor/Imgui.h"
 
 #ifdef WIN32
@@ -29,6 +32,10 @@
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static int TEXT_HEIGHT = 16;
+static std::vector<std::pair<bool,std::string>> g_enabled;
+static std::string g_tooltip,g_disabledReason="Unavailable for the current backend, pipeline or material.";
+static int g_lastX=0,g_lastY=0,g_lastW=0,g_lastH=0;
 static const unsigned TEXT_POOL_SIZE = 50000;
 static char g_textPool[TEXT_POOL_SIZE];
 static unsigned g_textPoolSize = 0;
@@ -169,9 +176,29 @@ struct GuiState
 
 	unsigned int areaId;
 	unsigned int widgetId;
+	bool visible=true, hideDisabled=false;
+	std::vector<bool> visibility;
 };
 
 static GuiState g_state;
+
+void imguiPushVisibility(bool visible)
+{
+    g_state.visibility.push_back(g_state.visible);
+    g_state.visible=g_state.visible && visible;
+}
+void imguiPopVisibility()
+{
+    if (g_state.visibility.empty()) return;
+    g_state.visible=g_state.visibility.back();
+    g_state.visibility.pop_back();
+}
+bool imguiSetHideDisabled(bool hide)
+{
+    const bool previous=g_state.hideDisabled;
+    g_state.hideDisabled=hide;
+    return previous;
+}
 
 inline bool anyActive()
 {
@@ -267,6 +294,9 @@ static void updateInput(int mx, int my, unsigned char mbut, int scroll)
 void imguiBeginFrame(int mx, int my, unsigned char mbut, int scroll)
 {
 	updateInput(mx,my,mbut,scroll);
+    g_state.visible=true;
+    g_state.hideDisabled=false;
+    g_state.visibility.clear();
 
 	g_state.hot = g_state.hotToBe;
 	g_state.hotToBe = 0;
@@ -283,10 +313,39 @@ void imguiBeginFrame(int mx, int my, unsigned char mbut, int scroll)
 	g_state.widgetId = 1;
 
 	resetGfxCmdQueue();
+    g_tooltip.clear();
 }
 
+void imguiPushEnabled(bool enabled,const char* reason)
+{
+    const bool parent=g_enabled.empty() || g_enabled.back().first;
+    g_enabled.push_back({parent && enabled,reason?reason:"This option is inactive in the current pipeline."});
+}
+void imguiPopEnabled() { if (!g_enabled.empty()) g_enabled.pop_back(); }
+bool imguiIsEnabled() { return g_enabled.empty() || g_enabled.back().first; }
+void imguiTooltip(const char* reason)
+{
+    if (reason && *reason && g_state.visible && inRect(g_lastX,g_lastY,g_lastW,g_lastH)) g_tooltip=reason;
+}
+void imguiSetDisabledReason(const char* reason)
+{ g_disabledReason=reason?reason:"Unavailable for the current backend, pipeline or material."; }
 void imguiEndFrame()
 {
+    if (!g_tooltip.empty())
+    {
+        addGfxCmdScissor(-1,0,0,0);
+        std::vector<std::string> lines; std::string remaining=g_tooltip;
+        while (!remaining.empty())
+        {
+            auto count=std::min(std::size_t(66),remaining.size());
+            if (count<remaining.size()) { auto space=remaining.rfind(' ',count); if (space!=std::string::npos && space>0) count=space; }
+            lines.push_back(remaining.substr(0,count));remaining.erase(0,count);while (!remaining.empty() && remaining[0]==' ') remaining.erase(0,1);
+        }
+        const int x=std::max(4,g_state.mx-250),top=std::max(30+int(lines.size())*TEXT_HEIGHT,g_state.my-18);
+        addGfxCmdRoundedRect(float(x),float(top-int(lines.size())*TEXT_HEIGHT-12),548,float(lines.size()*TEXT_HEIGHT+16),4,imguiRGBA(18,20,26,250));
+        for (unsigned i=0;i<lines.size();++i) addGfxCmdText(x+8,top-int(i+1)*TEXT_HEIGHT,IMGUI_ALIGN_LEFT,lines[i].c_str(),imguiRGBA(240,225,190));
+    }
+    if (g_state.leftReleased) clearActive();
 	clearInput();
 }
 
@@ -302,15 +361,24 @@ int imguiGetRenderQueueSize()
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-static const int BUTTON_HEIGHT = 20;
-static const int SLIDER_HEIGHT = 20;
+static int BUTTON_HEIGHT = 20;
+static int SLIDER_HEIGHT = 20;
 static const int SLIDER_MARKER_WIDTH = 10;
 static const int CHECK_SIZE = 8;
 static const int DEFAULT_SPACING = 4;
-static const int TEXT_HEIGHT = 8;
+
 static const int SCROLL_AREA_PADDING = 6;
 static const int INDENT_SIZE = 16;
-static const int AREA_HEADER = 28;
+static int AREA_HEADER = 28;
+
+void imguiSetFontHeight(int height)
+{
+    // Text commands carry the glyph bottom. Center that actual glyph box in
+    // each row; the old eight-pixel estimate clipped the first body label.
+    TEXT_HEIGHT=std::clamp(height,8,64);
+    BUTTON_HEIGHT=SLIDER_HEIGHT=std::max(20,TEXT_HEIGHT+2);
+    AREA_HEADER=std::max(28,TEXT_HEIGHT+10);
+}
 
 static int g_scrollTop = 0;
 static int g_scrollBottom = 0;
@@ -368,6 +436,17 @@ void imguiEndScrollArea()
 	int stop = g_scrollAreaTop;
 	int sbot = g_state.widgetY;
 	int sh = stop - sbot; // The scrollable area height.
+
+	// Dynamic panels can lose rows when a group closes or a backend changes.
+	// Clamp even when content now fits, since that branch has no wheel handler.
+	const int maximumScroll = sh > h ? sh - h : 0;
+	if (*g_scrollVal < 0) *g_scrollVal = 0;
+	if (*g_scrollVal > maximumScroll) *g_scrollVal = maximumScroll;
+	if (sh <= 0)
+	{
+		g_state.insideCurrentScroll = false;
+		return;
+	}
 
 	float barHeight = (float)h/(float)sh;
 
@@ -428,6 +507,8 @@ void imguiEndScrollArea()
 
 bool imguiButton(const char* text, bool enabled)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled)) { ++g_state.widgetId; return false; }
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId<<16) | g_state.widgetId;
 
@@ -437,6 +518,7 @@ bool imguiButton(const char* text, bool enabled)
 	int h = BUTTON_HEIGHT;
 	g_state.widgetY -= BUTTON_HEIGHT + DEFAULT_SPACING;
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x, y, w, h);
 	bool res = buttonLogic(id, over);
 
@@ -446,11 +528,14 @@ bool imguiButton(const char* text, bool enabled)
 	else
 		addGfxCmdText(x+BUTTON_HEIGHT/2, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_LEFT, text, imguiRGBA(128,128,128,200));
 
+    if (res) g_openComboId=0;
 	return res;
 }
 
 bool imguiItem(const char* text, bool enabled)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled)) { ++g_state.widgetId; return false; }
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId<<16) | g_state.widgetId;
 
@@ -460,6 +545,7 @@ bool imguiItem(const char* text, bool enabled)
 	int h = BUTTON_HEIGHT;
 	g_state.widgetY -= BUTTON_HEIGHT + DEFAULT_SPACING;
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x, y, w, h);
 	bool res = buttonLogic(id, over);
 
@@ -471,11 +557,14 @@ bool imguiItem(const char* text, bool enabled)
 	else
 		addGfxCmdText(x+BUTTON_HEIGHT/2, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_LEFT, text, imguiRGBA(128,128,128,200));
 
+    if (res) g_openComboId=0;
 	return res;
 }
 
 bool imguiCheck(const char* text, bool checked, bool enabled)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled)) { ++g_state.widgetId; return false; }
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId<<16) | g_state.widgetId;
 
@@ -485,6 +574,7 @@ bool imguiCheck(const char* text, bool checked, bool enabled)
 	int h = BUTTON_HEIGHT;
 	g_state.widgetY -= BUTTON_HEIGHT + DEFAULT_SPACING;
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x, y, w, h);
 	bool res = buttonLogic(id, over);
 
@@ -504,11 +594,14 @@ bool imguiCheck(const char* text, bool checked, bool enabled)
 	else
 		addGfxCmdText(x+BUTTON_HEIGHT, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_LEFT, text, imguiRGBA(128,128,128,200));
 
+    if (res) g_openComboId=0;
 	return res;
 }
 
 bool imguiCollapse(const char* text, const char* subtext, bool checked, bool enabled)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled)) { ++g_state.widgetId; return false; }
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId<<16) | g_state.widgetId;
 
@@ -521,6 +614,7 @@ bool imguiCollapse(const char* text, const char* subtext, bool checked, bool ena
 	const int cx = x+BUTTON_HEIGHT/2-CHECK_SIZE/2;
 	const int cy = y+BUTTON_HEIGHT/2-CHECK_SIZE/2;
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x, y, w, h);
 	bool res = buttonLogic(id, over);
 
@@ -537,11 +631,15 @@ bool imguiCollapse(const char* text, const char* subtext, bool checked, bool ena
 	if (subtext)
 		addGfxCmdText(x+w-BUTTON_HEIGHT/2, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_RIGHT, subtext, imguiRGBA(255,255,255,128));
 
+    if (res) g_openComboId=0;
 	return res;
 }
 
-bool imguiCombo(const char* text, int* selected, const char** items, int itemCount, bool enabled)
+bool imguiCombo(const char* text, int* selected, const char** items, int itemCount, bool enabled, const char* const* reasons, bool leftAligned)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled))
+    { g_state.widgetId+=1+std::max(0,itemCount); return false; }
 	if (selected == 0 || items == 0 || itemCount <= 0)
 	{
 		return false;
@@ -555,6 +653,10 @@ bool imguiCombo(const char* text, int* selected, const char** items, int itemCou
 	{
 		*selected = itemCount - 1;
 	}
+    // Long captions get their own row instead of colliding with the selection.
+    constexpr int CharacterWidth=8,ComboPadding=36;
+    if (text && *text && int(strlen(text)+strlen(items[*selected]))*CharacterWidth+ComboPadding>g_state.widgetW)
+    { imguiLabel(text); text=""; }
 
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId << 16) | g_state.widgetId;
@@ -565,6 +667,7 @@ bool imguiCombo(const char* text, int* selected, const char** items, int itemCou
 	const int h = BUTTON_HEIGHT;
 	g_state.widgetY -= BUTTON_HEIGHT + DEFAULT_SPACING;
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x, y, w, h);
 	bool pressed = buttonLogic(id, over);
 	if (pressed)
@@ -576,31 +679,37 @@ bool imguiCombo(const char* text, int* selected, const char** items, int itemCou
 	const unsigned int textColor = enabled
 		? (isHot(id) ? imguiRGBA(255, 196, 0, 255) : imguiRGBA(255, 255, 255, 220))
 		: imguiRGBA(128, 128, 128, 200);
-	addGfxCmdText(x + BUTTON_HEIGHT / 2, y + BUTTON_HEIGHT / 2 - TEXT_HEIGHT / 2, IMGUI_ALIGN_LEFT, text, textColor);
-	addGfxCmdText(x + w - BUTTON_HEIGHT * 2, y + BUTTON_HEIGHT / 2 - TEXT_HEIGHT / 2, IMGUI_ALIGN_RIGHT, items[*selected], textColor);
+	addGfxCmdText(leftAligned ? x : x + BUTTON_HEIGHT / 2, y + BUTTON_HEIGHT / 2 - TEXT_HEIGHT / 2, IMGUI_ALIGN_LEFT, text, textColor);
+	const bool alignSelectionLeft = leftAligned && (!text || !*text);
+	addGfxCmdText(alignSelectionLeft?x:x+w-BUTTON_HEIGHT*2, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, alignSelectionLeft?IMGUI_ALIGN_LEFT:IMGUI_ALIGN_RIGHT, items[*selected], textColor);
 
 	const int arrowX = x + w - BUTTON_HEIGHT;
 	const int arrowY = y + BUTTON_HEIGHT / 2 - CHECK_SIZE / 2;
 	addGfxCmdTriangle(arrowX, arrowY, CHECK_SIZE, CHECK_SIZE, g_openComboId == id ? 2 : 1, imguiRGBA(255, 255, 255, enabled ? 200 : 96));
 
 	bool changed = false;
+    // Opening a list must not renumber the controls that follow it.
+    const unsigned firstItem=g_state.widgetId+1;
+    g_state.widgetId+=unsigned(itemCount);
 	if (g_openComboId == id)
 	{
 		for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex)
 		{
-			g_state.widgetId++;
-			unsigned int itemId = (g_state.areaId << 16) | g_state.widgetId;
+			unsigned int itemId = (g_state.areaId << 16) | (firstItem+unsigned(itemIndex));
 			const int itemY = g_state.widgetY - BUTTON_HEIGHT;
 			g_state.widgetY -= BUTTON_HEIGHT + DEFAULT_SPACING;
 
-			bool itemOver = enabled && inRect(x, itemY, w, BUTTON_HEIGHT);
+			const bool itemEnabled=enabled && (!reasons || !reasons[itemIndex] || !*reasons[itemIndex]);
+            g_lastX=x;g_lastY=itemY;g_lastW=w;g_lastH=BUTTON_HEIGHT;
+            if (!itemEnabled) imguiTooltip(reasons && reasons[itemIndex]?reasons[itemIndex]:g_disabledReason.c_str());
+            bool itemOver = itemEnabled && inRect(x, itemY, w, BUTTON_HEIGHT);
 			bool itemPressed = buttonLogic(itemId, itemOver);
 			const bool isSelected = itemIndex == *selected;
 			const unsigned int bg = isSelected ? imguiRGBA(255, 196, 0, 96) : imguiRGBA(32, 32, 32, 220);
 			addGfxCmdRoundedRect((float)x, (float)itemY, (float)w, (float)BUTTON_HEIGHT, 3.0f,
 				isHot(itemId) ? imguiRGBA(255, 196, 0, isActive(itemId) ? 160 : 112) : bg);
 			addGfxCmdText(x + BUTTON_HEIGHT / 2, itemY + BUTTON_HEIGHT / 2 - TEXT_HEIGHT / 2, IMGUI_ALIGN_LEFT,
-				items[itemIndex], isSelected ? imguiRGBA(255, 255, 255, 255) : imguiRGBA(255, 255, 255, 200));
+				items[itemIndex], !itemEnabled ? imguiRGBA(110,110,110,200) : isSelected ? imguiRGBA(255, 255, 255, 255) : imguiRGBA(255, 255, 255, 200));
 
 			if (itemPressed)
 			{
@@ -616,14 +725,25 @@ bool imguiCombo(const char* text, int* selected, const char** items, int itemCou
 
 void imguiLabel(const char* text)
 {
-	int x = g_state.widgetX;
-	int y = g_state.widgetY - BUTTON_HEIGHT;
-	g_state.widgetY -= BUTTON_HEIGHT;
-	addGfxCmdText(x, y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_LEFT, text, imguiRGBA(255,255,255,255));
+    if (!g_state.visible) return;
+    constexpr int CharacterWidth=8;
+    const auto width=std::size_t(std::max(1,g_state.widgetW/CharacterWidth));
+    std::string remaining(text?text:"");
+    do
+    {
+        auto count=std::min(width,remaining.size());
+        if (count<remaining.size())
+        { const auto space=remaining.rfind(' ',count); if (space!=std::string::npos && space>0) count=space; }
+        const int y=g_state.widgetY-BUTTON_HEIGHT; g_state.widgetY-=BUTTON_HEIGHT;
+        addGfxCmdText(g_state.widgetX,y+BUTTON_HEIGHT/2-TEXT_HEIGHT/2,IMGUI_ALIGN_LEFT,remaining.substr(0,count).c_str(),imguiRGBA(255,255,255,255));
+        remaining.erase(0,count);
+        while (!remaining.empty() && remaining.front()==' ') remaining.erase(0,1);
+    } while (!remaining.empty());
 }
 
 void imguiValue(const char* text)
 {
+    if (!g_state.visible) return;
 	const int x = g_state.widgetX;
 	const int y = g_state.widgetY - BUTTON_HEIGHT;
 	const int w = g_state.widgetW;
@@ -634,6 +754,11 @@ void imguiValue(const char* text)
 
 bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vinc, bool enabled)
 {
+    if (!g_enabled.empty() && !g_enabled.back().first) {enabled=false;imguiSetDisabledReason(g_enabled.back().second.c_str());}
+    if (!g_state.visible || (g_state.hideDisabled && !enabled)) { ++g_state.widgetId; return false; }
+    constexpr int CharacterWidth=8,ValueWidth=64;
+    if (text && int(strlen(text))*CharacterWidth+ValueWidth>g_state.widgetW)
+    { imguiLabel(text); text=""; }
 	g_state.widgetId++;
 	unsigned int id = (g_state.areaId<<16) | g_state.widgetId;
 
@@ -652,26 +777,28 @@ bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vin
 	if (u > 1) u = 1;
 	int m = (int)(u * range);
 
+	g_lastX=x;g_lastY=y;g_lastW=w;g_lastH=h; if (!enabled) imguiTooltip(g_disabledReason.c_str());
 	bool over = enabled && inRect(x+m, y, SLIDER_MARKER_WIDTH, SLIDER_HEIGHT);
-	bool res = buttonLogic(id, over);
+	const bool dragging = isActive(id);
+	buttonLogic(id, over);
 	bool valChanged = false;
 
-	if (isActive(id))
+	if (isActive(id) || dragging)
 	{
 		if (g_state.wentActive)
 		{
 			g_state.dragX = g_state.mx;
-			g_state.dragOrig = u;
+			g_state.dragOrig = *val;
 		}
-		if (g_state.dragX != g_state.mx)
+		else if (range > 0)
 		{
-			u = g_state.dragOrig + (float)(g_state.mx - g_state.dragX) / (float)range;
-			if (u < 0) u = 0;
-			if (u > 1) u = 1;
-			*val = vmin + u*(vmax-vmin);
-			*val = floorf(*val/vinc+0.5f)*vinc; // Snap to vinc
-			m = (int)(u * range);
-			valChanged = true;
+			const float delta = (float)(g_state.mx - g_state.dragX) / (float)range;
+			const float value = g_state.dragOrig + delta*(vmax-vmin);
+			const float snapped = delta == 0 ? g_state.dragOrig :
+				std::clamp(floorf(value/vinc+0.5f)*vinc, vmin, vmax);
+			valChanged = snapped != *val;
+			*val = snapped;
+			m = (int)((snapped-vmin)/(vmax-vmin) * range);
 		}
 	}
 
@@ -703,29 +830,33 @@ bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vin
 		addGfxCmdText(x+w-SLIDER_HEIGHT/2, y+SLIDER_HEIGHT/2-TEXT_HEIGHT/2, IMGUI_ALIGN_RIGHT, msg, imguiRGBA(128,128,128,200));
 	}
 
-	return res || valChanged;
+	return valChanged;
 }
 
 
 void imguiIndent()
 {
+    if (!g_state.visible) return;
 	g_state.widgetX += INDENT_SIZE;
 	g_state.widgetW -= INDENT_SIZE;
 }
 
 void imguiUnindent()
 {
+    if (!g_state.visible) return;
 	g_state.widgetX -= INDENT_SIZE;
 	g_state.widgetW += INDENT_SIZE;
 }
 
 void imguiSeparator()
 {
+    if (!g_state.visible) return;
 	g_state.widgetY -= DEFAULT_SPACING*3;
 }
 
 void imguiSeparatorLine()
 {
+    if (!g_state.visible) return;
 	int x = g_state.widgetX;
 	int y = g_state.widgetY - DEFAULT_SPACING*2;
 	int w = g_state.widgetW;

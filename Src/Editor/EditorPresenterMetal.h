@@ -30,7 +30,6 @@ public:
         int viewportHeight) override;
     void DrawImgui() override;
     bool EndFrame() override;
-    bool CaptureBackBuffer(Image& output) override;
 
     [[nodiscard]] bool IsInitialized() const noexcept override;
     [[nodiscard]] EditorPresentationAPI API() const noexcept override

@@ -3,7 +3,7 @@
 // The Editor extends Evans's header-only Vulkan ABI with Win32 WSI declarations.
 // No Vulkan SDK headers or import libraries are required by the presenter.
 
-#include "Renderer/VulkanABI.h"
+#include "Renderer/Vulkan/VulkanABI.h"
 
 #include <cstdint>
 
@@ -37,6 +37,7 @@ constexpr VkImageLayout VK_IMAGE_LAYOUT_PRESENT_SRC_KHR = 1000001002;
 constexpr VkFormat VK_FORMAT_R32G32_SFLOAT = 103;
 constexpr VkFormat VK_FORMAT_B8G8R8A8_UNORM = 44;
 constexpr VkColorSpaceKHR VK_COLOR_SPACE_SRGB_NONLINEAR_KHR = 0;
+constexpr VkPresentModeKHR VK_PRESENT_MODE_IMMEDIATE_KHR = 0;
 constexpr VkPresentModeKHR VK_PRESENT_MODE_MAILBOX_KHR = 1;
 constexpr VkPresentModeKHR VK_PRESENT_MODE_FIFO_KHR = 2;
 constexpr VkSurfaceTransformFlagBitsKHR VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR = 0x00000001U;

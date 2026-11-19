@@ -1,3 +1,4 @@
+#include "Renderer/OpenGLES/OpenGLESProgramCache.h"
 #include "Editor/ImguiRenderOpenGLES.h"
 
 #if defined(_WIN32)
@@ -131,8 +132,10 @@ struct ImguiRenderOpenGLES::Impl
         std::uint32_t Color = 0;
     };
 
+    std::function<void*(const char*)> CacheResolver;
     bool LoadFunctions(void* userData, OpenGLESProcResolver resolver)
     {
+        CacheResolver=[userData,resolver](const char* name){return resolver(userData,name);};
 #define EVANS_RESOLVE_GL(Member, Name) Resolve(Member, userData, resolver, Name)
         return EVANS_RESOLVE_GL(GlCreateShader, "glCreateShader") &&
                EVANS_RESOLVE_GL(GlShaderSource, "glShaderSource") &&
@@ -215,23 +218,9 @@ void main()
     OutColor = Color * texture(SourceTexture, TexCoord);
 }
 )GLSL";
-        const GLuint vertex = Compile(GL_VERTEX_SHADER, vertexSource);
-        if (vertex == 0) return false;
-        const GLuint fragment = Compile(GL_FRAGMENT_SHADER, fragmentSource);
-        if (fragment == 0)
-        {
-            GlDeleteShader(vertex);
-            return false;
-        }
-        Program = GlCreateProgram();
-        GlAttachShader(Program, vertex);
-        GlAttachShader(Program, fragment);
-        GlLinkProgram(Program);
-        GlDeleteShader(vertex);
-        GlDeleteShader(fragment);
-        GLint linked = 0;
-        GlGetProgramiv(Program, GL_LINK_STATUS, &linked);
-        if (linked == 0) return false;
+        std::string error;
+        Program=Renderer::CompileCachedGLESProgram(CacheResolver,{{GL_VERTEX_SHADER,vertexSource},{GL_FRAGMENT_SHADER,fragmentSource}},error);
+        if(!Program)return false;
         ScreenSizeLocation = GlGetUniformLocation(Program, "ScreenSize");
         const GLint textureLocation = GlGetUniformLocation(Program, "SourceTexture");
         if (ScreenSizeLocation < 0 || textureLocation < 0) return false;
@@ -294,6 +283,7 @@ void main()
         TEXTMETRICA metrics{};
         GetTextMetricsA(dc, &metrics);
         FontHeight = std::max(8L, metrics.tmHeight);
+        imguiSetFontHeight(FontHeight);
         int penX = 1;
         int penY = 1;
         for (int character = 32; character < 128; ++character)

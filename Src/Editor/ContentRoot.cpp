@@ -49,7 +49,9 @@ namespace
     return std::filesystem::is_regular_file(
                contentRoot / "Models/UtahTeapot/teapot.obj", error) &&
            std::filesystem::is_regular_file(
-               contentRoot / "Scenes/Sponza/sponza.obj", error);
+               contentRoot / "Scenes/Sponza/sponza.obj", error) &&
+           std::filesystem::is_regular_file(
+               contentRoot / "Models/StanfordDragon/dragon.obj", error);
 }
 
 [[nodiscard]] std::filesystem::path FindAbove(std::filesystem::path directory)
@@ -82,7 +84,7 @@ std::filesystem::path ResolveContentRoot()
     }
 
     throw std::runtime_error(
-        "Cannot find Contents with the Teapot and Sponza demo assets near the "
+        "Cannot find Contents with the Teapot, Sponza and Dragon demo assets near the "
         "executable or working directory: " + executable.string());
 }
 

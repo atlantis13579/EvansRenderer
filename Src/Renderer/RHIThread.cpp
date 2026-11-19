@@ -1,4 +1,5 @@
 #include "Renderer/RHIThread.h"
+#include "Renderer/ShaderPreparationProgress.h"
 
 #include <memory>
 #include <utility>
@@ -60,6 +61,14 @@ namespace Evans::Renderer
 		{
 			return false;
 		}
+        if (auto preparation = ShaderPreparationScope::Capture())
+        {
+            command = [preparation = std::move(preparation), command = std::move(command)](Renderer& renderer)
+            {
+                const ShaderPreparationScope scope(preparation);
+                command(renderer);
+            };
+        }
 		{
 			std::lock_guard<std::mutex> lock(m_Mutex);
 			if (!m_Running || m_StopRequested)

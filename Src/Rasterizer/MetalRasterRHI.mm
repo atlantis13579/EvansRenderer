@@ -1,4 +1,6 @@
+#include "Renderer/Metal/MetalShaderCache.h"
 #include "Rasterizer/MetalRasterRHI.h"
+#include "Renderer/Types.h"
 
 #include "Rasterizer/BackendCommon.hpp"
 #include "Rasterizer/GpuRasterCommon.hpp"
@@ -54,10 +56,7 @@ struct RasterTriangleGpu
     float AlphaCutoff;
     uint DiffuseTextureIndex;
     uint OpacityTextureIndex;
-    uint Selected;
-    uint Padding0;
-    uint Padding1;
-    uint Padding2;
+    uint Selected; uint NormalTextureIndex; float SubsurfaceWeight; uint ReceivesLightmap;
 };
 
 struct RasterTextureGpu
@@ -65,7 +64,7 @@ struct RasterTextureGpu
     uint OffsetTexels;
     uint Width;
     uint Height;
-    uint Padding;
+    uint FirstMip;
 };
 
 struct RasterLightGpu
@@ -115,6 +114,10 @@ struct RasterConstants
     uint TextureTexelCount;
     RasterLightGpu Lights[4];
     float4 ShadowRasterBias;
+    uint MaterialOptions, FrontLightmap, BackLightmap, ACESColor;
+    float4 DisplayParameters;
+    uint SkyTexture, SkyDiffuseTexture; float SkyIntensity, SkyDiffuseIntensity;
+    float4 SubsurfaceScattering;
 };
 
 float4 TransformRows(constant float4* rows, float4 value)
@@ -156,112 +159,61 @@ float3 NormalizeOr(float3 value, float3 fallback)
         : value * rsqrt(lengthSquared);
 }
 
-float SRGBToLinearChannel(float value)
-{
-    value = saturate(value);
-    return value <= 0.04045f
-        ? value / 12.92f
-        : pow((value + 0.055f) / 1.055f, 2.4f);
-}
-
-int WrapTextureCoordinate(int value, uint size)
-{
-    int result = value % int(size);
-    return result < 0 ? result + int(size) : result;
-}
-
-float4 ReadTextureTexel(
-    RasterTextureGpu descriptor,
-    int x,
-    int y,
-    bool decodeSRGB,
-    device const uint* textureTexels)
-{
-    x = WrapTextureCoordinate(x, descriptor.Width);
-    y = WrapTextureCoordinate(y, descriptor.Height);
-    const uint packed = textureTexels[
-        descriptor.OffsetTexels + uint(y) * descriptor.Width + uint(x)];
-    float4 value = float4(uint4(
-        packed & 255u,
-        (packed >> 8u) & 255u,
-        (packed >> 16u) & 255u,
-        (packed >> 24u) & 255u)) / 255.0f;
-    if (decodeSRGB)
-    {
-        value.rgb = float3(
-            SRGBToLinearChannel(value.r),
-            SRGBToLinearChannel(value.g),
-            SRGBToLinearChannel(value.b));
-    }
-    return value;
-}
-
-float4 SampleTexture(
-    uint textureIndex,
-    float2 texCoord,
-    bool decodeSRGB,
-    constant RasterConstants& constants,
-    device const RasterTextureGpu* textureDescriptors,
-    device const uint* textureTexels)
-{
-    if (textureIndex >= constants.TextureCount)
-    {
-        return float4(1.0f);
-    }
-    const RasterTextureGpu descriptor = textureDescriptors[textureIndex];
-    if (descriptor.Width == 0u ||
-        descriptor.Height == 0u ||
-        descriptor.OffsetTexels >= constants.TextureTexelCount)
-    {
-        return float4(1.0f);
-    }
-    const uint availableTexels =
-        constants.TextureTexelCount - descriptor.OffsetTexels;
-    if (descriptor.Height > availableTexels / descriptor.Width)
-    {
-        return float4(1.0f);
-    }
-
-    const float x = fract(texCoord.x) * float(descriptor.Width) - 0.5f;
-    const float y =
-        fract(1.0f - texCoord.y) * float(descriptor.Height) - 0.5f;
-    const int x0 = int(floor(x));
-    const int y0 = int(floor(y));
-    const float blendX = x - floor(x);
-    const float blendY = y - floor(y);
-    const float4 top = mix(
-        ReadTextureTexel(
-            descriptor,
-            x0,
-            y0,
-            decodeSRGB,
-            textureTexels),
-        ReadTextureTexel(
-            descriptor,
-            x0 + 1,
-            y0,
-            decodeSRGB,
-            textureTexels),
-        blendX);
-    const float4 bottom = mix(
-        ReadTextureTexel(
-            descriptor,
-            x0,
-            y0 + 1,
-            decodeSRGB,
-            textureTexels),
-        ReadTextureTexel(
-            descriptor,
-            x0 + 1,
-            y0 + 1,
-            decodeSRGB,
-            textureTexels),
-        blendX);
-    return mix(top, bottom, blendY);
-}
-
+)metal"
+#define R_FN
+#define R_TRI RasterTriangleGpu
+#define R_TEX RasterTextureGpu
+#define R_READ(T) device const T*
+#define R_MIN min
+#define R_MAX max
+#define R_FLOOR floor
+#define R_CEIL ceil
+#define R_ABS abs
+#define R_SQRT sqrt
+#define R_LOG2 log2
+#define R_POW pow
+#define R_EXP2 exp2
+#define R_FINITE isfinite
+#define R_ATAN2 atan2
+#define R_ACOS acos
+#define R_DOT dot
+#define R_CROSS cross
+#define R_FLOAT2 float2
+#define R_FLOAT3 float3
+#define R_FLOAT4 float4
+#define R_XYZ(v) (v).xyz
+#define R_NORMALIZE_OR NormalizeOr
+#define EVANS_MATERIAL_STRING(...) #__VA_ARGS__ "\n"
+#define EVANS_GPU_CODE(...) EVANS_MATERIAL_STRING(__VA_ARGS__)
+#include "GpuMaterials.inc"
+#undef EVANS_MATERIAL_STRING
+#undef R_FN
+#undef R_TRI
+#undef R_TEX
+#undef R_READ
+#undef R_MIN
+#undef R_MAX
+#undef R_FLOOR
+#undef R_CEIL
+#undef R_ABS
+#undef R_SQRT
+#undef R_LOG2
+#undef R_POW
+#undef R_EXP2
+#undef R_FINITE
+#undef R_ATAN2
+#undef R_ACOS
+#undef R_DOT
+#undef R_CROSS
+#undef R_FLOAT2
+#undef R_FLOAT3
+#undef R_FLOAT4
+#undef R_XYZ
+#undef R_NORMALIZE_OR
+#undef EVANS_GPU_CODE
+R"metal(
 float4 SampleSurface(
-    device const RasterTriangleGpu& primitive,
+    RasterTriangleGpu primitive,
     float p0,
     float p1,
     float p2,
@@ -280,24 +232,34 @@ float4 SampleSurface(
          primitive.Vertices[1].TexCoord.xy * p1 +
          primitive.Vertices[2].TexCoord.xy * p2) /
         denominator;
-    const float4 diffuse = SampleTexture(
-        primitive.DiffuseTextureIndex,
-        texCoord,
-        true,
-        constants,
-        textureDescriptors,
-        textureTexels);
-    const float opacity = SampleTexture(
-        primitive.OpacityTextureIndex,
-        texCoord,
-        false,
-        constants,
-        textureDescriptors,
-        textureTexels).r;
+    const bool aniso = (constants.MaterialOptions & 8u) != 0;
+    if (aniso && constants.InputSpace != 0)
+        for (uint i = 0; i < 3; ++i)
+            primitive.Vertices[i].Clip = TransformRows(constants.Projection, TransformRows(constants.View,
+                TransformRows(constants.World, primitive.Vertices[i].Position)));
+    RasterTextureGradients gradients = GpuTextureGradients(primitive, texCoord, denominator, constants.Width, constants.Height);
+    const float4 diffuse = GpuSampleTexture((constants.MaterialOptions & 1u) != 0 ?
+        primitive.DiffuseTextureIndex : 0xffffffffu, texCoord,1,gradients,constants.TextureCount,aniso,
+        textureDescriptors,textureTexels);
+    const float opacity = GpuSampleTexture((constants.MaterialOptions & 4u) != 0 ?
+        primitive.OpacityTextureIndex : 0xffffffffu,texCoord,0,gradients,constants.TextureCount,aniso,
+        textureDescriptors,textureTexels).r;
     return float4(
         vertex.rgb * primitive.BaseColor.rgb * diffuse.rgb,
         saturate(
             vertex.a * primitive.BaseColor.a * diffuse.a * opacity));
+}
+
+// Karis' smooth inverse-square window; Filament, Punctual lights.
+// The host canonicalizes range: zero is unbounded, positive is finite support.
+float LightRangeWindow(float3 offset, float radius)
+{
+    if (radius <= 0.0f) return 1.0f;
+    if (any(abs(offset) >= float3(radius))) return 0.0f;
+    float3 normalizedOffset = offset / radius;
+    float squaredFraction = dot(normalizedOffset, normalizedOffset);
+    float window = max(1.0f - squaredFraction * squaredFraction, 0.0f);
+    return window * window;
 }
 
 void AccumulateLightSample(
@@ -307,7 +269,7 @@ void AccumulateLightSample(
     float3 normal,
     float3 viewDirection,
     float shininess,
-    uint shading,
+    uint shading, float3 scatter,
     thread float3& diffuseLight,
     thread float3& specularLight)
 {
@@ -317,14 +279,11 @@ void AccumulateLightSample(
         return;
     }
     const float3 direction = lightDirection * rsqrt(directionLengthSquared);
-    const float normalToLight = max(dot(normal, direction), 0.0f);
-    if (normalToLight <= 0.0f)
-    {
-        return;
-    }
+    const float cosine = dot(normal, direction);
+    float normalToLight = max(cosine, 0.0f);
     const float3 visibleRadiance = radiance * visibility;
-    diffuseLight += visibleRadiance * normalToLight;
-    if (shading == 2u)
+    diffuseLight += visibleRadiance * max(cosine + scatter, 0.0f) / (1.0f + scatter);
+    if (shading == 2 && normalToLight > 0)
     {
         const float3 halfVector = NormalizeOr(direction + viewDirection, normal);
         const float specularAmount = pow(
@@ -340,8 +299,7 @@ void AccumulateSceneLight(
     float3 normal,
     float3 viewDirection,
     float shininess,
-    uint shading,
-    float shadowVisibility,
+    uint shading, float shadowVisibility, float3 scatter,
     constant RasterConstants& constants,
     thread float3& diffuseLight,
     thread float3& specularLight)
@@ -365,7 +323,7 @@ void AccumulateSceneLight(
             normal,
             viewDirection,
             shininess,
-            shading,
+            shading, scatter,
             diffuseLight,
             specularLight);
         return;
@@ -376,12 +334,12 @@ void AccumulateSceneLight(
         const float distanceSquared = max(dot(toLight, toLight), 1.0e-6f);
         AccumulateLightSample(
             toLight,
-            radiance / distanceSquared,
+            radiance * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared,
             visibility,
             normal,
             viewDirection,
             shininess,
-            shading,
+            shading, scatter,
             diffuseLight,
             specularLight);
         return;
@@ -416,12 +374,12 @@ void AccumulateSceneLight(
                 0.0f);
             AccumulateLightSample(
                 direction,
-                radiance * (0.25f * emitterCosine / distanceSquared),
+                radiance * (0.25f * emitterCosine * LightRangeWindow(toLight, light.AreaSizePadding.z) / distanceSquared),
                 visibility,
                 normal,
                 viewDirection,
                 shininess,
-                shading,
+                shading, scatter,
                 diffuseLight,
                 specularLight);
         }
@@ -545,7 +503,7 @@ kernel void EvansMetalShadowMain(
             constants,
             textureDescriptors,
             textureTexels).a;
-        if (primitive.AlphaCutoff > 0.0f &&
+        if ((constants.MaterialOptions&4u)!=0 && primitive.AlphaCutoff > 0.0f &&
             alpha < primitive.AlphaCutoff)
         {
             continue;
@@ -580,6 +538,7 @@ kernel void EvansMetalRasterMain(
     const float2 samplePosition = float2(float(x) + 0.5f, float(y) + 0.5f);
     float bestDepth = 1.0e30f;
     float4 bestColor = constants.ClearColor;
+    float visibilityDepth = 1.0e30f; bool selected = false;
     float bestWireDepth = 1.0e30f;
     for (uint binIndex = tileOffsets[tile];
          binIndex < tileOffsets[tile + 1u];
@@ -690,9 +649,17 @@ kernel void EvansMetalRasterMain(
             {
                 const float edgeAlpha = SampleSurface(primitive, edgePerspective.x, edgePerspective.y,
                     edgePerspective.z, edgeDenominator, constants, textureDescriptors, textureTexels).a;
-                if (primitive.AlphaCutoff <= 0.0f || edgeAlpha >= primitive.AlphaCutoff)
+                if ((constants.MaterialOptions&4u)==0 || primitive.AlphaCutoff <= 0.0f || edgeAlpha >= primitive.AlphaCutoff)
                     bestWireDepth = min(bestWireDepth, wireDepth);
             }
+        }
+        if ((constants.OutlineEnabled & 2u) != 0 && inside)
+        {
+            float z=w0*vertexDepth[0]+w1*vertexDepth[1]+w2*vertexDepth[2];
+            float a=w0*inverseW[0],b=w1*inverseW[1],c=w2*inverseW[2],d=a+b+c;
+            if(z>=0 && z<=1 && z<visibilityDepth && abs(d)>1e-8f &&
+                ((constants.MaterialOptions&4u)==0 || primitive.AlphaCutoff<=0 || SampleSurface(primitive,a,b,c,d,constants,textureDescriptors,textureTexels).a>=primitive.AlphaCutoff))
+            {visibilityDepth=z;selected=primitive.Selected!=0;}
         }
         if (constants.FillModeValue == 1 || !inside) continue;
 
@@ -723,7 +690,7 @@ kernel void EvansMetalRasterMain(
             constants,
             textureDescriptors,
             textureTexels);
-        if (primitive.AlphaCutoff > 0.0f &&
+        if ((constants.MaterialOptions&4u)!=0 && primitive.AlphaCutoff > 0.0f &&
             color.a < primitive.AlphaCutoff)
         {
             continue;
@@ -734,6 +701,10 @@ kernel void EvansMetalRasterMain(
             constants.ShadowWidth > 0 &&
             constants.ShadowHeight > 0)
         {
+            const float3 shadowNormal = NormalizeSafe((normal[0]*p0 + normal[1]*p1 + normal[2]*p2)/denominator) *
+                (front ? 1.0f : -1.0f);
+            const float receiverBias = GpuShadowBias(constants.ShadowBias, constants.ShadowRasterBias.z, shadowNormal,
+                constants.Lights[clamp(constants.ShadowLightIndex,0,3)].DirectionIntensity.xyz);
             const float4 shadow =
                 (shadowClip[0] * p0 +
                  shadowClip[1] * p1 +
@@ -789,7 +760,7 @@ kernel void EvansMetalRasterMain(
                             const uint shadowIndex =
                                 uint(sampleY) * constants.ShadowWidth +
                                 uint(sampleX);
-                            if (shadowZ - constants.ShadowBias >
+                            if (shadowZ - receiverBias >
                                 shadowDepths[shadowIndex])
                             {
                                 ++occluded;
@@ -821,6 +792,17 @@ kernel void EvansMetalRasterMain(
             {
                 surfaceNormal = -surfaceNormal;
             }
+            RasterTriangleGpu materialTriangle = primitive;
+            for (uint i=0;i<3;++i) {
+                materialTriangle.Vertices[i].Position = world[i];
+                materialTriangle.Vertices[i].Clip = clip[i];
+            }
+            float4 uv = (primitive.Vertices[0].TexCoord*p0 + primitive.Vertices[1].TexCoord*p1 +
+                primitive.Vertices[2].TexCoord*p2)/denominator;
+            RasterTextureGradients gradients = GpuTextureGradients(materialTriangle,uv.xy,denominator,constants.Width,constants.Height);
+            if ((constants.MaterialOptions&2u)!=0 && primitive.NormalTextureIndex<constants.TextureCount)
+                surfaceNormal = GpuMappedNormal(materialTriangle,surfaceNormal,GpuSampleTexture(primitive.NormalTextureIndex,
+                    uv.xy,0,gradients,constants.TextureCount,(constants.MaterialOptions&8u)!=0,textureDescriptors,textureTexels));
             const float4 interpolatedPosition =
                 (world[0] * p0 +
                  world[1] * p1 +
@@ -843,10 +825,19 @@ kernel void EvansMetalRasterMain(
                     primitive.Shininess,
                     constants.ShadingValue,
                     shadowVisibility,
+                    constants.SubsurfaceScattering.xyz*primitive.SubsurfaceWeight,
                     constants,
                     diffuseLight,
                     specularLight);
             }
+            if (constants.SkyDiffuseIntensity > 0 && constants.SkyDiffuseTexture < constants.TextureCount)
+                diffuseLight += GpuSampleSky(surfaceNormal,constants.SkyDiffuseTexture,constants.TextureCount,
+                    textureDescriptors,textureTexels)*constants.SkyDiffuseIntensity;
+            const uint atlas = front || constants.BackLightmap >= constants.TextureCount ?
+                constants.FrontLightmap : constants.BackLightmap;
+            if (primitive.ReceivesLightmap && atlas < constants.TextureCount)
+                diffuseLight += GpuSampleTexture(atlas,uv.zw,2,gradients,constants.TextureCount,
+                    false,textureDescriptors,textureTexels).rgb*constants.DisplayParameters.w;
             color.rgb =
                 color.rgb *
                     (constants.AmbientColor.rgb *
@@ -856,10 +847,7 @@ kernel void EvansMetalRasterMain(
                 primitive.EmissiveColor.rgb;
         }
 
-        color.rgb = max(color.rgb, 0.0f);
-        color.rgb /= max(
-            1.0f,
-            max(color.r, max(color.g, color.b)));
+        color.rgb = GpuDisplayColor(color.rgb,constants.ACESColor,constants.DisplayParameters);
         bestDepth = depth;
         bestColor = float4(saturate(color.rgb), saturate(color.a));
     }
@@ -871,8 +859,36 @@ kernel void EvansMetalRasterMain(
         bestColor = constants.WireframeColor;
         bestDepth = min(bestDepth, bestWireDepth);
     }
+    if (bestDepth > 1.0f && constants.FillModeValue != 1 && constants.SkyIntensity > 0 && constants.SkyTexture < constants.TextureCount) {
+        const float3 ray = GpuSkyRay(x+0.5f,y+0.5f,constants.Width,constants.Height,constants.View[0].xyz,
+            constants.View[1].xyz,constants.View[2].xyz,constants.Projection[0].x,constants.Projection[1].y);
+        const auto color = GpuDisplayColor(GpuSampleSky(ray,constants.SkyTexture,constants.TextureCount,
+            textureDescriptors,textureTexels)*constants.SkyIntensity,constants.ACESColor,constants.DisplayParameters);
+        bestColor = float4(color,1);
+    }
     outputColors[pixel] = bestColor;
-    outputDepths[pixel] = bestDepth;
+    outputDepths[pixel] = (constants.OutlineEnabled&2u)!=0 ? (selected?-visibilityDepth-1:visibilityDepth) : bestDepth;
+}
+kernel void EvansMetalPresent(device const float4* colors [[buffer(0)]],
+    device const float* depths [[buffer(1)]],constant RasterConstants& frame [[buffer(2)]],
+    texture2d<float,access::write> output [[texture(0)]],uint2 id [[thread_position_in_grid]])
+{
+    if(id.x>=frame.Width || id.y>=frame.Height)return;
+    uint pixel=id.y*frame.Width+id.x;float4 color=colors[pixel];
+    if((frame.OutlineEnabled&1u)!=0 && depths[pixel]>=0)
+    {
+        int radius=max(1,int(ceil(frame.OutlineWidth)));float selected=1e30f;
+        for(int y=-radius;y<=radius;++y)for(int x=-radius;x<=radius;++x)
+        {
+            int2 p=int2(id)+int2(x,y);
+            if(x*x+y*y>radius*radius || any(p<0) || p.x>=int(frame.Width) || p.y>=int(frame.Height))continue;
+            float depth=depths[p.y*frame.Width+p.x];if(depth<0)selected=min(selected,-depth-1);
+        }
+        if(selected<1e29f && selected<=depths[pixel]+0.002f)color=frame.OutlineColor;
+    }
+    color=saturate(color);
+    color.rgb=select(1.055f*pow(color.rgb,float3(1.0f/2.4f))-0.055f,color.rgb*12.92f,color.rgb<=0.0031308f);
+    output.write(color,id);
 }
 )MSL";
 
@@ -972,9 +988,7 @@ public:
         NSString* source =
             [NSString stringWithUTF8String:MetalRasterShaderSource];
         id<MTLLibrary> library =
-            [Device newLibraryWithSource:source
-                                options:nil
-                                  error:&compileError];
+            Evans::Renderer::CompileCachedMetalLibrary(Device,source,nil,&compileError);
         if (library == nil)
         {
             error = ErrorDescription(
@@ -1000,16 +1014,18 @@ public:
 
         NSError* shadowError = nil;
         ShadowPipeline =
-            [Device newComputePipelineStateWithFunction:shadowFunction
-                                                   error:&shadowError];
+            Evans::Renderer::CreateCachedMetalComputePipeline(Device,shadowFunction,&shadowError);
         NSError* rasterError = nil;
         RasterPipeline =
-            [Device newComputePipelineStateWithFunction:rasterFunction
-                                                   error:&rasterError];
+            Evans::Renderer::CreateCachedMetalComputePipeline(Device,rasterFunction,&rasterError);
         ReleaseObject(rasterFunction);
         ReleaseObject(shadowFunction);
+        id<MTLFunction> presentFunction=[library newFunctionWithName:@"EvansMetalPresent"];
+        NSError* presentError=nil;
+        if(presentFunction)PresentPipeline=Evans::Renderer::CreateCachedMetalComputePipeline(Device,presentFunction,&presentError);
+        ReleaseObject(presentFunction);
         ReleaseObject(library);
-        if (ShadowPipeline == nil || RasterPipeline == nil)
+        if (PresentPipeline==nil || ShadowPipeline == nil || RasterPipeline == nil)
         {
             error = ShadowPipeline == nil
                 ? ErrorDescription(
@@ -1028,6 +1044,8 @@ public:
 
     void ShutdownNative() noexcept
     {
+        GpuPool.clear();
+        ReleaseObject(PresentPipeline);
         ReleaseObject(RasterPipeline);
         ReleaseObject(ShadowPipeline);
         ReleaseObject(Queue);
@@ -1061,7 +1079,7 @@ public:
         std::size_t count,
         std::size_t stride,
         const void* data,
-        const char* label) const
+        const char* label, bool gpuOnly = false) const
     {
         if (stride == 0 ||
             count > std::numeric_limits<std::size_t>::max() / stride)
@@ -1084,13 +1102,13 @@ public:
                              options:MTLResourceStorageModeShared]
             : [Device
                   newBufferWithLength:static_cast<NSUInteger>(length)
-                              options:MTLResourceStorageModeShared];
+                              options:gpuOnly?MTLResourceStorageModePrivate:MTLResourceStorageModeShared];
         if (buffer == nil)
         {
             throw std::runtime_error(
                 std::string("Metal failed to allocate buffer: ") + label);
         }
-        if (data == nullptr)
+        if (data == nullptr && !gpuOnly)
         {
             std::memset([buffer contents], 0, length);
         }
@@ -1337,12 +1355,12 @@ public:
             pixelCount,
             sizeof(float) * 4U,
             nullptr,
-            "Evans Metal raster colors");
+            "Evans Metal raster colors", settings.GpuPresentation);
         buffers.OutputDepths = CreateBuffer(
             pixelCount,
             sizeof(float),
             nullptr,
-            "Evans Metal raster depths");
+            "Evans Metal raster depths", settings.GpuPresentation);
 
         if (Detail::IsGpuRasterCancelled(
                 externalCancellation,
@@ -1529,6 +1547,32 @@ public:
             return RasterStatus::Cancelled;
         }
 
+        std::uint64_t shadedPixels = 0;
+        if(settings.GpuPresentation)
+        {
+            GpuPool.erase(std::remove_if(GpuPool.begin(),GpuPool.end(),[&](const auto& item){return item.use_count()==1 && (item->Width!=target.Width() || item->Height!=target.Height());}),GpuPool.end());
+            std::shared_ptr<GpuSurface> surface;
+            for(auto& item:GpuPool)if(item.use_count()==1){surface=item;break;}
+            if(!surface)
+            {
+                surface=std::make_shared<GpuSurface>();surface->Width=target.Width();surface->Height=target.Height();
+                MTLTextureDescriptor* desc=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:target.Width() height:target.Height() mipmapped:NO];
+                desc.storageMode=MTLStorageModePrivate;desc.usage=MTLTextureUsageShaderWrite|MTLTextureUsageShaderRead;
+                surface->Texture=[Device newTextureWithDescriptor:desc];
+                if(!surface->Texture)throw std::runtime_error("Metal failed to allocate raster presentation texture");
+                GpuPool.push_back(surface);
+            }
+            id<MTLCommandBuffer> command=[Queue commandBuffer];id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];
+            [encoder setComputePipelineState:PresentPipeline];
+            [encoder setBuffer:buffers.OutputColors offset:0 atIndex:0];[encoder setBuffer:buffers.OutputDepths offset:0 atIndex:1];
+            [encoder setBytes:&constants length:sizeof(constants) atIndex:2];[encoder setTexture:surface->Texture atIndex:0];
+            [encoder dispatchThreads:MTLSizeMake(target.Width(),target.Height(),1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];[encoder endEncoding];
+            std::string error;if(!CommitAndWait(command,error))throw std::runtime_error(error);
+            target.GpuColor=std::make_shared<Renderer::GpuImage>();target.GpuColor->Backend=Renderer::RHIBackend::Metal;
+            target.GpuColor->NativeTexture=surface->Texture;target.GpuColor->Owner=surface;
+        }
+        else
+        {
         const float* colors =
             static_cast<const float*>([buffers.OutputColors contents]);
         const float* depths =
@@ -1539,7 +1583,6 @@ public:
                 "Metal raster output buffers are not CPU-visible");
         }
 
-        std::uint64_t shadedPixels = 0;
         for (std::size_t pixel = 0; pixel < pixelCount; ++pixel)
         {
             target.MutableColors()[pixel] = {
@@ -1558,6 +1601,7 @@ public:
 
         Detail::ApplyGpuSelectionOutline(mainScene, gpuSettings, target,
             externalCancellation, backendCancellation);
+        }
         if (Detail::IsGpuRasterCancelled(externalCancellation, backendCancellation))
             return RasterStatus::Cancelled;
 
@@ -1569,7 +1613,10 @@ public:
                 mainBins.TilesY +
             static_cast<std::uint64_t>(shadowBins.TilesX) *
                 shadowBins.TilesY;
-        statistics.WorkerThreads = 64;
+        statistics.WorkerThreads = 0;
+        statistics.ComputeGroups=std::uint64_t((target.Width()+7)/8)*((target.Height()+7)/8) +
+            (generateShadowMap?std::uint64_t((shadowWidth+7)/8)*((shadowHeight+7)/8):0);
+        statistics.ComputeInvocations=statistics.ComputeGroups*64;
         statistics.ExecutionPath =
             "Native Metal compute, 16x16 bins=" +
             std::to_string(mainBins.TilesX * mainBins.TilesY) +
@@ -1597,6 +1644,14 @@ public:
     std::string Error;
     std::string DeviceName;
     bool NativeAvailable = false;
+    struct GpuSurface
+    {
+        id<MTLTexture> Texture=nil;
+        std::uint32_t Width=0,Height=0;
+        ~GpuSurface(){ReleaseObject(Texture);}
+    };
+    std::vector<std::shared_ptr<GpuSurface>> GpuPool;
+    id<MTLComputePipelineState> PresentPipeline = nil;
     id<MTLDevice> Device = nil;
     id<MTLCommandQueue> Queue = nil;
     id<MTLComputePipelineState> ShadowPipeline = nil;

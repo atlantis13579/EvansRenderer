@@ -43,6 +43,8 @@ inline unsigned int imguiRGBA(unsigned char r, unsigned char g, unsigned char b,
 
 IMGUI_API void imguiBeginFrame(int mx, int my, unsigned char mbut, int scroll);
 IMGUI_API void imguiEndFrame();
+// Presenters report the actual atlas line height before building the UI queue.
+IMGUI_API void imguiSetFontHeight(int height);
 
 IMGUI_API bool imguiBeginScrollArea(const char* name, int x, int y, int w, int h, int* scroll);
 IMGUI_API void imguiEndScrollArea();
@@ -51,12 +53,22 @@ IMGUI_API void imguiIndent();
 IMGUI_API void imguiUnindent();
 IMGUI_API void imguiSeparator();
 IMGUI_API void imguiSeparatorLine();
+// Hidden branches keep their controls inert and consume no panel space.
+IMGUI_API void imguiPushVisibility(bool visible);
+IMGUI_API void imguiPopVisibility();
+IMGUI_API bool imguiSetHideDisabled(bool hide);
+
+IMGUI_API void imguiPushEnabled(bool enabled,const char* reason = nullptr);
+IMGUI_API void imguiPopEnabled();
+IMGUI_API bool imguiIsEnabled();
+IMGUI_API void imguiTooltip(const char* reason);
+IMGUI_API void imguiSetDisabledReason(const char* reason);
 
 IMGUI_API bool imguiButton(const char* text, bool enabled = true);
 IMGUI_API bool imguiItem(const char* text, bool enabled = true);
 IMGUI_API bool imguiCheck(const char* text, bool checked, bool enabled = true);
 IMGUI_API bool imguiCollapse(const char* text, const char* subtext, bool checked, bool enabled = true);
-IMGUI_API bool imguiCombo(const char* text, int* selected, const char** items, int itemCount, bool enabled = true);
+IMGUI_API bool imguiCombo(const char* text, int* selected, const char** items, int itemCount, bool enabled = true, const char* const* reasons = nullptr, bool leftAligned = false);
 IMGUI_API void imguiLabel(const char* text);
 IMGUI_API void imguiValue(const char* text);
 IMGUI_API bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vinc, bool enabled = true);

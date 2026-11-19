@@ -1,12 +1,20 @@
 #pragma once
+#include "Techniques/RenderBuffer.h"
+
+#include "Techniques/TechniqueCatalog.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+namespace Evans::Renderer { struct GpuImage; struct EnvironmentRadiance; struct DensityVolume; }
+
 namespace Evans::Editor
 {
+struct BigWorldState;
 
 struct Float2
 {
@@ -101,6 +109,13 @@ struct Material
     std::shared_ptr<const ImageAsset> DiffuseImage;
     std::shared_ptr<const ImageAsset> NormalImage;
     std::shared_ptr<const ImageAsset> OpacityImage;
+    // Per-material diffusion coverage; zero leaves ordinary surfaces unchanged.
+    float SubsurfaceWeight = 0;
+    bool Refractive = false;
+    std::optional<float> Roughness, Metallic;
+    float DielectricReflectance=0.04f;
+    std::string MetallicRoughnessTexture;
+    std::shared_ptr<const ImageAsset> MetallicRoughnessImage;
 };
 
 using SceneNodeId = std::uint64_t;
@@ -113,6 +128,8 @@ struct SceneNode
     std::shared_ptr<const MeshAsset> Mesh;
     bool Visible = true;
     bool Selectable = true;
+    // A node can reuse immutable geometry with a distinct material.
+    std::string MaterialOverride;
 };
 
 struct Camera
@@ -139,13 +156,21 @@ struct Light
     float Intensity = 1.0f;
     Float2 AreaSize{1.0f, 1.0f};
     bool CastShadows = true;
+    // World-space radius per emitter sample; zero means unbounded.
+    float Range = 0.0f;
+    bool Enabled = true;
+    bool EditorOverride = false;
 };
 
 enum class DemoId
 {
     Triangle,
     UtahTeapot,
-    SponzaAtrium
+    SponzaAtrium,
+    StanfordDragon,
+    FurCube,
+    BigWorld,
+    DisneyCloud=BigWorld, // Legacy serialized demo identifier.
 };
 
 struct SceneSnapshot
@@ -153,12 +178,40 @@ struct SceneSnapshot
     DemoId Demo = DemoId::Triangle;
     // Geometry/material changes invalidate resident scene resources.
     std::uint64_t Revision = 0;
+    // Rigid animation changes transforms without rebuilding local-space meshes.
+    std::uint64_t TransformRevision = 0;
+    std::uint64_t DynamicRevision = 0;
+    // Light edits invalidate illumination while retaining resident geometry.
+    std::uint64_t LightingRevision = 0;
     // Camera changes invalidate only rendered pixels, not scene resources.
     std::uint64_t CameraRevision = 0;
+    // Scene sample time, independent of render-worker latency and frame rate.
+    double SampleTimeSeconds = 0.0;
     Camera SceneCamera;
     std::vector<Light> Lights;
     std::vector<Material> Materials;
+    // Swap the complete material library when the editor changes shading models.
+    std::vector<Material> AlternateMaterials;
+    bool UsingPbrMaterials = false;
+    bool UsingDefaultPbrReflection = false;
     std::vector<SceneNode> Nodes;
+    std::filesystem::path BakedLightingDirectory;
+    std::shared_ptr<const Renderer::EnvironmentRadiance> Environment;
+    void UsePbrMaterials(bool enabled)
+    {
+        if (enabled == UsingPbrMaterials || AlternateMaterials.empty()) return;
+        Materials.swap(AlternateMaterials);
+        UsingPbrMaterials = enabled;
+        ++Revision;
+    }
+    [[nodiscard]] std::filesystem::path ActiveBakedLightingDirectory() const
+    {
+        return UsingPbrMaterials && !BakedLightingDirectory.empty() ? BakedLightingDirectory / "PBR" : BakedLightingDirectory;
+    }
+    std::shared_ptr<const Renderer::DensityVolume> Volume;
+    std::shared_ptr<const BigWorldState> World;
+    // Source geometry at scene entry, shared by all subsequent frame snapshots.
+    std::uint64_t TriangleCountAtLoad = 0;
 };
 
 enum class FillMode
@@ -173,10 +226,15 @@ struct ViewportSettings
     std::uint32_t Width = 1280;
     std::uint32_t Height = 720;
     FillMode Mode = FillMode::Solid;
+    Techniques::RenderBuffer Buffer=Techniques::RenderBuffer::Color;
     bool ShadowsEnabled = true;
     bool OutlineEnabled = true;
+    bool ShowLights = false;
+    bool ContinuousRendering = false;
+    bool GpuPresentation = false;
     SceneNodeId SelectedNode = 0;
     float TeapotRotationDegreesPerSecond = 30.0f;
+    Evans::Techniques::Settings Techniques;
 };
 
 struct Image
@@ -185,11 +243,14 @@ struct Image
     std::uint32_t Height = 0;
     // Top-left RGBA8 with display-sRGB RGB and straight linear alpha.
     std::vector<std::uint8_t> PixelsRGBA8;
+    std::shared_ptr<const Image> Overlay;
+    std::shared_ptr<const Renderer::GpuImage> GpuColor;
+    std::shared_ptr<const Renderer::GpuImage> GpuContext;
 
     [[nodiscard]] bool IsValid() const noexcept
     {
         return Width > 0 && Height > 0 &&
-               PixelsRGBA8.size() == static_cast<std::size_t>(Width) * Height * 4U;
+               (GpuColor || PixelsRGBA8.size() == static_cast<std::size_t>(Width) * Height * 4U);
     }
 };
 

@@ -47,6 +47,7 @@ public:
     [[nodiscard]] static std::string ReadTextFile(const std::filesystem::path& path);
     [[nodiscard]] static std::shared_ptr<const ImageAsset> LoadImage(
         const std::filesystem::path& path);
+    [[nodiscard]] static std::vector<Material> LoadMaterialLibrary(const std::filesystem::path& path);
     [[nodiscard]] static LoadedModel LoadObj(const std::filesystem::path& path);
 };
 

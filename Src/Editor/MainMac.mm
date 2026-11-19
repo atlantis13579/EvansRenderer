@@ -3,6 +3,7 @@
 #include "Editor/EditorPresenter.h"
 #include "Editor/Imgui.h"
 #include "Editor/ModuleAdapters.h"
+#include "Editor/TechniqueControls.h"
 
 #if defined(__APPLE__)
 
@@ -31,7 +32,7 @@ using Evans::Editor::Rect;
 
 constexpr int EditorPanelX = 10;
 constexpr int EditorPanelY = 10;
-constexpr int EditorPanelWidth = 250;
+constexpr int EditorPanelWidth = 360;
 constexpr int EditorPanelGap = 10;
 constexpr int EditorViewportMargin = 10;
 constexpr int InitialWidth = 1280;
@@ -90,7 +91,6 @@ NSString* StringFromUtf8(const std::string& text)
 @private
     std::unique_ptr<EditorCore> Editor_;
     std::unique_ptr<IEditorPresenter> Presenter_;
-    NSTimer* FrameTimer_;
     std::chrono::steady_clock::time_point LastTick_;
     std::string PresentationError_;
     int ClientWidth_;
@@ -102,6 +102,7 @@ NSString* StringFromUtf8(const std::string& text)
     double WheelRemainder_;
     unsigned char MouseButtons_;
     BOOL CameraRotateCapture_;
+    BOOL LightDragCapture_;
     BOOL Running_;
 }
 
@@ -123,7 +124,6 @@ NSString* StringFromUtf8(const std::string& text)
     self = [super initWithFrame:frameRect];
     if (self != nil)
     {
-        FrameTimer_ = nil;
         LastTick_ = std::chrono::steady_clock::now();
         ClientWidth_ = std::max(1, static_cast<int>(std::lround(NSWidth(frameRect))));
         ClientHeight_ = std::max(1, static_cast<int>(std::lround(NSHeight(frameRect))));
@@ -134,6 +134,7 @@ NSString* StringFromUtf8(const std::string& text)
         WheelRemainder_ = 0.0;
         MouseButtons_ = 0;
         CameraRotateCapture_ = NO;
+    LightDragCapture_=NO;
         Running_ = NO;
     }
     return self;
@@ -224,13 +225,9 @@ NSString* StringFromUtf8(const std::string& text)
         LastTick_ = std::chrono::steady_clock::now();
         Running_ = YES;
 
-        FrameTimer_ = [[NSTimer alloc]
-            initWithTimeInterval:1.0 / 60.0
-            target:self
-            selector:@selector(frameTimer:)
-            userInfo:nil
-            repeats:YES];
-        [[NSRunLoop mainRunLoop] addTimer:FrameTimer_ forMode:NSRunLoopCommonModes];
+        Editor_->SetContinuousRendering(true);
+        Editor_->SetGpuPresentation(true);
+        [self performSelector:@selector(frameTimer:) withObject:nil afterDelay:0.0 inModes:@[NSRunLoopCommonModes]];
         return YES;
     }
     catch (const std::exception& exception)
@@ -253,12 +250,7 @@ NSString* StringFromUtf8(const std::string& text)
     {
         Editor_->ClearCameraInput();
     }
-    if (FrameTimer_ != nil)
-    {
-        [FrameTimer_ invalidate];
-        [FrameTimer_ release];
-        FrameTimer_ = nil;
-    }
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(frameTimer:) object:nil];
 
     if (Presenter_ != nullptr)
     {
@@ -318,7 +310,7 @@ NSString* StringFromUtf8(const std::string& text)
         backendLabels.push_back(backend.DisplayName.c_str());
     }
 
-    // Keep the backend selector as the first control in the Riemann panel.
+    // Keep the backend selector as the first control in the editor panel.
     imguiLabel("RHI Backend");
     int backendIndex = BackendSelectionIndex(backends, Editor_->SelectedBackend());
     if (!backendLabels.empty() && imguiCombo(
@@ -350,36 +342,9 @@ NSString* StringFromUtf8(const std::string& text)
         Editor_->SelectDemo(demos[static_cast<std::size_t>(demoIndex)].Id);
     }
 
-    imguiSeparatorLine();
-    imguiLabel("Fill Mode");
-    constexpr const char* fillLabels[] = {
-        "Solid",
-        "Wireframe",
-        "Solid + Wireframe"};
-    for (int modeIndex = 0; modeIndex < 3; ++modeIndex)
-    {
-        const FillMode mode = static_cast<FillMode>(modeIndex);
-        if (imguiCheck(
-                fillLabels[modeIndex],
-                Editor_->Settings().Mode == mode,
-                true) &&
-            Editor_->Settings().Mode != mode)
-        {
-            Editor_->SetFillMode(mode);
-        }
-    }
-
-    imguiLabel("Features");
-    if (imguiCheck("Shadow Map", Editor_->Settings().ShadowsEnabled, true))
-    {
-        Editor_->SetShadowsEnabled(!Editor_->Settings().ShadowsEnabled);
-    }
-    if (imguiCheck("Selection Outline", Editor_->Settings().OutlineEnabled, true))
-    {
-        Editor_->SetOutlineEnabled(!Editor_->Settings().OutlineEnabled);
-    }
-
-
+    Evans::Editor::DrawRenderModeControls(*Editor_);
+    Evans::Editor::DrawRenderBufferControls(*Editor_);
+    Evans::Editor::DrawTechniqueControls(*Editor_);
 
     imguiSeparatorLine();
     imguiLabel("Status");
@@ -434,6 +399,7 @@ NSString* StringFromUtf8(const std::string& text)
         MouseWheel_);
     MouseWheel_ = 0;
     [self drawEditorImgui];
+    Evans::Editor::DrawViewportStatus(*Editor_,viewport,ClientHeight_);
     imguiEndFrame();
     Presenter_->DrawImgui();
     if (!Presenter_->EndFrame())
@@ -465,6 +431,7 @@ NSString* StringFromUtf8(const std::string& text)
     Editor_->Tick(deltaSeconds);
     [self renderNow];
     [framePool drain];
+    if (Running_) [self performSelector:@selector(frameTimer:) withObject:nil afterDelay:0.0 inModes:@[NSRunLoopCommonModes]];
 }
 
 - (void)updateMouseFromEvent:(NSEvent*)event
@@ -483,11 +450,14 @@ NSString* StringFromUtf8(const std::string& text)
 - (void)mouseMoved:(NSEvent*)event
 {
     [self updateMouseFromEvent:event];
+    if (Editor_ != nullptr) Editor_->HandleDemoPointer(float(MouseX_),float(MouseY_),
+        EditorViewportBounds(ClientWidth_,ClientHeight_).Contains(float(MouseX_),float(MouseY_)));
 }
 
 - (void)mouseDragged:(NSEvent*)event
 {
-    [self updateMouseFromEvent:event];
+    [self mouseMoved:event];
+    if (Editor_ && LightDragCapture_) Editor_->HandleLightPointer(float(MouseX_),float(MouseY_),EditorViewportBounds(ClientWidth_,ClientHeight_),true);
 }
 
 - (void)rightMouseDragged:(NSEvent*)event
@@ -509,7 +479,8 @@ NSString* StringFromUtf8(const std::string& text)
     if (Editor_ != nullptr)
     {
         const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
-        Editor_->HandleViewportPointer(
+        LightDragCapture_=Editor_->HandleLightPointer(float(MouseX_),float(MouseY_),viewport,true);
+        if (!LightDragCapture_) Editor_->HandleViewportPointer(
             static_cast<float>(MouseX_),
             static_cast<float>(MouseY_),
             viewport);
@@ -520,6 +491,8 @@ NSString* StringFromUtf8(const std::string& text)
 - (void)mouseUp:(NSEvent*)event
 {
     [self updateMouseFromEvent:event];
+    if (Editor_) Editor_->HandleLightPointer(float(MouseX_),float(MouseY_),EditorViewportBounds(ClientWidth_,ClientHeight_),false);
+    LightDragCapture_=NO;
     MouseButtons_ &= static_cast<unsigned char>(~IMGUI_MBUT_LEFT);
     [self renderNow];
 }
@@ -548,6 +521,7 @@ NSString* StringFromUtf8(const std::string& text)
     [self updateMouseFromEvent:event];
     MouseButtons_ &= static_cast<unsigned char>(~IMGUI_MBUT_RIGHT);
     CameraRotateCapture_ = NO;
+    LightDragCapture_=NO;
     if (Editor_ != nullptr)
     {
         Editor_->HandleCameraPointer(
@@ -607,6 +581,7 @@ NSString* StringFromUtf8(const std::string& text)
 - (BOOL)resignFirstResponder
 {
     CameraRotateCapture_ = NO;
+    LightDragCapture_=NO;
     MouseButtons_ &= static_cast<unsigned char>(~IMGUI_MBUT_RIGHT);
     if (Editor_ != nullptr)
     {

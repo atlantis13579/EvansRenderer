@@ -614,10 +614,10 @@ namespace Evans::Renderer
 					!ExpectIdentifier(
 						"an HLSL entry point",
 						stage.HLSL) ||
-					!ExpectKeyword("spirv") ||
+					!ExpectKeyword("vulkan_glsl") ||
 					!ExpectIdentifier(
-						"a SPIR-V entry point",
-						stage.SPIRV) ||
+						"a Vulkan GLSL entry point",
+						stage.VulkanGLSL) ||
 					!ExpectKeyword("glsl_es") ||
 					!ExpectIdentifier(
 						"a GLSL ES entry point",
@@ -952,8 +952,8 @@ namespace Evans::Renderer
 			return GLSLES;
 		case RealtimeShaderLanguage::Metal:
 			return Metal;
-		case RealtimeShaderLanguage::SPIRV:
-			return SPIRV;
+		case RealtimeShaderLanguage::VulkanGLSL:
+			return VulkanGLSL;
 		}
 		return HLSL;
 	}
@@ -1016,17 +1016,17 @@ namespace Evans::Renderer
 shader EvansRealtime {
     version 1;
 
-    constant_buffer DrawConstants binding 0 vulkan_binding 0 size 672;
+    constant_buffer DrawConstants binding 0 vulkan_binding 0 size 688;
     resource depth_texture ShadowMap binding 0 vulkan_binding 1 colorspace linear;
     resource texture DiffuseMap binding 1 vulkan_binding 2 colorspace srgb;
     resource texture NormalMap binding 2 vulkan_binding 3 colorspace linear;
     resource texture OpacityMap binding 3 vulkan_binding 4 colorspace linear;
     sampler SurfaceSampler binding 0 vulkan_binding 5 filter linear address repeat;
 
-    stage vertex hlsl VSMain spirv VSMain glsl_es main metal EvansVertexMain;
-    stage fragment hlsl PSMain spirv PSMain glsl_es main metal EvansFragmentMain;
-    stage shadow hlsl PSShadow spirv PSShadow glsl_es main metal EvansShadowFragment;
-    stage outline hlsl PSOutline spirv PSOutline glsl_es main metal EvansFragmentMain;
+    stage vertex hlsl VSMain vulkan_glsl main glsl_es main metal EvansVertexMain;
+    stage fragment hlsl PSMain vulkan_glsl main glsl_es main metal EvansFragmentMain;
+    stage shadow hlsl PSShadow vulkan_glsl main glsl_es main metal EvansShadowFragment;
+    stage outline hlsl PSOutline vulkan_glsl main glsl_es main metal EvansFragmentMain;
 
     option maximum_lights = 4;
     option shadow_kernel_radius = 1;

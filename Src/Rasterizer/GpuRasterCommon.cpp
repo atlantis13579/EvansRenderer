@@ -1,3 +1,4 @@
+#include "Techniques/LightRange.h"
 #include "Rasterizer/GpuRasterCommon.hpp"
 
 #include <algorithm>
@@ -40,6 +41,7 @@ void CopyLight(GpuRasterLight& destination, const RasterLight& source) noexcept
     destination.ColorCastShadows[3] = source.CastShadows ? 1.0f : 0.0f;
     destination.AreaSizePadding[0] = source.AreaSize.X;
     destination.AreaSizePadding[1] = source.AreaSize.Y;
+    destination.AreaSizePadding[2] = Techniques::CanonicalLightRange(source.Range);
 }
 
 [[nodiscard]] Float4 TransformForBinning(
@@ -78,6 +80,7 @@ void CopyLight(GpuRasterLight& destination, const RasterLight& source) noexcept
             continue;
         }
         texelCount += static_cast<std::uint64_t>(texture.Width) * texture.Height;
+        if (texture.MipPixelsRGBA8) texelCount += texture.MipPixelsRGBA8->size() / 4;
         if (texelCount > std::numeric_limits<std::uint32_t>::max())
         {
             throw std::overflow_error("GPU raster texture atlas is too large");
@@ -148,6 +151,8 @@ std::vector<GpuRasterTriangle> BuildGpuRasterTriangles(
                 gpuVertex.ShadowClip);
             gpuVertex.TexCoord[0] = vertex.TexCoord.X;
             gpuVertex.TexCoord[1] = vertex.TexCoord.Y;
+            gpuVertex.TexCoord[2] = vertex.LightmapUV.X;
+            gpuVertex.TexCoord[3] = vertex.LightmapUV.Y;
         }
         CopyColor(destination.BaseColor, source.Material.BaseColor);
         CopyColor(destination.SpecularColor, source.Material.SpecularColor);
@@ -159,6 +164,9 @@ std::vector<GpuRasterTriangle> BuildGpuRasterTriangles(
         destination.OpacityTextureIndex =
             source.Material.OpacityTextureIndex;
         destination.Selected = source.Selected ? 1U : 0U;
+        destination.NormalTextureIndex = source.Material.NormalTextureIndex;
+        destination.SubsurfaceWeight = source.Material.SubsurfaceWeight;
+        destination.ReceivesLightmap = source.Material.ReceivesLightmap ? 1U : 0U;
     }
     return result;
 }
@@ -170,35 +178,57 @@ GpuRasterTextureData BuildGpuRasterTextures(const RasterScene& scene)
     result.Descriptors.resize(scene.Textures.size());
     result.TexelsRGBA8.reserve(texelCount);
 
-    for (std::size_t textureIndex = 0;
-         textureIndex < scene.Textures.size();
-         ++textureIndex)
-    {
-        const RasterTexture& texture = scene.Textures[textureIndex];
-        if (!texture.IsValid())
+    auto pack = [&](GpuRasterTexture& descriptor, const std::vector<std::uint8_t>& bytes,
+                    std::size_t offset, std::uint32_t width, std::uint32_t height) {
+        const std::size_t texels = std::size_t(width) * height;
+        if (offset > bytes.size() || texels > (bytes.size() - offset) / 4)
+            throw std::invalid_argument("GPU raster texture mip data is incomplete");
+        if (texels > std::numeric_limits<std::uint32_t>::max() ||
+            result.TexelsRGBA8.size() > std::numeric_limits<std::uint32_t>::max() - texels)
+            throw std::overflow_error("GPU raster texture atlas exceeds 32-bit indexing");
+        descriptor = {static_cast<std::uint32_t>(result.TexelsRGBA8.size()), width, height, 0};
+        for (std::size_t texel = 0; texel < texels; ++texel)
         {
-            continue;
+            const auto* rgba = bytes.data() + offset + texel * 4;
+            result.TexelsRGBA8.push_back(static_cast<std::uint32_t>(rgba[0]) |
+                (static_cast<std::uint32_t>(rgba[1]) << 8U) | (static_cast<std::uint32_t>(rgba[2]) << 16U) |
+                (static_cast<std::uint32_t>(rgba[3]) << 24U));
         }
-
-        GpuRasterTexture& descriptor = result.Descriptors[textureIndex];
-        descriptor.OffsetTexels =
-            static_cast<std::uint32_t>(result.TexelsRGBA8.size());
-        descriptor.Width = texture.Width;
-        descriptor.Height = texture.Height;
-        const std::vector<std::uint8_t>& source = *texture.PixelsRGBA8;
-        const std::size_t sourceTexelCount =
-            static_cast<std::size_t>(texture.Width) * texture.Height;
-        for (std::size_t texel = 0; texel < sourceTexelCount; ++texel)
+    };
+    for (std::size_t index = 0; index < scene.Textures.size(); ++index)
+    {
+        const auto& texture = scene.Textures[index];
+        if (!texture.IsValid()) continue;
+        pack(result.Descriptors[index], *texture.PixelsRGBA8, 0, texture.Width, texture.Height);
+        if (!texture.MipPixelsRGBA8 || (texture.Width == 1 && texture.Height == 1)) continue;
+        result.Descriptors[index].FirstMip = static_cast<std::uint32_t>(result.Descriptors.size());
+        std::uint32_t width = texture.Width, height = texture.Height;
+        std::size_t offset = 0;
+        while (width > 1 || height > 1)
         {
-            const std::size_t byte = texel * 4U;
-            result.TexelsRGBA8.push_back(
-                static_cast<std::uint32_t>(source[byte]) |
-                (static_cast<std::uint32_t>(source[byte + 1U]) << 8U) |
-                (static_cast<std::uint32_t>(source[byte + 2U]) << 16U) |
-                (static_cast<std::uint32_t>(source[byte + 3U]) << 24U));
+            width = std::max(1U, width / 2);
+            height = std::max(1U, height / 2);
+            result.Descriptors.emplace_back();
+            pack(result.Descriptors.back(), *texture.MipPixelsRGBA8, offset, width, height);
+            offset += std::size_t(width) * height * 4;
         }
     }
     return result;
+}
+
+const GpuRasterTextureData& GpuRasterTextureCache::Get(const RasterScene& scene)
+{
+    bool changed=Generation_==0 || Sources_.size()!=scene.Textures.size();
+    for(std::size_t i=0;!changed && i<Sources_.size();++i)
+        changed=Sources_[i].Width!=scene.Textures[i].Width || Sources_[i].Height!=scene.Textures[i].Height ||
+            Sources_[i].PixelsRGBA8!=scene.Textures[i].PixelsRGBA8 ||
+            Sources_[i].MipPixelsRGBA8!=scene.Textures[i].MipPixelsRGBA8;
+    if(changed)
+    {
+        auto data=BuildGpuRasterTextures(scene);
+        Sources_=scene.Textures;Data_=std::move(data);++Generation_;
+    }
+    return Data_;
 }
 
 GpuRasterConstants BuildGpuRasterConstants(
@@ -210,6 +240,23 @@ GpuRasterConstants BuildGpuRasterConstants(
     std::uint32_t shadowHeight)
 {
     GpuRasterConstants constants;
+    constants.MaterialOptions = (settings.TextureMapping ? 1U : 0U) |
+        (settings.NormalMapping ? 2U : 0U) | (settings.AlphaTesting ? 4U : 0U) |
+        (settings.AnisotropicFiltering ? 8U : 0U);
+    constants.FrontLightmap = settings.FrontLightmap;
+    constants.BackLightmap = settings.BackLightmap;
+    constants.ACESColor = settings.ACESColor ? 1U : 0U;
+    constants.DisplayParameters[0] = settings.Exposure;
+    constants.DisplayParameters[1] = settings.Contrast;
+    constants.DisplayParameters[2] = settings.Saturation;
+    constants.DisplayParameters[3] = settings.LightmapIntensity;
+    constants.SkyTexture = settings.SkyTexture;
+    constants.SkyDiffuseTexture = settings.SkyDiffuseTexture;
+    constants.SkyIntensity = settings.SkyIntensity;
+    constants.SkyDiffuseIntensity = settings.SkyDiffuseIntensity;
+    constants.SubsurfaceScattering[0] = settings.SubsurfaceScattering.X;
+    constants.SubsurfaceScattering[1] = settings.SubsurfaceScattering.Y;
+    constants.SubsurfaceScattering[2] = settings.SubsurfaceScattering.Z;
     CopyMatrix(constants.World, settings.World);
     CopyMatrix(constants.View, settings.View);
     CopyMatrix(constants.Projection, settings.Projection);
@@ -225,7 +272,7 @@ GpuRasterConstants BuildGpuRasterConstants(
     constants.BackFaceCulling = settings.BackFaceCulling ? 1U : 0U;
     constants.FrontFaceCounterClockwise =
         settings.FrontFaceCounterClockwise ? 1U : 0U;
-    constants.OutlineEnabled = settings.OutlineEnabled ? 1U : 0U;
+    constants.OutlineEnabled = (settings.OutlineEnabled ? 1U : 0U) | (settings.GpuPresentation && settings.OutlineEnabled ? 2U : 0U);
     constants.ShadowsEnabled = shadowsEnabled ? 1U : 0U;
     constants.ShadowWidth = shadowWidth;
     constants.ShadowHeight = shadowHeight;
@@ -234,6 +281,7 @@ GpuRasterConstants BuildGpuRasterConstants(
     constants.OutlineWidth = settings.OutlineWidth;
     constants.ShadowBias = settings.ShadowBias;
     constants.ShadowRasterBias[0] = std::max(settings.ShadowSlopeScaledBias, 0.0f);
+    constants.ShadowRasterBias[2] = std::max(settings.ShadowReceiverSlopeBias, 0.0f);
     constants.ShadowStrength = settings.ShadowStrength;
     constants.DepthTest = settings.DepthTest ? 1U : 0U;
     constants.ShadowPCFRadius = settings.ShadowPCFRadius;
@@ -264,6 +312,9 @@ GpuRasterConstants BuildGpuRasterConstants(
         CopyLight(constants.Lights[index], EffectiveRasterLight(settings, index));
     }
     constants.TextureCount = static_cast<std::uint32_t>(scene.Textures.size());
+    for (const auto& texture : scene.Textures)
+        if (texture.IsValid() && texture.MipPixelsRGBA8)
+            for (auto extent = std::max(texture.Width, texture.Height); extent > 1; extent /= 2) ++constants.TextureCount;
     constants.TextureTexelCount = TextureTexelCount(scene);
     return constants;
 }

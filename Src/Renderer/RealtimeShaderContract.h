@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Renderer/Types.h"
+#include "Techniques/LightRange.h"
 
 #include <algorithm>
 #include <array>
@@ -29,8 +30,17 @@ namespace Evans::Renderer
 		Float4 PositionType;
 		Float4 DirectionIntensity;
 		Float4 ColorCastShadows;
-		Float4 AreaSizePadding;
+		Float4 AreaSizePadding; // XY: emitter size, Z: range, W: physical sample grid width (zero = legacy).
 	};
+
+	inline ShaderLight BuildShaderLight(const SceneLight& light) noexcept
+	{
+		return {
+			{light.Position.X, light.Position.Y, light.Position.Z, static_cast<float>(light.Type)},
+			{light.Direction.X, light.Direction.Y, light.Direction.Z, light.Intensity},
+			{light.Color.X, light.Color.Y, light.Color.Z, light.CastShadows ? 1.0f : 0.0f},
+			{light.AreaSize.X, light.AreaSize.Y, Techniques::CanonicalLightRange(light.Range), static_cast<float>(light.AreaSampleAxisCount)}};
+	}
 
 	struct RealtimeDrawConstants
 	{
@@ -44,11 +54,16 @@ namespace Evans::Renderer
 		Float4 MaterialSpecularColor;
 		Float4 MaterialEmissiveColor;
 		Float4 MaterialParameters;
+        // W carries outline width for extrusion, otherwise diffusion coverage.
+        // Deferred stores coverage in emission alpha, preserving emission RGB.
 		Float4 AmbientColorStrength;
 		Float4 CameraLightCount;
 		Float4 RenderParameters;
 		ShaderUInt4 TextureFlags;
 		std::array<ShaderLight, MaximumSceneLights> Lights;
+		// Roughness, metallic, toon bands, and active attachment's HDR output flag.
+		// The attachment owns W; custom RGBA8 passes retain display preparation.
+		Float4 ShadingParameters;
 	};
 
 	static_assert(sizeof(Vertex) == 48,
@@ -64,7 +79,9 @@ namespace Evans::Renderer
 		&& offsetof(RealtimeDrawConstants, TextureFlags) == 400
 		&& offsetof(RealtimeDrawConstants, Lights) == 416,
 		"The realtime draw constants must preserve the shader packing contract");
-	static_assert(sizeof(RealtimeDrawConstants) == 672,
+	static_assert(offsetof(RealtimeDrawConstants, ShadingParameters) == 672,
+		"Surface parameters follow the fixed light array");
+	static_assert(sizeof(RealtimeDrawConstants) == 688,
 		"The realtime draw constants must match the shader contract");
 
 	inline Matrix4 BuildRealtimeNormalMatrix(const Matrix4& world)
@@ -106,6 +123,16 @@ namespace Evans::Renderer
 		return result;
 	}
 
+	inline bool RealtimeWorldIsMirrored(const Matrix4& world)
+	{
+		const auto& m = world.Values;
+		const float determinant =
+			m[0] * (m[5] * m[10] - m[6] * m[9]) -
+			m[1] * (m[4] * m[10] - m[6] * m[8]) +
+			m[2] * (m[4] * m[9] - m[5] * m[8]);
+		return determinant < 0.0f;
+	}
+
 	inline RealtimeDrawConstants BuildRealtimeDrawConstants(
 		const PipelineState& pipeline,
 		const Matrix4& world,
@@ -115,7 +142,8 @@ namespace Evans::Renderer
 		bool shadowAvailable,
 		bool diffuseAvailable,
 		bool normalAvailable,
-		bool opacityAvailable)
+		bool opacityAvailable,
+		bool hdrSceneOutput = false)
 	{
 		RealtimeDrawConstants constants {};
 		constants.World = world;
@@ -134,7 +162,8 @@ namespace Evans::Renderer
 			pipeline.MaterialShininess,
 			pipeline.MaterialOpacity,
 			pipeline.AlphaCutoff,
-			outlineThickness };
+			pipeline.OutlineExtrusion ? outlineThickness :
+                (std::isfinite(pipeline.SubsurfaceWeight) ? std::clamp(pipeline.SubsurfaceWeight,0.0f,1.0f) : 0.0f) };
 
 		const LightingState& lighting = pipeline.Lighting;
 		const std::uint32_t lightCount = std::min(
@@ -149,9 +178,10 @@ namespace Evans::Renderer
 			lighting.CameraPosition.Y,
 			lighting.CameraPosition.Z,
 			static_cast<float>(lightCount) };
+		// Overlay lies between hardware wireframe (1) and the outline threshold (1.5).
 		const float renderMode = pass == PassType::Outline || pipeline.OutlineExtrusion
 			? 2.0f
-			: (pipeline.Fill == FillMode::Wireframe ? 1.0f : 0.0f);
+			: (pipeline.WireframeOverlay ? 1.25f : pipeline.Fill == FillMode::Wireframe ? 1.0f : 0.0f);
 		constants.RenderParameters = {
 			shadowAvailable ? 1.0f : 0.0f,
 			renderMode,
@@ -160,34 +190,14 @@ namespace Evans::Renderer
 		constants.TextureFlags = {
 			diffuseAvailable ? 1u : 0u,
 			normalAvailable ? 1u : 0u,
-			opacityAvailable ? 1u : 0u,
-			0u };
+			opacityAvailable ? (pipeline.PackedMetallicRoughness ? 3u : 1u) : 0u,
+			static_cast<std::uint32_t>(pipeline.Shading) };
+		constants.ShadingParameters = {
+			pipeline.Roughness, pipeline.Metallic, pipeline.ToonBands, hdrSceneOutput ? 1.0f : 0.0f };
 
 		for (std::uint32_t lightIndex = 0; lightIndex < lightCount; ++lightIndex)
-		{
-			const SceneLight& light = lighting.Lights[lightIndex];
-			ShaderLight& gpuLight = constants.Lights[lightIndex];
-			gpuLight.PositionType = {
-				light.Position.X,
-				light.Position.Y,
-				light.Position.Z,
-				static_cast<float>(light.Type) };
-			gpuLight.DirectionIntensity = {
-				light.Direction.X,
-				light.Direction.Y,
-				light.Direction.Z,
-				light.Intensity };
-			gpuLight.ColorCastShadows = {
-				light.Color.X,
-				light.Color.Y,
-				light.Color.Z,
-				light.CastShadows ? 1.0f : 0.0f };
-			gpuLight.AreaSizePadding = {
-				light.AreaSize.X,
-				light.AreaSize.Y,
-				0.0f,
-				0.0f };
-		}
+			constants.Lights[lightIndex] = BuildShaderLight(lighting.Lights[lightIndex]);
+
 		return constants;
 	}
 }

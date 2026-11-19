@@ -1,10 +1,20 @@
 #include "Editor/ModuleAdapters.h"
+#include "Rasterizer/ParallelExecutor.h"
+#include "Maths/ColorSpace.h"
+#include "Editor/BigWorld.hpp"
+#include "Renderer/BakedLighting/BakedLightingAssets.h"
+#include "Renderer/MaterialTexture.h"
+#include "Renderer/Reflections/EnvironmentRadiance.h"
+#include <iostream>
 
 #include "Maths/EvansMaths.h"
 #include "Rasterizer/Rasterizer.hpp"
 #include "Rasterizer/SoftwareRasterCore.hpp"
-#include "Renderer/DxrRayTracingRHI.h"
+#include "Renderer/DX12/DxrRayTracingRHI.h"
 #include "Renderer/EvansRenderer.h"
+#include "Renderer/Lighting/SceneLightCollection.h"
+#include "Renderer/Geometry/MeshGeometry.h"
+#include "Renderer/Pipelines/SceneStorageBudget.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -92,13 +103,15 @@ constexpr float Pi = 3.14159265358979323846f;
     return result;
 }
 
-[[nodiscard]] Image ToEditorImage(const Renderer::FrameCapture& capture)
+[[nodiscard]] Image ToEditorImage(Renderer::FrameCapture& capture)
 {
     Image result;
-    if (!capture.HasColorOutput()) return result;
+    if (!capture.HasColorOutput() && !capture.GpuColor) return result;
     result.Width = capture.Width;
     result.Height = capture.Height;
-    result.PixelsRGBA8 = capture.ColorRGBA8;
+    result.PixelsRGBA8 = std::move(capture.ColorRGBA8);
+    result.GpuColor = std::move(capture.GpuColor);
+    result.GpuContext = std::move(capture.GpuContext);
     return result;
 }
 
@@ -115,9 +128,11 @@ constexpr float Pi = 3.14159265358979323846f;
 
 [[nodiscard]] const Material* MaterialForTriangle(
     const SceneSnapshot& scene,
-    const MeshAsset& mesh,
+    const SceneNode& node,
     std::size_t firstIndex)
 {
+    if (!node.MaterialOverride.empty()) return FindMaterial(scene,node.MaterialOverride);
+    const auto& mesh=*node.Mesh;
     for (const MeshSection& section : mesh.Sections)
     {
         const std::size_t begin = section.FirstIndex;
@@ -228,7 +243,7 @@ enum class SampleConversion
 }
 
 using RendererImageCache =
-    std::unordered_map<const ImageAsset*, std::shared_ptr<const Renderer::ImageData>>;
+    std::unordered_map<std::shared_ptr<const ImageAsset>, std::shared_ptr<const Renderer::ImageData>>;
 
 [[nodiscard]] std::shared_ptr<const Renderer::ImageData> ToRendererImage(
     const std::shared_ptr<const ImageAsset>& source,
@@ -239,7 +254,7 @@ using RendererImageCache =
     {
         return {};
     }
-    const auto found = cache.find(source.get());
+    const auto found = cache.find(source);
     if (found != cache.end())
     {
         return found->second;
@@ -264,7 +279,7 @@ using RendererImageCache =
             count,
             result->PixelsRGBA8.begin() + static_cast<std::ptrdiff_t>(offset));
     }
-    cache.emplace(source.get(), result);
+    cache.emplace(source, result);
     return result;
 }
 
@@ -298,10 +313,16 @@ using RendererImageCache =
     result.EmissiveColor = {
         source->Emissive.R, source->Emissive.G, source->Emissive.B, source->Emissive.A};
     result.Shininess = std::max(source->Shininess, 1.0f);
+    result.SubsurfaceWeight = source->SubsurfaceWeight;
+    result.Refractive = source->Refractive;
+    result.Roughness = source->Roughness;
+    result.Metallic = source->Metallic;
+    result.DielectricReflectance=source->DielectricReflectance;
     result.AlphaCutoff =
         source->OpacityImage && source->OpacityImage->IsValid() ? 0.5f : 0.0f;
     result.DiffuseImage = ToRendererImage(
         source->DiffuseImage, imageCache, cancellation);
+    result.MetallicRoughnessImage = ToRendererImage(source->MetallicRoughnessImage, imageCache, cancellation);
     result.NormalImage = ToRendererImage(
         source->NormalImage, imageCache, cancellation);
     result.OpacityImage = ToRendererImage(
@@ -377,20 +398,39 @@ struct ShadowFrame
     float SlopeScaledBias = 0.0f;
 };
 
+using MeshBoundsCache=std::unordered_map<std::shared_ptr<const MeshAsset>,Maths::AABB>;
+
 [[nodiscard]] ShadowFrame BuildShadowFrame(
     const SceneSnapshot& scene,
-    bool useRealtimeRendererDirection = false)
+    bool useRealtimeRendererDirection = false,MeshBoundsCache* cache=nullptr)
 {
     Maths::AABB bounds;
+    MeshBoundsCache active;
     for (const SceneNode& node : scene.Nodes)
     {
         if (!node.Visible || !node.Mesh) continue;
         const Maths::Transform transform = ToMath(node.LocalTransform);
+        if (cache)
+        {
+            auto [entry,inserted]=active.try_emplace(node.Mesh);
+            if (inserted)
+            {
+                const auto previous=cache->find(node.Mesh);
+                if (previous!=cache->end()) entry->second=previous->second;
+                else for (const auto& vertex:node.Mesh->Vertices) entry->second.Expand(ToMath(vertex.Position));
+            }
+            // Transform the eight corners once per instance, including rotated trees.
+            const auto& box=entry->second;
+            if (box.IsValid()) for (int i=0;i<8;++i)
+                bounds.Expand(transform.TransformPoint({(i&1)?box.Max.x:box.Min.x,(i&2)?box.Max.y:box.Min.y,(i&4)?box.Max.z:box.Min.z}));
+            continue;
+        }
         for (const Vertex& vertex : node.Mesh->Vertices)
         {
             bounds.Expand(transform.TransformPoint(ToMath(vertex.Position)));
         }
     }
+    if (cache) cache->swap(active);
     const auto lightIterator = std::find_if(
         scene.Lights.begin(),
         scene.Lights.end(),
@@ -521,12 +561,14 @@ struct ShadowFrame
 }
 
 using RasterTextureCache =
-    std::unordered_map<const ImageAsset*, std::uint32_t>;
+    std::unordered_map<const void*, std::uint32_t>;
 
+template<class Image>
 [[nodiscard]] std::uint32_t AddRasterTexture(
-    const std::shared_ptr<const ImageAsset>& source,
+    const std::shared_ptr<const Image>& source,
     Rasterizer::RasterScene& scene,
-    RasterTextureCache& cache)
+    RasterTextureCache& cache,
+    bool srgb = false)
 {
     if (!source || !source->IsValid())
     {
@@ -547,6 +589,7 @@ using RasterTextureCache =
     Rasterizer::RasterTexture texture;
     texture.Width = source->Width;
     texture.Height = source->Height;
+    texture.SRGB = srgb;
     // The aliasing shared pointer retains the ImageAsset while exposing its
     // immutable pixel vector directly to the synchronous raster backends.
     texture.PixelsRGBA8 =
@@ -567,7 +610,15 @@ struct RasterSceneBuild
     Rasterizer::RasterScene Scene;
     ShadowFrame Shadow;
     bool WasCancelled = false;
+    std::uint32_t FrontLightmap = Rasterizer::InvalidRasterTextureIndex;
+    std::uint32_t BackLightmap = Rasterizer::InvalidRasterTextureIndex;
+    std::string LightmapStatus;
+    std::uint32_t SkyTexture = Rasterizer::InvalidRasterTextureIndex;
+    std::uint32_t SkyDiffuseTexture = Rasterizer::InvalidRasterTextureIndex;
 };
+
+RasterSceneBuild BuildSponzaRasterScene(const SceneSnapshot&, const ViewportSettings&,
+    const CancellationToken&);
 
 [[nodiscard]] bool UpdateRasterProjection(
     Rasterizer::RasterScene& rasterScene,
@@ -605,12 +656,7 @@ struct RasterSceneBuild
     RasterSceneBuild result;
     result.Shadow = clipSpace ? ShadowFrame{} : BuildShadowFrame(scene);
 
-    std::size_t triangleCount = 0;
-    for (const SceneNode& node : scene.Nodes)
-    {
-        if (node.Visible && node.Mesh) triangleCount += node.Mesh->Indices.size() / 3;
-    }
-    result.Scene.Triangles.reserve(triangleCount);
+    result.Scene.Triangles.reserve(scene.TriangleCountAtLoad);
     RasterTextureCache textureCache;
 
     for (const SceneNode& node : scene.Nodes)
@@ -640,7 +686,7 @@ struct RasterSceneBuild
             {
                 continue;
             }
-            const Material* material = MaterialForTriangle(scene, mesh, firstIndex);
+            const Material* material = MaterialForTriangle(scene, node, firstIndex);
             Rasterizer::RasterTriangle triangle;
             triangle.Selected = settings.SelectedNode == node.Id;
             if (material != nullptr)
@@ -655,7 +701,10 @@ struct RasterSceneBuild
                 triangle.Material.DiffuseTextureIndex = AddRasterTexture(
                     material->DiffuseImage,
                     result.Scene,
-                    textureCache);
+                    textureCache, true);
+                triangle.Material.NormalTextureIndex = AddRasterTexture(
+                    material->NormalImage, result.Scene, textureCache);
+                triangle.Material.SubsurfaceWeight = material->SubsurfaceWeight;
                 triangle.Material.OpacityTextureIndex = AddRasterTexture(
                     material->OpacityImage,
                     result.Scene,
@@ -691,6 +740,7 @@ struct RasterSceneBuild
 
 struct RasterSceneCache
 {
+    Rasterizer::Detail::ParallelExecutor OutputWorkers;
     const RasterSceneBuild& Get(
         const RenderRequest& request,
         const CancellationToken& cancellation,
@@ -701,31 +751,62 @@ struct RasterSceneCache
         // Camera changes only reproject cached world-space vertices. Geometry,
         // materials, and textures survive camera, viewport, and effect changes.
         const bool rebuild = !Valid || Demo != scene.Demo || Revision != scene.Revision ||
+            TransformRevision != scene.TransformRevision ||
             ClipSpace != clipSpace || SelectedNode != settings.SelectedNode;
         const bool reproject = clipSpace && (CameraRevision != scene.CameraRevision ||
             Width != settings.Width || Height != settings.Height);
-        if (rebuild || reproject)
+        const bool lightmaps = !clipSpace && scene.Demo == DemoId::SponzaAtrium &&
+            Techniques::UsesLightmaps(settings.Techniques.GlobalIllumination);
+        if (rebuild || reproject || lightmaps != Lightmaps)
         {
             Valid = false;
-            if (rebuild)
-                Built = BuildRasterScene(scene, settings, cancellation, clipSpace);
+            if (rebuild || lightmaps != Lightmaps)
+            {
+                Built = std::make_shared<RasterSceneBuild>(!clipSpace && scene.Demo == DemoId::SponzaAtrium ?
+                    BuildSponzaRasterScene(scene, settings, cancellation) :
+                    BuildRasterScene(scene, settings, cancellation, clipSpace));
+                MaterialMips = false;
+            }
             else
-                Built.WasCancelled = !UpdateRasterProjection(Built.Scene, scene, settings, cancellation);
-            if (!Built.WasCancelled && !cancellation.IsCancellationRequested())
+                Built->WasCancelled = !UpdateRasterProjection(Built->Scene, scene, settings, cancellation);
+            if (!Built->WasCancelled && !cancellation.IsCancellationRequested())
             {
                 Demo = scene.Demo;
                 Revision = scene.Revision;
+                TransformRevision = scene.TransformRevision;
                 CameraRevision = scene.CameraRevision;
                 Width = settings.Width;
                 Height = settings.Height;
                 SelectedNode = settings.SelectedNode;
                 ClipSpace = clipSpace;
+                Lightmaps = lightmaps;
                 Valid = true;
             }
         }
-        return Built;
+        const bool filter = !clipSpace && settings.Techniques.AnisotropicFiltering;
+        if (Valid && (rebuild || filter != MaterialMips))
+        {
+            Valid = false;
+            for (auto& texture : Built->Scene.Textures)
+            {
+                texture.MipPixelsRGBA8.reset();
+                if (!filter || !texture.IsValid() || texture.Irradiance || (texture.Width == 1 && texture.Height == 1)) continue;
+                Renderer::TextureDesc desc;
+                desc.Width = texture.Width;
+                desc.Height = texture.Height;
+                desc.ColorSpace = texture.SRGB ? Renderer::TextureColorSpace::SRGB : Renderer::TextureColorSpace::Linear;
+                desc.MipLevels = Renderer::MaterialMipLevels(desc);
+                const auto mips = Renderer::BuildMaterialMipChain(desc, *texture.PixelsRGBA8);
+                texture.MipPixelsRGBA8 = std::make_shared<const std::vector<std::uint8_t>>(
+                    mips.begin() + texture.PixelsRGBA8->size(), mips.end());
+            }
+            MaterialMips = filter;
+            Valid = true;
+        }
+        return *Built;
     }
 
+    bool MaterialMips = false, Lightmaps = false;
     bool Valid = false;
     bool ClipSpace = false;
     DemoId Demo = DemoId::Triangle;
@@ -734,23 +815,29 @@ struct RasterSceneCache
     std::uint32_t Width = 0;
     std::uint32_t Height = 0;
     SceneNodeId SelectedNode = 0;
-    RasterSceneBuild Built;
+    std::shared_ptr<RasterSceneBuild> Built;
+    std::uint64_t TransformRevision = 0;
 };
 
-[[nodiscard]] Image ToEditorImage(const Rasterizer::RenderTarget& target)
+[[nodiscard]] Image ToEditorImage(const Rasterizer::RenderTarget& target, Rasterizer::Detail::ParallelExecutor& workers)
 {
     Image result;
     result.Width = target.Width();
     result.Height = target.Height();
-    const std::vector<std::uint32_t> packed = target.ToRGBA8();
-    result.PixelsRGBA8.resize(packed.size() * 4);
-    for (std::size_t pixel = 0; pixel < packed.size(); ++pixel)
-    {
-        result.PixelsRGBA8[pixel * 4] = static_cast<std::uint8_t>(packed[pixel] & 0xffU);
-        result.PixelsRGBA8[pixel * 4 + 1] = static_cast<std::uint8_t>((packed[pixel] >> 8U) & 0xffU);
-        result.PixelsRGBA8[pixel * 4 + 2] = static_cast<std::uint8_t>((packed[pixel] >> 16U) & 0xffU);
-        result.PixelsRGBA8[pixel * 4 + 3] = static_cast<std::uint8_t>((packed[pixel] >> 24U) & 0xffU);
-    }
+    if (target.GpuColor) { result.GpuColor=target.GpuColor; return result; }
+    const auto& colors=target.Colors();
+    result.PixelsRGBA8.resize(colors.size()*4);
+    constexpr std::size_t blockSize=4096;
+    workers.Run(static_cast<std::uint32_t>((colors.size()+blockSize-1)/blockSize),0,[&](std::uint32_t block) {
+        const std::size_t first=std::size_t(block)*blockSize,last=std::min(first+blockSize,colors.size());
+        for(std::size_t pixel=first;pixel<last;++pixel)
+        {
+            const auto& color=colors[pixel];
+            auto* destination=result.PixelsRGBA8.data()+4*pixel;
+            destination[0]=Maths::LinearToSRGB8(color.R);destination[1]=Maths::LinearToSRGB8(color.G);
+            destination[2]=Maths::LinearToSRGB8(color.B);destination[3]=Maths::LinearToUNorm8(color.A);
+        }
+    });
     return result;
 }
 
@@ -814,7 +901,8 @@ struct LightSelection
         source.LightColor.G,
         source.LightColor.B,
         source.LightColor.A};
-    result.Intensity = source.Intensity;
+    result.Intensity = source.Enabled ? source.Intensity : 0;
+    result.Range = source.Range;
     result.AreaSize = {source.AreaSize.X, source.AreaSize.Y};
     result.CastShadows = source.CastShadows;
 
@@ -855,11 +943,43 @@ struct LightSelection
     try
     {
         Rasterizer::RasterSettings rasterSettings;
+        rasterSettings.ImmutableScene = std::shared_ptr<const Rasterizer::RasterScene>(sceneCache.Built, &built.Scene);
+        rasterSettings.GpuPresentation = request.Settings.GpuPresentation && rasterizer.SelectedBackend()!=Rasterizer::RasterBackend::CPU;
         rasterSettings.Mode = ToRasterMode(request.Settings.Mode);
         rasterSettings.InputSpace = Rasterizer::VertexInputSpace::Local;
         rasterSettings.DepthRange = Rasterizer::ClipDepthRange::ZeroToOne;
         const LightSelection lightSelection = SelectLights(*request.Scene);
         rasterSettings.Shading = Rasterizer::ShadingModel::Phong;
+        rasterSettings.TextureMapping = request.Settings.Techniques.TextureMapping;
+        rasterSettings.NormalMapping = request.Settings.Techniques.NormalMapping;
+        rasterSettings.AlphaTesting = request.Settings.Techniques.AlphaTesting;
+        rasterSettings.AnisotropicFiltering = request.Settings.Techniques.AnisotropicFiltering;
+        if (request.Scene->Demo == DemoId::SponzaAtrium)
+        {
+            const auto& techniques = request.Settings.Techniques;
+            const auto& hdr = techniques.PostProcessing.HDR;
+            rasterSettings.ACESColor = hdr.ToneMapping == Techniques::ToneMappingMode::ACESFitted;
+            rasterSettings.Exposure = std::exp2(hdr.ExposureEV);
+            rasterSettings.Contrast = hdr.ColorGrading ? hdr.Contrast : 1;
+            rasterSettings.Saturation = hdr.ColorGrading ? hdr.Saturation : 1;
+            rasterSettings.FrontLightmap = built.FrontLightmap;
+            rasterSettings.BackLightmap = built.BackLightmap;
+            rasterSettings.LightmapIntensity = techniques.GlobalIllumination.Intensity;
+            // Prebaked irradiance replaces the constant ambient term in the native path.
+            if (built.FrontLightmap != Rasterizer::InvalidRasterTextureIndex)
+                rasterSettings.AmbientStrength = 0;
+            rasterSettings.SkyTexture = built.SkyTexture;
+            rasterSettings.SkyDiffuseTexture = built.SkyDiffuseTexture;
+            rasterSettings.SkyIntensity = techniques.Reflections.Skybox ? techniques.Reflections.SkyboxIntensity : 0;
+            rasterSettings.SkyDiffuseIntensity = 0.96f * techniques.Reflections.DiffuseIBL;
+        }
+        const auto& diffusion = request.Settings.Techniques.Subsurface;
+        if (Techniques::UsesSubsurfaceScattering(diffusion))
+        {
+            const float amount = diffusion.Strength * std::min(diffusion.Distance * 4.0f, 1.0f);
+            rasterSettings.SubsurfaceScattering = {diffusion.ChannelRadius[0] * amount,
+                diffusion.ChannelRadius[1] * amount, diffusion.ChannelRadius[2] * amount};
+        }
         const float aspect = static_cast<float>(request.Settings.Width) /
                              static_cast<float>(request.Settings.Height);
         const Maths::Matrix4 view = Maths::Matrix4::LookAtRH(
@@ -870,7 +990,7 @@ struct LightSelection
             request.Scene->SceneCamera.VerticalFieldOfViewDegrees * Pi / 180.0f,
             aspect,
             0.05f,
-            1000.0f);
+            request.Scene->World ? 10000.0f : 1000.0f);
         const ShadowFrame& shadowFrame = built.Shadow;
         rasterSettings.View = ToRasterMatrix(view);
         rasterSettings.Projection = ToRasterMatrix(projection);
@@ -898,8 +1018,17 @@ struct LightSelection
             std::min(request.Settings.Width, request.Settings.Height), 64U, 1024U);
         rasterSettings.ShadowBias = shadowFrame.DepthBias;
         rasterSettings.ShadowSlopeScaledBias = shadowFrame.SlopeScaledBias;
-        rasterSettings.OutlineEnabled = request.Settings.OutlineEnabled;
-        Rasterizer::RenderTarget target(request.Settings.Width, request.Settings.Height);
+        if (request.Scene->Demo == DemoId::SponzaAtrium)
+        {
+            rasterSettings.ShadowMapSize = std::clamp(
+                std::max(request.Settings.Width, request.Settings.Height), 256U, 2048U);
+            rasterSettings.ShadowPCFRadius = request.Settings.Techniques.ShadowFilter.Mode == Techniques::ShadowFilterMode::Hard ?
+                0 : request.Settings.Techniques.ShadowFilter.Radius;
+            rasterSettings.ShadowBias = 0.00035f;
+            rasterSettings.ShadowReceiverSlopeBias = 0.0006f;
+        }
+        rasterSettings.OutlineEnabled = request.Settings.OutlineEnabled && request.Settings.SelectedNode!=0;
+        Rasterizer::RenderTarget target(request.Settings.Width, request.Settings.Height, !rasterSettings.GpuPresentation);
         const Rasterizer::RasterStatus status = rasterizer.Render(
             built.Scene,
             rasterSettings,
@@ -912,7 +1041,16 @@ struct LightSelection
 
         RenderResult result;
         result.Status = RenderStatus::Completed;
-        result.Output = ToEditorImage(target);
+        result.Output = ToEditorImage(target,sceneCache.OutputWorkers);
+        result.BakedLightingStatus = built.LightmapStatus;
+        const auto statistics=rasterizer.LastStatistics();
+        result.Geometry.Available=true;
+        result.Geometry.RasterWorkerThreads=statistics.WorkerThreads;
+        result.Geometry.RasterComputeGroups=statistics.ComputeGroups;
+        result.Geometry.RasterComputeInvocations=statistics.ComputeInvocations;
+        result.Geometry.RasterPreparationMilliseconds=statistics.TransformMilliseconds;
+        result.Geometry.RasterExecutionMilliseconds=statistics.RasterMilliseconds;
+        result.Geometry.RasterExecutionPath=statistics.ExecutionPath;
         return result;
     }
     catch (const std::exception& exception)
@@ -975,7 +1113,12 @@ struct LightSelection
         if (status == Rasterizer::RasterStatus::Cancelled) return Cancelled();
         if (cancellation.IsCancellationRequested()) return Cancelled();
 
-        const Image overlay = ToEditorImage(target);
+        const Image overlay = ToEditorImage(target,sceneCache.OutputWorkers);
+        if(base.Output.GpuColor)
+        {
+            // Composite the topology mask at presentation without reading ray color.
+            base.Output.Overlay=std::make_shared<Image>(overlay);return base;
+        }
         for (std::size_t pixel = 0; pixel + 3 < base.Output.PixelsRGBA8.size(); pixel += 4)
         {
             const float alpha = overlay.PixelsRGBA8[pixel + 3] / 255.0f;
@@ -1011,6 +1154,24 @@ struct LightSelection
     return result;
 }
 
+Renderer::MeshData RendererMeshInstance(const SceneNode& node)
+{
+    Renderer::MeshData mesh;
+    mesh.Id="Node."+std::to_string(node.Id);
+    mesh.SelectionGroup=node.Id;
+    mesh.Visible=node.Visible;
+    mesh.PlanarReceiver=node.Name.find("Water tile ")==0;
+    mesh.ReorderForInstancing=node.Name.find("Pine ")==0;
+    mesh.Vegetation=node.Name.find("Grass patch ")==0?1:mesh.ReorderForInstancing?2:0;
+    const bool lakebed=node.Name.find("Lakebed ")==0,weather=node.Name=="Weather";
+    mesh.ManagedLod=mesh.Vegetation!=0 || mesh.PlanarReceiver || lakebed;
+    mesh.DynamicVertices=weather || mesh.PlanarReceiver || lakebed;
+    mesh.CastShadow=!mesh.PlanarReceiver && !weather;
+    mesh.Color={1,1,1,1};
+    mesh.WorldTransform=ToRendererMatrix(ToMath(node.LocalTransform).ToMatrix());
+    return mesh;
+}
+
 [[nodiscard]] bool AppendFullMaterialMesh(
     const SceneNode& node,
     const std::vector<std::size_t>& triangleOrdinals,
@@ -1028,13 +1189,8 @@ struct LightSelection
         return true;
     }
 
-    Renderer::MeshData mesh;
-    mesh.Id = "Node." + std::to_string(node.Id) +
-              ".Section." + std::to_string(sectionOrdinal);
-    mesh.SelectionGroup = node.Id;
-    mesh.Visible = node.Visible;
-    mesh.Color = {1.0f, 1.0f, 1.0f, 1.0f};
-    mesh.WorldTransform = ToRendererMatrix(ToMath(node.LocalTransform).ToMatrix());
+    auto mesh=RendererMeshInstance(node);
+    mesh.Id+=".Section."+std::to_string(sectionOrdinal);
     mesh.Indices.reserve(triangleOrdinals.size() * 3U);
     mesh.Vertices.reserve(std::min(
         triangleOrdinals.size() * 3U,
@@ -1100,7 +1256,7 @@ struct LightSelection
 [[nodiscard]] std::vector<Renderer::MeshData> BuildRendererMeshes(
     const SceneSnapshot& scene,
     const CancellationToken& cancellation,
-    bool fullMaterial)
+    bool fullMaterial, RendererImageCache* persistentImages=nullptr)
 {
     std::vector<Renderer::MeshData> result;
     std::size_t meshCount = 0;
@@ -1112,7 +1268,8 @@ struct LightSelection
             : 1U;
     }
     result.reserve(meshCount);
-    RendererImageCache imageCache;
+    RendererImageCache localImages;
+    auto& imageCache=persistentImages?*persistentImages:localImages;
     for (const SceneNode& node : scene.Nodes)
     {
         if (cancellation.IsCancellationRequested()) return {};
@@ -1120,6 +1277,23 @@ struct LightSelection
 
         if (fullMaterial)
         {
+            // Generated single-section grids already have native triangle-list
+            // topology. Keep their vertex order across deformation updates.
+            const auto& src=*node.Mesh;
+            if (scene.World && src.Sections.size()==1 && src.Sections.front().FirstIndex==0 &&
+                src.Sections.front().IndexCount==src.Indices.size() && src.Indices.size()%3==0 &&
+                std::all_of(src.Indices.begin(),src.Indices.end(),[&](auto i){return i<src.Vertices.size();}))
+            {
+                auto mesh=RendererMeshInstance(node);
+                mesh.Id+=".Section.0";
+                mesh.Indices=src.Indices;
+                mesh.Vertices.reserve(src.Vertices.size());
+                std::transform(src.Vertices.begin(),src.Vertices.end(),std::back_inserter(mesh.Vertices),ToRendererVertex);
+                mesh.Material=ToRendererMaterial(FindMaterial(scene,node.MaterialOverride.empty()?src.Sections.front().MaterialName:node.MaterialOverride),
+                    imageCache,cancellation);
+                result.push_back(std::move(mesh));
+                continue;
+            }
             std::vector<std::uint32_t> vertexRemap(
                 node.Mesh->Vertices.size(),
                 std::numeric_limits<std::uint32_t>::max());
@@ -1180,7 +1354,7 @@ struct LightSelection
                  sectionIndex < sectionTriangles.size();
                  ++sectionIndex)
             {
-                const Material* material = sectionIndex < node.Mesh->Sections.size()
+                const Material* material = !node.MaterialOverride.empty() ? FindMaterial(scene,node.MaterialOverride) : sectionIndex < node.Mesh->Sections.size()
                     ? FindMaterial(
                         scene,
                         node.Mesh->Sections[sectionIndex].MaterialName)
@@ -1202,14 +1376,10 @@ struct LightSelection
             continue;
         }
 
-        Renderer::MeshData mesh;
-        mesh.Id = "Node." + std::to_string(node.Id);
-        mesh.SelectionGroup = node.Id;
-        mesh.Visible = node.Visible;
+        auto mesh=RendererMeshInstance(node);
         mesh.Indices = node.Mesh->Indices;
         mesh.Vertices.reserve(node.Mesh->Vertices.size());
         constexpr Color defaultColor{0.72f, 0.76f, 0.82f, 1.0f};
-        mesh.Color = {1.0f, 1.0f, 1.0f, 1.0f};
         for (const Vertex& vertex : node.Mesh->Vertices)
         {
             if ((mesh.Vertices.size() & 0x3fffU) == 0 &&
@@ -1226,7 +1396,7 @@ struct LightSelection
         // the node identifier used by picking and silhouette outlines.
         for (const MeshSection& section : node.Mesh->Sections)
         {
-            const Material* material = FindMaterial(scene, section.MaterialName);
+            const Material* material = FindMaterial(scene, node.MaterialOverride.empty()?section.MaterialName:node.MaterialOverride);
             const Color color = material != nullptr ? material->Diffuse : defaultColor;
             const std::size_t sectionBegin = std::min<std::size_t>(
                 section.FirstIndex, mesh.Indices.size());
@@ -1251,11 +1421,206 @@ struct LightSelection
                 }
             }
         }
-        mesh.WorldTransform = ToRendererMatrix(ToMath(node.LocalTransform).ToMatrix());
         result.push_back(std::move(mesh));
     }
     return result;
 }
+
+std::uint32_t AddRasterRadiance(Rasterizer::RasterScene& scene, unsigned width, unsigned height,
+    const std::vector<Renderer::Float4>& linear)
+{
+    if (linear.empty()) return Rasterizer::InvalidRasterTextureIndex;
+    // Preserve HDR irradiance in the packed software texture table. Decode
+    // RGBE before bilinear filtering so the exponent never interpolates.
+    auto pixels = std::make_shared<std::vector<std::uint8_t>>(linear.size() * 4);
+    for (std::size_t i = 0; i < linear.size(); ++i)
+    {
+        const auto& color = linear[i];
+        const float maximum = std::max({color.X, color.Y, color.Z});
+        if (color.W <= 0 || maximum <= 1.0e-12f) continue;
+        int exponent;
+        std::frexp(maximum, &exponent);
+        const float scale = std::ldexp(255.0f, -exponent);
+        auto* pixel = pixels->data() + 4 * i;
+        pixel[0] = static_cast<std::uint8_t>(std::clamp(color.X * scale + 0.5f, 0.0f, 255.0f));
+        pixel[1] = static_cast<std::uint8_t>(std::clamp(color.Y * scale + 0.5f, 0.0f, 255.0f));
+        pixel[2] = static_cast<std::uint8_t>(std::clamp(color.Z * scale + 0.5f, 0.0f, 255.0f));
+        pixel[3] = static_cast<std::uint8_t>(exponent + 128);
+    }
+    const auto index = static_cast<std::uint32_t>(scene.Textures.size());
+    Rasterizer::RasterTexture texture;
+    texture.Width = width;
+    texture.Height = height;
+    texture.PixelsRGBA8 = std::move(pixels);
+    texture.Irradiance = true;
+    scene.Textures.push_back(std::move(texture));
+    return index;
+}
+
+std::vector<Renderer::Float4> BuildRasterSky(const Renderer::EnvironmentRadiance& source,
+    unsigned width, unsigned height, bool diffuse)
+{
+    using Maths::Vector3;
+    const unsigned footprint = diffuse ? std::min(8U, source.Resolution) : 1U;
+    const unsigned side = source.Resolution / footprint;
+    std::array<std::vector<Vector3>, Renderer::EnvironmentFaceCount> faces;
+    for (unsigned face = 0; face < faces.size(); ++face)
+    {
+        auto& values = faces[face];
+        values.resize(std::size_t(side) * side);
+        for (unsigned y = 0; y < side; ++y)
+            for (unsigned x = 0; x < side; ++x)
+            {
+                Vector3 sum{};
+                for (unsigned j = 0; j < footprint; ++j)
+                    for (unsigned i = 0; i < footprint; ++i)
+                    {
+                        const auto sample=source.Texel(Renderer::EnvironmentFace(face),x*footprint+i,y*footprint+j);
+                        sum += Vector3(sample.X,sample.Y,sample.Z);
+                    }
+                values[std::size_t(y) * side + x] = sum / float(footprint * footprint);
+            }
+    }
+    auto sample = [&](const Vector3& direction) {
+        Renderer::EnvironmentLookup lookup;
+        if (!Renderer::LocateEnvironmentDirection({direction.x, direction.y, direction.z}, lookup)) return Vector3{};
+        const float u = lookup.UV.X * side - 0.5f, v = lookup.UV.Y * side - 0.5f;
+        const int x = int(std::floor(u)), y = int(std::floor(v));
+        const auto& pixels = faces[static_cast<unsigned>(lookup.Face)];
+        auto texel = [&](int column, int row) {
+            return pixels[std::size_t(std::clamp(row, 0, int(side) - 1)) * side + std::clamp(column, 0, int(side) - 1)];
+        };
+        const float dx = u - x, dy = v - y;
+        return (texel(x, y) * (1 - dx) + texel(x + 1, y) * dx) * (1 - dy) +
+            (texel(x, y + 1) * (1 - dx) + texel(x + 1, y + 1) * dx) * dy;
+    };
+    std::vector<Renderer::Float4> result(std::size_t(width) * height);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        const float polar = Pi * (y + 0.5f) / height;
+        for (unsigned x = 0; x < width; ++x)
+        {
+            const float phi = 2 * Pi * ((x + 0.5f) / width - 0.5f);
+            const Vector3 direction(std::sin(polar)*std::cos(phi), std::cos(polar), std::sin(polar)*std::sin(phi));
+            auto radiance = diffuse ? Vector3{} : sample(direction);
+            if (diffuse)
+            {
+                const Vector3 axis = std::abs(direction.y) < 0.99f ? Vector3(0,1,0) : Vector3(1,0,0);
+                const auto tangent = axis.Cross(direction).Normalized();
+                const auto bitangent = direction.Cross(tangent);
+                for (unsigned ray = 0; ray < 16; ++ray)
+                {
+                    const float radius = std::sqrt((ray + 0.5f) / 16.0f), azimuth = ray * 2.39996323f;
+                    radiance += sample(tangent * (radius * std::cos(azimuth)) + bitangent * (radius * std::sin(azimuth)) +
+                        direction * std::sqrt(1.0f - radius * radius)) * (1.0f / 16.0f);
+                }
+            }
+            result[std::size_t(y) * width + x] = {radiance.x, radiance.y, radiance.z, 1};
+        }
+    }
+    return result;
+}
+
+RasterSceneBuild BuildSponzaRasterScene(const SceneSnapshot& scene, const ViewportSettings& settings,
+    const CancellationToken& cancellation)
+{
+    RasterSceneBuild result;
+    result.Shadow = BuildShadowFrame(scene);
+    if (scene.Environment)
+    {
+        result.SkyTexture = AddRasterRadiance(result.Scene, 512, 256, BuildRasterSky(*scene.Environment, 512, 256, false));
+        result.SkyDiffuseTexture = AddRasterRadiance(result.Scene, 128, 64, BuildRasterSky(*scene.Environment, 128, 64, true));
+    }
+    auto meshes = BuildRendererMeshes(scene, cancellation, true);
+    std::sort(meshes.begin(), meshes.end(), [](const auto& a, const auto& b) { return a.Id < b.Id; });
+    std::shared_ptr<const Renderer::LightmapBakeResult> atlas;
+    if (Techniques::UsesLightmaps(settings.Techniques.GlobalIllumination))
+    {
+        std::vector<Renderer::LightmapSourceInstance> instances;
+        instances.reserve(meshes.size());
+        for (const auto& mesh : meshes)
+        {
+            if (cancellation.IsCancellationRequested()) { result.WasCancelled = true; return result; }
+            auto geometry = std::make_shared<Renderer::LightmapSourceGeometry>();
+            geometry->Vertices = mesh.Vertices;
+            Renderer::MeshLodChain chain;
+            std::string error;
+            if (!Renderer::BuildMeshLods(mesh.Vertices, mesh.Indices, {}, chain, error))
+            {
+                result.LightmapStatus = "Failed: " + error;
+                break;
+            }
+            for (auto& level : chain.Levels) geometry->Levels.push_back(std::move(level.Indices));
+            instances.push_back({std::move(geometry), mesh.WorldTransform, mesh.Color, mesh.Material, mesh.Visible, mesh.CastShadow});
+        }
+        if (instances.size() == meshes.size())
+        {
+            const auto request = Renderer::MakeLightmapBakeRequest(std::move(instances), settings.Techniques, {}, true);
+            atlas = Renderer::LoadLightmapAsset(scene.ActiveBakedLightingDirectory() / "irradiance.evlightmap", request);
+            result.LightmapStatus = atlas ? "Loaded baked resource" : "Failed: prebaked lightmap does not match the scene";
+        }
+    }
+    std::vector<const Renderer::LightmapReceiverRange*> ranges(meshes.size(), nullptr);
+    if (atlas)
+    {
+        for (const auto& range : atlas->Receivers->Ranges)
+            if (range.LodLevel == 0 && range.InstanceIndex < meshes.size() && meshes[range.InstanceIndex].Visible &&
+                range.VertexCount == meshes[range.InstanceIndex].Indices.size()) ranges[range.InstanceIndex] = &range;
+
+        if (std::any_of(ranges.begin(), ranges.end(), [](const auto* range) { return range != nullptr; }))
+        {
+            const auto& bake = *atlas->Irradiance;
+            const unsigned side = bake.Atlas->Settings.Resolution;
+            result.FrontLightmap = AddRasterRadiance(result.Scene, side, side, bake.FrontIrradiance);
+            result.BackLightmap = AddRasterRadiance(result.Scene, side, side, bake.BackIrradiance);
+        }
+        else result.LightmapStatus = "Failed: prebaked lightmap has no matching receivers";
+    }
+    RasterTextureCache textures;
+    for (std::size_t m = 0; m < meshes.size(); ++m)
+    {
+        if (cancellation.IsCancellationRequested()) { result.WasCancelled = true; return result; }
+        const auto& mesh = meshes[m];
+        if (!mesh.Visible) continue;
+        const auto& source = mesh.Material;
+        const auto color = [](Renderer::Float4 v) { return Rasterizer::Color{v.X, v.Y, v.Z, v.W}; };
+        Rasterizer::RasterTriangle triangle;
+        triangle.Selected = settings.SelectedNode == mesh.SelectionGroup;
+        triangle.Material.BaseColor = color(source.BaseColor);
+        triangle.Material.SpecularColor = color(source.SpecularColor);
+        triangle.Material.EmissiveColor = color(source.EmissiveColor);
+        triangle.Material.Shininess = source.Shininess;
+        triangle.Material.AlphaCutoff = source.AlphaCutoff;
+        triangle.Material.DiffuseTextureIndex = AddRasterTexture(source.DiffuseImage, result.Scene, textures, true);
+        triangle.Material.NormalTextureIndex = AddRasterTexture(source.NormalImage, result.Scene, textures);
+        triangle.Material.OpacityTextureIndex = AddRasterTexture(source.OpacityImage, result.Scene, textures);
+        triangle.Material.ReceivesLightmap = ranges[m] != nullptr;
+        const auto world = ToRasterMatrix(Maths::Matrix4{mesh.WorldTransform.Values});
+        for (std::size_t i = 0; i < mesh.Indices.size(); i += 3)
+        {
+            for (unsigned corner = 0; corner < 3; ++corner)
+            {
+                const auto& vertex = mesh.Vertices[mesh.Indices[i + corner]];
+                auto& out = triangle.Vertices[corner];
+                const auto position = world * Rasterizer::Float4{vertex.Position.X, vertex.Position.Y, vertex.Position.Z, 1};
+                const auto normal = world * Rasterizer::Float4{vertex.Normal.X, vertex.Normal.Y, vertex.Normal.Z, 0};
+                out.Position = {position.X, position.Y, position.Z};
+                out.Normal = {normal.X, normal.Y, normal.Z};
+                out.TexCoord = {vertex.TexCoord.X, vertex.TexCoord.Y};
+                out.VertexColor = {vertex.Color.X * mesh.Color.X, vertex.Color.Y * mesh.Color.Y,
+                    vertex.Color.Z * mesh.Color.Z, vertex.Color.W * mesh.Color.W};
+                if (ranges[m])
+                {
+                    const auto uv = atlas->Receivers->Vertices[ranges[m]->FirstVertex + i + corner].AtlasUV;
+                    out.LightmapUV = {uv.X, uv.Y};
+                }
+            }
+            result.Scene.Triangles.push_back(triangle);
+        }
+    }
+    return result;
+}
+
 
 [[nodiscard]] Renderer::SceneLight ToRendererLight(const Light& source)
 {
@@ -1263,7 +1628,8 @@ struct LightSelection
     result.Position = {source.Position.X, source.Position.Y, source.Position.Z};
     result.Color = {
         source.LightColor.R, source.LightColor.G, source.LightColor.B};
-    result.Intensity = source.Intensity;
+    result.Intensity = source.Enabled ? source.Intensity : 0;
+    result.Range = source.Range;
     result.AreaSize = {source.AreaSize.X, source.AreaSize.Y};
     result.CastShadows = source.CastShadows;
 
@@ -1285,8 +1651,34 @@ struct LightSelection
     return result;
 }
 
+struct RealtimeLightCacheKey
+{
+    DemoId Demo = DemoId::Triangle;
+    std::uint64_t Revision = 0;
+    std::uint64_t LightingRevision = 0;
+
+    friend bool operator==(const RealtimeLightCacheKey& a, const RealtimeLightCacheKey& b)
+    { return a.Demo == b.Demo && a.Revision == b.Revision && a.LightingRevision == b.LightingRevision; }
+};
+
+[[nodiscard]] std::shared_ptr<const Renderer::SceneLightCollection> BuildRendererSceneLights(
+    const SceneSnapshot& scene, std::string& error)
+{
+    if (scene.Lights.size() > Renderer::MaximumForwardPlusLights)
+    { error = "Scene lights exceed the native light-collection capacity"; return {}; }
+    std::vector<Renderer::SceneLight> lights;
+    lights.reserve(scene.Lights.size());
+    std::int32_t shadowLightIndex = -1;
+    for (const auto& light : scene.Lights)
+    {
+        if (shadowLightIndex < 0 && light.CastShadows) shadowLightIndex = static_cast<std::int32_t>(lights.size());
+        lights.push_back(ToRendererLight(light));
+    }
+    return Renderer::SceneLightCollection::Create(std::move(lights), shadowLightIndex, error);
+}
+
 [[nodiscard]] Renderer::LightingState BuildRendererLighting(
-    const SceneSnapshot& scene)
+    const SceneSnapshot& scene, const std::shared_ptr<const Renderer::SceneLightCollection>& lights)
 {
     Renderer::LightingState result;
     result.CameraPosition = {
@@ -1294,64 +1686,78 @@ struct LightSelection
         scene.SceneCamera.Position.Y,
         scene.SceneCamera.Position.Z};
     result.AmbientColor = {1.0f, 1.0f, 1.0f};
-    result.AmbientStrength = 0.08f;
-
-    const LightSelection lightSelection = SelectLights(scene);
-    for (std::size_t lightIndex = 0; lightIndex < lightSelection.Count; ++lightIndex)
-    {
-        const std::size_t sceneIndex = lightSelection.SceneIndices[lightIndex];
-        result.Lights[lightIndex] = ToRendererLight(scene.Lights[sceneIndex]);
-    }
-    result.LightCount = static_cast<std::uint32_t>(lightSelection.Count);
-    result.ShadowLightIndex = lightSelection.ShadowLightIndex;
+    result.AmbientStrength = scene.World ? 0.0f : 0.08f;
+    result.SceneLights = lights;
+    lights->WriteLegacySubset(result);
     return result;
 }
 
 struct RealtimeCacheKey
 {
+    double AnimationTime=0;
     DemoId Demo = DemoId::Triangle;
     std::uint64_t Revision = 0;
     std::uint64_t CameraRevision = 0;
+    std::uint64_t LightingRevision = 0;
+    std::uint64_t TransformRevision = 0;
+    std::uint64_t HistoryEpoch = 0;
     std::uint32_t Width = 0;
     std::uint32_t Height = 0;
     FillMode Mode = FillMode::Solid;
+    Techniques::RenderBuffer Buffer=Techniques::RenderBuffer::Color;
     bool ShadowsEnabled = false;
     bool OutlineEnabled = false;
+    bool GpuPresentation = false;
     SceneNodeId SelectedNode = 0;
+    Techniques::Settings Techniques;
 
     friend bool operator==(const RealtimeCacheKey& left, const RealtimeCacheKey& right)
     {
-        return left.Demo == right.Demo &&
+        return left.AnimationTime==right.AnimationTime && left.Demo == right.Demo &&
                left.Revision == right.Revision &&
                left.CameraRevision == right.CameraRevision &&
+               left.LightingRevision == right.LightingRevision &&
+               left.TransformRevision == right.TransformRevision &&
+               left.HistoryEpoch == right.HistoryEpoch &&
                left.Width == right.Width &&
                left.Height == right.Height &&
-               left.Mode == right.Mode &&
+               left.Mode == right.Mode && left.Buffer==right.Buffer &&
                left.ShadowsEnabled == right.ShadowsEnabled &&
-               left.OutlineEnabled == right.OutlineEnabled &&
-               left.SelectedNode == right.SelectedNode;
+               left.OutlineEnabled == right.OutlineEnabled && left.GpuPresentation == right.GpuPresentation &&
+               left.SelectedNode == right.SelectedNode &&
+               left.Techniques == right.Techniques;
     }
 };
 
 [[nodiscard]] RealtimeCacheKey MakeCacheKey(const RenderRequest& request)
 {
     RealtimeCacheKey key;
+    const auto& effects=request.Settings.Techniques;
+    if ((Techniques::UsesHairFur(effects.Hair) && effects.Hair.Animate) ||
+        (effects.VolumetricFog.Enabled && effects.VolumetricFog.MediumMode==Techniques::VolumeMediumMode::Clouds && effects.VolumetricFog.Clouds.Animate))
+        key.AnimationTime=request.Scene->SampleTimeSeconds;
     key.Demo = request.Scene->Demo;
     key.Revision = request.Scene->Revision;
     key.CameraRevision = request.Scene->CameraRevision;
+    key.LightingRevision = request.Scene->LightingRevision;
+    key.TransformRevision = request.Scene->TransformRevision;
+    key.HistoryEpoch = request.HistoryEpoch;
     key.Width = request.Settings.Width;
     key.Height = request.Settings.Height;
     key.Mode = request.Settings.Mode;
+    key.Buffer=request.Settings.Buffer;
     key.ShadowsEnabled = request.Settings.ShadowsEnabled;
     key.OutlineEnabled = request.Settings.OutlineEnabled;
+    key.GpuPresentation = request.Settings.GpuPresentation;
     key.SelectedNode = request.Settings.SelectedNode;
+    key.Techniques = request.Settings.Techniques;
     return key;
 }
 
 struct RealtimeSceneCacheKey
 {
     DemoId Demo = DemoId::Triangle;
-    std::uint64_t Revision = 0;
+    std::uint64_t Revision = 0, DynamicRevision = 0;
     Renderer::RHIBackend Backend = Renderer::RHIBackend::Vulkan;
     bool FullMaterial = false;
 
@@ -1360,7 +1766,7 @@ struct RealtimeSceneCacheKey
         const RealtimeSceneCacheKey& right)
     {
         return left.Demo == right.Demo &&
-               left.Revision == right.Revision &&
+               left.Revision == right.Revision && left.DynamicRevision == right.DynamicRevision &&
                left.Backend == right.Backend &&
                left.FullMaterial == right.FullMaterial;
     }
@@ -1374,6 +1780,7 @@ struct RealtimeSceneCacheKey
     RealtimeSceneCacheKey key;
     key.Demo = request.Scene->Demo;
     key.Revision = request.Scene->Revision;
+    key.DynamicRevision=request.Scene->DynamicRevision;
     key.Backend = backend;
     key.FullMaterial = fullMaterial;
     return key;
@@ -1402,7 +1809,7 @@ struct RealtimeBackendContext
     Renderer::Renderer RendererInstance;
     Renderer::RHIThread Thread;
     bool ThreadStarted = false;
-    std::mutex RenderMutex;
+    std::shared_ptr<std::mutex> RenderMutex=std::make_shared<std::mutex>();
 };
 
 class RealtimeRenderAdapter final : public IRenderAdapter
@@ -1416,6 +1823,99 @@ public:
     }
 
     ~RealtimeRenderAdapter() override = default;
+
+    [[nodiscard]] std::uint32_t QueryMultisampleCounts() const override { return MultisampleCounts_.load(); }
+    [[nodiscard]] std::uint32_t QueryWeightedTransparencySampleCounts() const override { return WeightedTransparencyCounts_.load(); }
+    [[nodiscard]] bool QueryNaniteHardwareScheduling() const override { return NaniteHardwareDeviceSupport_.load()==DeviceSupportAvailable; }
+    [[nodiscard]] bool QueryLumenHardwareRayTracing() const override { return LumenHardwareDeviceSupport_.load()==DeviceSupportAvailable; }
+    [[nodiscard]] bool QueryMaterialAnisotropicFiltering() const override { return MaterialAnisotropicFiltering_.load(); }
+    [[nodiscard]] std::uint64_t QuerySceneStorageBlockBytes() const override { return SceneStorageBlockBytes_.load(); }
+
+    [[nodiscard]] Techniques::Support QueryTechniqueSupport(Techniques::Technique technique) const override
+    {
+        const auto implementation = IRenderAdapter::QueryTechniqueSupport(technique);
+        if (technique == Techniques::Technique::Hybrid && implementation.Available() && HybridDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed Hybrid rendering's raster and scene-ray inputs."};
+        if (technique == Techniques::Technique::VisibilityBuffer && implementation.Available() && VisibilityDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed visibility storage and integer/float targets."};
+        if (technique == Techniques::Technique::GPUDriven && implementation.Available() && GpuDrivenDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed GPU instance compaction and indexed indirect drawing."};
+        if (technique == Techniques::Technique::ForwardPlus && implementation.Available() && ForwardPlusDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed compute light lists and material storage buffers."};
+        if (technique == Techniques::Technique::ClusteredForward && implementation.Available() && ClusteredDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed clustered assignment and material storage buffers."};
+        if (technique == Techniques::Technique::TiledDeferred && implementation.Available() && TiledDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed G-buffer targets, tiled assignment and material storage buffers."};
+        if (technique == Techniques::Technique::WeightedBlendedOIT && implementation.Available() && QueryWeightedTransparencySampleCounts() == 0)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed blendable float transparency targets."};
+        if (technique == Techniques::Technique::SSGI && implementation.Available() && GIDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed floating material, velocity and private GI history targets."};
+        if (technique == Techniques::Technique::MeshShaders && implementation.Available() && MeshShaderDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"The device has not confirmed native mesh stages, required limits and runtime shader compilation."};
+        if (technique == Techniques::Technique::Nanite && implementation.Available() && NaniteDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"The device has not confirmed Nanite decode, hybrid coverage and visibility materials."};
+        if (technique == Techniques::Technique::VirtualGeometry && implementation.Available() && VirtualGeometryDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"The device has not confirmed virtual geometry selection, page caches and drawable decoding."};
+        if (technique == Techniques::Technique::Tessellation && implementation.Available() && TessellationDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed PN vertex/index compute, storage ranges and coherent readback."};
+        if (technique == Techniques::Technique::DisplacementMapping && implementation.Available() && DisplacementDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed displacement compute, storage ranges and coherent geometry readback."};
+        if (technique == Techniques::Technique::ParallaxOcclusionMapping && implementation.Available() && ParallaxDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed POM material blocks, floating attachments and position invariance."};
+        if (technique == Techniques::Technique::TemporalEffects && implementation.Available() && ExposureDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed HDR and renderable FP32 metering targets."};
+        if (technique == Techniques::Technique::TSR && implementation.Available() && TemporalSuperResolutionDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"The device has not confirmed TSR compute, fragment storage and HDR image support."};
+        if (technique == Techniques::Technique::VirtualShadowMaps && implementation.Available() && VirtualShadowDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"The device has not confirmed virtual shadow demand compute, storage and native page sampling."};
+        if (technique == Techniques::Technique::TAA && implementation.Available() && TemporalDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed renderable color/depth history targets."};
+        if (technique == Techniques::Technique::VolumetricFog && implementation.Available() && FogDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed floating fog targets and texture bindings."};
+        if ((technique == Techniques::Technique::VolumetricLighting || technique == Techniques::Technique::ParticipatingMedia ||
+            technique == Techniques::Technique::VolumetricClouds) && implementation.Available() &&
+            (VolumeLightDeviceSupport_.load() != DeviceSupportAvailable || FogDeviceSupport_.load() != DeviceSupportAvailable))
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed FP32 volume transport targets."};
+        if (technique == Techniques::Technique::MSAA && implementation.Available() && QueryMultisampleCounts() == 1)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed compatible multisample attachments."};
+        if (technique == Techniques::Technique::VSM && implementation.Available() && VSMDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed floating shadow moment targets."};
+        if (technique == Techniques::Technique::ContactShadows && implementation.Available() && ContactDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed contact-shadow compute and visibility storage."};
+        if (technique == Techniques::Technique::PathTracing && implementation.Available() && PathDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed FP32 path targets and complete scene storage."};
+        if (technique==Techniques::Technique::Lumen && implementation.Available() && LumenDeviceSupport_.load()!=DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend,"Lumen compute/material capabilities are pending or unavailable on this device."};
+        if (technique == Techniques::Technique::VoxelGI && implementation.Available() && VoxelDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed sampled FP32 voxel storage and its shader/texture interface."};
+        if (technique == Techniques::Technique::RayTracedGI && implementation.Available() && RayGIDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed diffuse ray scene/material storage and sampling limits."};
+        if (technique == Techniques::Technique::RayTracedReflections && implementation.Available() && RayReflectionDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed ray reflection scene/material storage and sampling limits."};
+        if (technique == Techniques::Technique::RayTracedAO && implementation.Available() && RayAODeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed four fragment scene storage buffers."};
+        if (technique == Techniques::Technique::OIT && implementation.Available() && PeelingDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed floating OIT targets and invariant vertex positions."};
+        if (technique == Techniques::Technique::LightShafts && implementation.Available() && LightShaftDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "The device has not confirmed floating color render/blit targets for light shafts."};
+        if ((technique != Techniques::Technique::Deferred && technique != Techniques::Technique::SSAO &&
+            technique != Techniques::Technique::HBAO && technique != Techniques::Technique::SAO &&
+            technique != Techniques::Technique::GTAO && technique != Techniques::Technique::RayTracedAO && technique != Techniques::Technique::SSR &&
+            technique != Techniques::Technique::Lumen && technique != Techniques::Technique::VoxelGI && technique != Techniques::Technique::RayTracedReflections && technique != Techniques::Technique::RayTracedGI &&
+            technique != Techniques::Technique::CubemapReflections && technique != Techniques::Technique::EnvironmentReflections &&
+            technique != Techniques::Technique::PlanarReflections && technique != Techniques::Technique::BakedGI &&
+            technique != Techniques::Technique::LightProbes && technique != Techniques::Technique::Lightmaps &&
+            technique != Techniques::Technique::Refraction && technique != Techniques::Technique::SubsurfaceScattering && technique != Techniques::Technique::HairFur) ||
+            !implementation.Available()) return implementation;
+        const int device = DeferredDeviceSupport_.load();
+        if (device == DeviceSupportUnknown)
+            return {Techniques::Availability::UnsupportedBackend, "Waiting for the renderer's device capability query."};
+        if (device == DeviceSupportUnavailable)
+            return {Techniques::Availability::UnsupportedBackend, "This device lacks the floating material targets required by Deferred, AO and reflections."};
+        if (technique == Techniques::Technique::SAO && SaoDeviceSupport_.load() != DeviceSupportAvailable)
+            return {Techniques::Availability::UnsupportedBackend, "This device has not confirmed sampled/renderable R32F depth hierarchy support."};
+        return implementation;
+    }
 
     [[nodiscard]] BackendDescriptor Descriptor() const override
     {
@@ -1431,15 +1931,40 @@ public:
         const RealtimeCacheKey key = MakeCacheKey(request);
         {
             std::lock_guard<std::mutex> lock(CacheMutex_);
-            if (CacheValid_ && key == CacheKey_) return CachedResult_;
+            if (!request.Settings.ContinuousRendering && CacheValid_ && key == CacheKey_ && !CachedResult_.NeedsTemporalFrame) return CachedResult_;
         }
         if (!Context_.ThreadStarted || !Context_.Thread.IsRunning())
         {
             return Failed("The Renderer RHI thread could not be started");
         }
-        std::lock_guard<std::mutex> renderLock(Context_.RenderMutex);
+        std::lock_guard<std::mutex> renderLock(*Context_.RenderMutex);
+        struct ReleaseContext
+        {
+            RealtimeBackendContext& Context;
+            ~ReleaseContext()
+            {
+                if(Context.Backend!=Renderer::RHIBackend::OpenGLES)return;
+                try
+                {
+                    auto done=std::make_shared<std::promise<void>>();auto ready=done->get_future();
+                    if(Context.Thread.Enqueue([done](Renderer::Renderer& renderer){renderer.ReleasePresentationContext();done->set_value();}))ready.get();
+                }
+                catch(...) { /* Teardown still owns the native context if the queue has stopped. */ }
+            }
+        } releaseContext{Context_};
         if (cancellation.IsCancellationRequested()) return Cancelled();
         const Renderer::RHIBackend backend = Context_.Backend;
+        // Camera and rigid-object motion do not change scene-light contents.
+        // The queued RHI work captures shared immutable storage, not a vector.
+        const RealtimeLightCacheKey lightKey {request.Scene->Demo, request.Scene->Revision, request.Scene->LightingRevision};
+        if (!SceneLights_ || !(lightKey == LightCacheKey_))
+        {
+            std::string error;
+            auto lights = BuildRendererSceneLights(*request.Scene, error);
+            if (!lights) return Failed(error);
+            SceneLights_ = std::move(lights);
+            LightCacheKey_ = lightKey;
+        }
         const bool fullMaterial =
             backend == Renderer::RHIBackend::DX11 ||
             backend == Renderer::RHIBackend::DX12 ||
@@ -1448,27 +1973,89 @@ public:
             backend == Renderer::RHIBackend::Metal;
         const RealtimeSceneCacheKey sceneKey =
             MakeSceneCacheKey(request, backend, fullMaterial);
+        if (!request.Scene->World) WorldShadowBounds_.clear();
 
         struct ConfigureResult
         {
             bool Success = false;
             bool Cancelled = false;
             bool SceneInvalidated = false;
+            int DeferredDeviceSupport = DeviceSupportUnknown;
+            int SaoDeviceSupport = DeviceSupportUnknown;
+            int TemporalDeviceSupport = DeviceSupportUnknown;
+            int TemporalSuperResolutionDeviceSupport=DeviceSupportUnknown;
+            int VirtualShadowDeviceSupport=DeviceSupportUnknown;
+            int ExposureDeviceSupport = DeviceSupportUnknown;
+            int ParallaxDeviceSupport = DeviceSupportUnknown;
+            int DisplacementDeviceSupport = DeviceSupportUnknown;
+            int TessellationDeviceSupport = DeviceSupportUnknown;
+            int VirtualGeometryDeviceSupport = DeviceSupportUnknown;
+            int NaniteDeviceSupport = DeviceSupportUnknown;
+            int MeshShaderDeviceSupport = DeviceSupportUnknown;
+            std::uint64_t SceneStorageBlockBytes = 0;
+            bool MaterialAnisotropicFiltering = false;
+            int NaniteHardwareDeviceSupport=DeviceSupportUnknown;
+            int LumenHardwareDeviceSupport=DeviceSupportUnknown;
+            int GIDeviceSupport = DeviceSupportUnknown;
+            int FogDeviceSupport = DeviceSupportUnknown;
+            int VolumeLightDeviceSupport = DeviceSupportUnknown;
+            int LightShaftDeviceSupport = DeviceSupportUnknown;
+            int PeelingDeviceSupport = DeviceSupportUnknown;
+            int RayAODeviceSupport = DeviceSupportUnknown;
+            int RayReflectionDeviceSupport = DeviceSupportUnknown;
+            int RayGIDeviceSupport = DeviceSupportUnknown;
+            int VoxelDeviceSupport = DeviceSupportUnknown;
+            int LumenDeviceSupport=DeviceSupportUnknown;
+            int PathDeviceSupport = DeviceSupportUnknown;
+            int GpuDrivenDeviceSupport = DeviceSupportUnknown;
+            int VisibilityDeviceSupport = DeviceSupportUnknown;
+            int HybridDeviceSupport = DeviceSupportUnknown;
+            int VSMDeviceSupport = DeviceSupportUnknown;
+            int ContactDeviceSupport = DeviceSupportUnknown;
+            int ForwardPlusDeviceSupport = DeviceSupportUnknown;
+            int ClusteredDeviceSupport = DeviceSupportUnknown;
+            int TiledDeviceSupport = DeviceSupportUnknown;
+            std::uint32_t MultisampleCounts = 0;
+            std::uint32_t WeightedTransparencySampleCounts = 0;
             std::string Error;
         };
-        std::shared_ptr<const std::vector<Renderer::MeshData>> meshes;
-        bool convertedSceneCandidate = false;
-        if (SceneCacheValid_ && sceneKey == SceneCacheKey_)
+        const bool incrementalWorld=request.Scene->World && UploadedSceneValid_ && SceneCacheMeshes_ &&
+            UploadedSceneKey_.Demo==sceneKey.Demo && UploadedSceneKey_.Revision==sceneKey.Revision &&
+            UploadedSceneKey_.Backend==sceneKey.Backend;
+        const auto previousMeshes=SceneCacheMeshes_;
+        std::unordered_set<SceneNodeId> dynamicNodes;
+        SceneSnapshot changedScene;
+        if (incrementalWorld)
         {
-            meshes = SceneCacheMeshes_;
+            changedScene.Materials=request.Scene->Materials;
+            changedScene.World=request.Scene->World;
+            for (const auto& node:request.Scene->Nodes)
+            {
+                const auto previous=SceneCacheSources_.find(node.Id);
+                if (previous==SceneCacheSources_.end() || previous->second!=node.Mesh)
+                { dynamicNodes.insert(node.Id); changedScene.Nodes.push_back(node); }
+            }
         }
+        std::shared_ptr<const MeshList> meshes;
+        bool convertedSceneCandidate = false;
+        if (SceneCacheValid_ && sceneKey == SceneCacheKey_) meshes = SceneCacheMeshes_;
         else
         {
-            meshes = std::make_shared<std::vector<Renderer::MeshData>>(
-                BuildRendererMeshes(
-                    *request.Scene,
-                    cancellation,
-                    fullMaterial));
+            // Deforming lakebed vertices retain immutable procedural textures.
+            // Stable image identity keeps native texture and vertex allocations resident.
+            if (!incrementalWorld) SceneImageCache_.clear();
+            auto converted=BuildRendererMeshes(incrementalWorld?changedScene:*request.Scene,cancellation,fullMaterial,&SceneImageCache_);
+            auto next=std::make_shared<MeshList>();
+            next->reserve(incrementalWorld?std::max(converted.size(),previousMeshes->size()):converted.size());
+            for (auto& mesh:converted) next->push_back(std::make_shared<Renderer::MeshData>(std::move(mesh)));
+            if (incrementalWorld)
+            {
+                std::unordered_set<SceneNodeId> present;
+                for (const auto& node:request.Scene->Nodes) present.insert(node.Id);
+                for (const auto& mesh:*previousMeshes)
+                    if (present.count(mesh->SelectionGroup) && !dynamicNodes.count(mesh->SelectionGroup)) next->push_back(mesh);
+            }
+            meshes=std::move(next);
             convertedSceneCandidate = true;
         }
         if (cancellation.IsCancellationRequested()) return Cancelled();
@@ -1487,16 +2074,25 @@ public:
             request.Scene->SceneCamera.VerticalFieldOfViewDegrees * Pi / 180.0f,
             aspect,
             0.05f,
-            1000.0f);
-        const Renderer::Matrix4 viewProjection = ToRendererMatrix(projection * view);
-        const Renderer::LightingState lighting = BuildRendererLighting(*request.Scene);
+            request.Scene->World ? 10000.0f : 1000.0f);
+        const Renderer::LightingState lighting = BuildRendererLighting(*request.Scene, SceneLights_);
+        // Local-space vertex/index buffers remain resident during rigid motion.
+        // Material sections share their source node's current transform.
+        std::unordered_map<SceneNodeId, Renderer::Matrix4> worldTransforms;
+        for (const SceneNode& node : request.Scene->Nodes)
+            worldTransforms.emplace(node.Id, ToRendererMatrix(ToMath(node.LocalTransform).ToMatrix()));
         ShadowFrame shadowFrame;
-        if (settings.ShadowsEnabled && settings.Mode != FillMode::Wireframe)
+        const bool requestedPaths = Techniques::UsesPathTracing(settings.Techniques.Pipeline) && PathDeviceSupport_.load() == DeviceSupportAvailable;
+        if (!requestedPaths && settings.ShadowsEnabled && settings.Mode != FillMode::Wireframe)
         {
-            if (!ShadowCacheValid_ || !(sceneKey == ShadowCacheKey_))
+            if (!ShadowCacheValid_ || !(sceneKey == ShadowCacheKey_) ||
+                ShadowTransformRevision_ != request.Scene->TransformRevision ||
+                ShadowLightingRevision_ != request.Scene->LightingRevision)
             {
-                CachedShadow_ = BuildShadowFrame(*request.Scene, !fullMaterial);
+                CachedShadow_ = BuildShadowFrame(*request.Scene,!fullMaterial,request.Scene->World?&WorldShadowBounds_:nullptr);
                 ShadowCacheKey_ = sceneKey;
+                ShadowTransformRevision_ = request.Scene->TransformRevision;
+                ShadowLightingRevision_ = request.Scene->LightingRevision;
                 ShadowCacheValid_ = true;
             }
             shadowFrame = CachedShadow_;
@@ -1504,8 +2100,12 @@ public:
         const Renderer::Matrix4 lightViewProjection = ToRendererMatrix(
             shadowFrame.Valid ? shadowFrame.ViewProjection : Maths::Matrix4::Identity());
         const bool enqueued = Context_.Thread.Enqueue(
-            [meshes, configured, settings, backend, viewProjection, lightViewProjection, lighting,
-             hasShadowFrame = shadowFrame.Valid, uploadScene, cancellation](
+            [meshes, configured, settings, backend, cameraView = ToRendererMatrix(view), cameraProjection = ToRendererMatrix(projection), lightViewProjection, lighting,
+             hasShadowFrame = shadowFrame.Valid, uploadScene, cancellation, incrementalWorld, previousMeshes, dynamicNodes,
+             worldTransforms = std::move(worldTransforms), sampleTime = request.Scene->SampleTimeSeconds,
+             triangleCount=request.Scene->TriangleCountAtLoad,
+             world=request.Scene->World, historyEpoch = request.HistoryEpoch, bakedLightingDirectory=request.Scene->ActiveBakedLightingDirectory(),
+             environment=request.Scene->Environment, volume=request.Scene->Volume](
                 Renderer::Renderer& renderer)
             {
                 ConfigureResult result;
@@ -1530,7 +2130,6 @@ public:
                         // Runtime backend switching can create an independent
                         // DX12 presentation device. Keep the process-global
                         // debug layer opt-in so it cannot reset that device.
-                        createInfo.EnableValidation = false;
                         createInfo.CaptureDiagnosticBuffers = false;
                         createInfo.ShadowMapSize = shadowMapSize;
                         return renderer.Initialize(createInfo);
@@ -1562,21 +2161,83 @@ public:
                         rendererRecreated = true;
                     }
 
-                    const bool replaceScene = uploadScene || rendererRecreated;
+                    const auto capabilities=renderer.GetCapabilities();
+                    const auto deviceSupport=[](bool available) { return available?DeviceSupportAvailable:DeviceSupportUnavailable; };
+                    result.MultisampleCounts = capabilities.SupportedSampleCounts;
+                    result.WeightedTransparencySampleCounts = capabilities.WeightedTransparencySampleCounts;
+                    result.DeferredDeviceSupport = deviceSupport(capabilities.DeferredShading);
+                    result.SaoDeviceSupport = deviceSupport(capabilities.ScalableAmbientObscurance);
+                    result.ExposureDeviceSupport = deviceSupport(capabilities.TemporalEffects);
+                    result.ParallaxDeviceSupport = deviceSupport(capabilities.ParallaxOcclusion);
+                    result.DisplacementDeviceSupport = deviceSupport(capabilities.GeometryDisplacement);
+                    result.TessellationDeviceSupport = deviceSupport(capabilities.GeometryTessellation);
+                    result.VirtualGeometryDeviceSupport = deviceSupport(capabilities.GeometryVirtualization);
+                    result.NaniteDeviceSupport = deviceSupport(capabilities.NaniteRendering);
+                    result.MeshShaderDeviceSupport = deviceSupport(capabilities.MeshShaders);
+                    result.SceneStorageBlockBytes = capabilities.SceneStorageBlockBytes;
+                    result.MaterialAnisotropicFiltering = capabilities.MaterialAnisotropicFiltering;
+                    result.NaniteHardwareDeviceSupport = deviceSupport(capabilities.NaniteHardwareScheduling);
+                    result.LumenHardwareDeviceSupport = deviceSupport(capabilities.LumenHardwareRayTracing);
+                    result.TemporalSuperResolutionDeviceSupport = deviceSupport(capabilities.TemporalSuperResolution);
+                    result.VirtualShadowDeviceSupport = deviceSupport(capabilities.VirtualShadowMaps);
+                    result.TemporalDeviceSupport = deviceSupport(capabilities.TemporalAntiAliasing);
+                    result.GIDeviceSupport = deviceSupport(capabilities.ScreenSpaceGlobalIllumination);
+                    result.FogDeviceSupport = deviceSupport(capabilities.VolumetricFog);
+                    result.VolumeLightDeviceSupport = deviceSupport(capabilities.VolumetricLighting);
+                    result.VSMDeviceSupport = deviceSupport(capabilities.VarianceShadowMaps);
+                    result.ContactDeviceSupport = deviceSupport(capabilities.ContactShadows);
+                    result.ForwardPlusDeviceSupport = deviceSupport(capabilities.ForwardPlusRendering);
+                    result.ClusteredDeviceSupport = deviceSupport(capabilities.ClusteredForwardRendering);
+                    result.TiledDeviceSupport = deviceSupport(capabilities.TiledDeferredRendering);
+                    result.PeelingDeviceSupport = deviceSupport(capabilities.DepthPeeling);
+                    result.RayAODeviceSupport = deviceSupport(capabilities.RayTracedAmbientOcclusion);
+                    result.RayReflectionDeviceSupport = deviceSupport(capabilities.RayTracedReflections);
+                    result.RayGIDeviceSupport = deviceSupport(capabilities.RayTracedGI);
+                    result.VoxelDeviceSupport = deviceSupport(capabilities.VoxelGI);
+                    result.LumenDeviceSupport = deviceSupport(capabilities.LumenGI);
+                    result.PathDeviceSupport = deviceSupport(capabilities.PathTracing);
+                    result.GpuDrivenDeviceSupport = deviceSupport(capabilities.GPUDrivenRendering);
+                    result.VisibilityDeviceSupport = deviceSupport(capabilities.VisibilityBufferRendering);
+                    result.HybridDeviceSupport = deviceSupport(capabilities.HybridRendering);
+                    result.LightShaftDeviceSupport = deviceSupport(capabilities.LightShafts);
+                    const bool replaceScene = (uploadScene && !incrementalWorld) || rendererRecreated;
                     if (replaceScene)
                     {
                         renderer.ClearScene();
                         result.SceneInvalidated = true;
                     }
+                    renderer.SetGpuPresentationEnabled(settings.GpuPresentation);
                     renderer.SetAutomaticViewProjection(false);
-                    renderer.SetViewProjection(viewProjection);
+                    renderer.SetCameraMatrices(cameraView, cameraProjection);
+                    renderer.SetFrameTime(sampleTime, historyEpoch);
+                    const auto wind=world?world->Settings:BigWorldSettings{};
+                    const float windAngle=wind.WindDirection*3.14159265f/180;
+                    renderer.SetVegetation(world?world->VegetationTime:0,
+                        {std::cos(windAngle),std::sin(windAngle),0,wind.WindSpeed*0.045f},
+                        {wind.GustWavelength,wind.GustStrength,wind.LeafFlutter,0});
                     renderer.SetLightViewProjection(lightViewProjection);
                     renderer.SetLighting(lighting);
-                    renderer.SetRenderMode(ToRendererMode(settings.Mode));
-                    renderer.SetShadowsEnabled(settings.ShadowsEnabled && hasShadowFrame);
+                    // A newly selected backend has not published its limits to
+                    // the UI yet. Resolve scene storage here as well, before the
+                    // first frame can allocate an oversized world-space table.
+                    auto sceneSettings=settings.Techniques;
+                    // From inside the lake the water mesh resolves the refracted
+                    // sky and total internal reflection at the interface.
+                    if (world && world->CameraUnderwater) sceneSettings.Reflections.Planar.Enabled=false;
+                    if (capabilities.SceneStorageBlockBytes)
+                        sceneSettings=Renderer::ConstrainSceneTriangleStorage(sceneSettings,triangleCount,capabilities.SceneStorageBlockBytes);
+                    renderer.SetTechniqueSettings(sceneSettings);
+                    renderer.SetRenderBuffer(settings.Buffer);
+                    renderer.SetBakedLightingDirectory(bakedLightingDirectory);
+                    renderer.SetEnvironmentRadiance(environment);
+                    renderer.SetDensityVolume(volume);
+                    const bool paths = Techniques::UsesPathTracing(renderer.GetTechniqueSettings().Pipeline);
+                    renderer.SetRenderMode(paths ? Renderer::RenderMode::Solid : ToRendererMode(settings.Mode));
+                    renderer.SetHairSelectionGroup(settings.SelectedNode);
+                    renderer.SetShadowsEnabled(settings.ShadowsEnabled && (paths || hasShadowFrame));
                     if (replaceScene)
                     {
-                        for (const Renderer::MeshData& mesh : *meshes)
+                        for (const auto& mesh : *meshes)
                         {
                             if (cancellation.IsCancellationRequested())
                             {
@@ -1584,7 +2245,7 @@ public:
                                 configured->set_value(std::move(result));
                                 return;
                             }
-                            if (!renderer.AddMesh(mesh))
+                            if (!renderer.AddMesh(*mesh))
                             {
                                 result.Error = renderer.GetLastError();
                                 configured->set_value(std::move(result));
@@ -1592,7 +2253,21 @@ public:
                             }
                         }
                     }
-                    for (const Renderer::MeshData& mesh : *meshes)
+                    if (incrementalWorld && uploadScene && !replaceScene)
+                    {
+                        // Mark a partial update invalid until the complete batch succeeds.
+                        result.SceneInvalidated=true;
+                        std::unordered_set<std::string> oldIds,newIds;
+                        for (const auto& previous:*previousMeshes) oldIds.insert(previous->Id);
+                        for (const auto& current:*meshes) newIds.insert(current->Id);
+                        for (const auto& previous:*previousMeshes)
+                            if (!newIds.count(previous->Id) && !renderer.RemoveMesh(previous->Id)) throw std::runtime_error(renderer.GetLastError());
+                        for (const auto& current:*meshes)
+                            if (dynamicNodes.count(current->SelectionGroup))
+                                if (!(oldIds.count(current->Id)?renderer.UpdateMesh(*current):renderer.AddMesh(*current)))
+                                    throw std::runtime_error(renderer.GetLastError());
+                    }
+                    for (const auto& mesh : *meshes)
                     {
                         if (cancellation.IsCancellationRequested())
                         {
@@ -1601,10 +2276,19 @@ public:
                             return;
                         }
                         Renderer::OutlineSettings outline;
-                        outline.Enabled = settings.OutlineEnabled &&
+                        const auto transform = worldTransforms.find(mesh->SelectionGroup);
+                        if (transform == worldTransforms.end() ||
+                            !renderer.SetWorldTransform(mesh->Id, transform->second))
+                        {
+                            result.SceneInvalidated = true;
+                            result.Error = "Resident mesh has no valid source-node transform";
+                            configured->set_value(std::move(result));
+                            return;
+                        }
+                        outline.Enabled = settings.Buffer==Techniques::RenderBuffer::Color && settings.OutlineEnabled &&
                                           settings.SelectedNode != 0 &&
-                                          mesh.SelectionGroup == settings.SelectedNode;
-                        if (!renderer.SetOutline(mesh.Id, outline))
+                                          mesh->SelectionGroup == settings.SelectedNode;
+                        if (!renderer.SetOutline(mesh->Id, outline))
                         {
                             // A missing mesh means the tracked resident scene
                             // no longer matches the Renderer instance.
@@ -1628,6 +2312,69 @@ public:
             });
         if (!enqueued) return Failed("Could not enqueue the realtime scene on the RHI thread");
         const ConfigureResult configureResult = configureFuture.get();
+        if (configureResult.MultisampleCounts)
+        {
+            MultisampleCounts_.store(configureResult.MultisampleCounts);
+            WeightedTransparencyCounts_.store(configureResult.WeightedTransparencySampleCounts);
+        }
+        if (configureResult.DeferredDeviceSupport != DeviceSupportUnknown)
+            DeferredDeviceSupport_.store(configureResult.DeferredDeviceSupport);
+        if (configureResult.SaoDeviceSupport != DeviceSupportUnknown)
+            SaoDeviceSupport_.store(configureResult.SaoDeviceSupport);
+        if (configureResult.ExposureDeviceSupport != DeviceSupportUnknown) ExposureDeviceSupport_.store(configureResult.ExposureDeviceSupport);
+        if (configureResult.ParallaxDeviceSupport != DeviceSupportUnknown) ParallaxDeviceSupport_.store(configureResult.ParallaxDeviceSupport);
+        if (configureResult.DisplacementDeviceSupport != DeviceSupportUnknown) DisplacementDeviceSupport_.store(configureResult.DisplacementDeviceSupport);
+        if (configureResult.TessellationDeviceSupport != DeviceSupportUnknown) TessellationDeviceSupport_.store(configureResult.TessellationDeviceSupport);
+        if (configureResult.NaniteDeviceSupport != DeviceSupportUnknown) NaniteDeviceSupport_.store(configureResult.NaniteDeviceSupport);
+        if (configureResult.MeshShaderDeviceSupport != DeviceSupportUnknown) MeshShaderDeviceSupport_.store(configureResult.MeshShaderDeviceSupport);
+        if (configureResult.Success)
+        {
+            SceneStorageBlockBytes_.store(configureResult.SceneStorageBlockBytes);
+            MaterialAnisotropicFiltering_.store(configureResult.MaterialAnisotropicFiltering);
+        }
+        if (configureResult.NaniteHardwareDeviceSupport!=DeviceSupportUnknown) NaniteHardwareDeviceSupport_.store(configureResult.NaniteHardwareDeviceSupport);
+        if (configureResult.LumenHardwareDeviceSupport!=DeviceSupportUnknown) LumenHardwareDeviceSupport_.store(configureResult.LumenHardwareDeviceSupport);
+        if (configureResult.VirtualGeometryDeviceSupport != DeviceSupportUnknown) VirtualGeometryDeviceSupport_.store(configureResult.VirtualGeometryDeviceSupport);
+        if (configureResult.TemporalSuperResolutionDeviceSupport!=DeviceSupportUnknown) TemporalSuperResolutionDeviceSupport_.store(configureResult.TemporalSuperResolutionDeviceSupport);
+        if (configureResult.VirtualShadowDeviceSupport!=DeviceSupportUnknown) VirtualShadowDeviceSupport_.store(configureResult.VirtualShadowDeviceSupport);
+        if (configureResult.TemporalDeviceSupport != DeviceSupportUnknown)
+            TemporalDeviceSupport_.store(configureResult.TemporalDeviceSupport);
+        if (configureResult.GIDeviceSupport != DeviceSupportUnknown)
+            GIDeviceSupport_.store(configureResult.GIDeviceSupport);
+        if (configureResult.FogDeviceSupport != DeviceSupportUnknown)
+            FogDeviceSupport_.store(configureResult.FogDeviceSupport);
+        if (configureResult.VolumeLightDeviceSupport != DeviceSupportUnknown)
+            VolumeLightDeviceSupport_.store(configureResult.VolumeLightDeviceSupport);
+        if (configureResult.VSMDeviceSupport != DeviceSupportUnknown)
+            VSMDeviceSupport_.store(configureResult.VSMDeviceSupport);
+        if (configureResult.ContactDeviceSupport != DeviceSupportUnknown)
+            ContactDeviceSupport_.store(configureResult.ContactDeviceSupport);
+        if (configureResult.ForwardPlusDeviceSupport != DeviceSupportUnknown)
+            ForwardPlusDeviceSupport_.store(configureResult.ForwardPlusDeviceSupport);
+        if (configureResult.ClusteredDeviceSupport != DeviceSupportUnknown)
+            ClusteredDeviceSupport_.store(configureResult.ClusteredDeviceSupport);
+        if (configureResult.TiledDeviceSupport != DeviceSupportUnknown)
+            TiledDeviceSupport_.store(configureResult.TiledDeviceSupport);
+        if (configureResult.PeelingDeviceSupport != DeviceSupportUnknown)
+            PeelingDeviceSupport_.store(configureResult.PeelingDeviceSupport);
+        if (configureResult.PathDeviceSupport != DeviceSupportUnknown)
+            PathDeviceSupport_.store(configureResult.PathDeviceSupport);
+        if (configureResult.HybridDeviceSupport != DeviceSupportUnknown)
+            HybridDeviceSupport_.store(configureResult.HybridDeviceSupport);
+        if (configureResult.VisibilityDeviceSupport != DeviceSupportUnknown)
+            VisibilityDeviceSupport_.store(configureResult.VisibilityDeviceSupport);
+        if (configureResult.GpuDrivenDeviceSupport != DeviceSupportUnknown)
+            GpuDrivenDeviceSupport_.store(configureResult.GpuDrivenDeviceSupport);
+        if (configureResult.VoxelDeviceSupport != DeviceSupportUnknown) VoxelDeviceSupport_.store(configureResult.VoxelDeviceSupport);
+        if (configureResult.LumenDeviceSupport!=DeviceSupportUnknown) LumenDeviceSupport_.store(configureResult.LumenDeviceSupport);
+        if (configureResult.RayGIDeviceSupport != DeviceSupportUnknown)
+            RayGIDeviceSupport_.store(configureResult.RayGIDeviceSupport);
+        if (configureResult.RayReflectionDeviceSupport != DeviceSupportUnknown)
+            RayReflectionDeviceSupport_.store(configureResult.RayReflectionDeviceSupport);
+        if (configureResult.RayAODeviceSupport != DeviceSupportUnknown)
+            RayAODeviceSupport_.store(configureResult.RayAODeviceSupport);
+        if (configureResult.LightShaftDeviceSupport != DeviceSupportUnknown)
+            LightShaftDeviceSupport_.store(configureResult.LightShaftDeviceSupport);
         if (configureResult.Success)
         {
             UploadedSceneKey_ = sceneKey;
@@ -1636,6 +2383,8 @@ public:
             {
                 SceneCacheKey_ = sceneKey;
                 SceneCacheMeshes_ = meshes;
+                SceneCacheSources_.clear();
+                if (request.Scene->World) for (const auto& node:request.Scene->Nodes) SceneCacheSources_.emplace(node.Id,node.Mesh);
                 SceneCacheValid_ = true;
             }
         }
@@ -1692,21 +2441,78 @@ public:
         if (cancellation.IsCancellationRequested()) return Cancelled();
         struct ReadbackResult
         {
+            std::string BakedLightingStatus;
+            std::string VoxelGIStatus;
+            std::string LumenGIStatus;
+            std::string HairFurStatus;
+            bool HairGeometryPending = false;
             Image Output;
             std::string Error;
+            bool NeedsTemporalFrame = false;
+            std::uint32_t PathTracingSamples = 0;
+            GeometryStatistics Geometry;
         };
         const std::shared_ptr<std::promise<ReadbackResult>> readback =
             std::make_shared<std::promise<ReadbackResult>>();
         std::future<ReadbackResult> readbackFuture = readback->get_future();
         if (!Context_.Thread.Enqueue(
-                [readback](Renderer::Renderer& renderer)
+                [readback,contextMutex=Context_.RenderMutex](Renderer::Renderer& renderer)
                 {
                     ReadbackResult result;
                     try
                     {
-                        result.Output = ToEditorImage(
-                            renderer.GetLastFrameCaptureView());
+                        auto capture = renderer.TakeLastFrameCapture();
+                        if(capture.GpuContext && capture.GpuContext->Backend==Renderer::RHIBackend::OpenGLES)
+                        {
+                            auto context=std::make_shared<Renderer::GpuImage>(*capture.GpuContext);
+                            // The EGL context migrates between the render and UI threads under this mutex.
+                            context->Owner=contextMutex;capture.GpuContext=std::move(context);
+                        }
+                        result.Output = ToEditorImage(capture);
                         result.Error = renderer.GetLastError();
+                        result.NeedsTemporalFrame = capture.NeedsTemporalFrame;
+                        result.PathTracingSamples = capture.Statistics.PathTracingSampleCount;
+                        result.BakedLightingStatus = std::move(capture.BakedLightingStatus);
+                        result.VoxelGIStatus = std::move(capture.VoxelGIStatus);
+                        result.LumenGIStatus=std::move(capture.LumenGIStatus);
+                        result.HairFurStatus = std::move(capture.HairFurStatus);
+                        result.HairGeometryPending = capture.HairGeometryPending;
+                        const auto& statistics = capture.Statistics;
+                        result.Geometry = {statistics.LodReducedMeshCount, true, statistics.DrawCallCount, statistics.InstancedDrawCallCount,
+                            statistics.IndirectDrawCallCount, statistics.GpuCandidateInstanceCount,
+                            statistics.VisibilityRasterDrawCount, statistics.VisibilityMaterialDrawCount, statistics.HybridRenderingPassCount, statistics.SubsurfacePassCount,
+                            static_cast<std::uint32_t>(capture.VoxelGIPasses.size()),statistics.HairFurPassCount,statistics.ParallaxMaterialDrawCount,statistics.DisplacedMeshCount,statistics.DisplacedVertexCount,statistics.DisplacementPreparationDispatches,statistics.DisplacementGeneration,statistics.TessellatedMeshCount,statistics.TessellatedVertexCount,statistics.TessellationPreparationDispatches,statistics.GeometryPreparationDispatches,statistics.PreparedGeometryGeneration,statistics.VirtualMeshCount,statistics.VirtualNodeCount,statistics.VirtualResidentPages,statistics.VirtualPendingPages,statistics.VirtualUploadedPages,statistics.VirtualCopiedPages,statistics.VirtualBootstrapPages,statistics.VirtualUploadedBytes,statistics.VirtualCopiedBytes,statistics.VirtualPoolBytes,statistics.VirtualGeometryGeneration,statistics.NaniteMeshCount,statistics.NaniteSelectedClusters,statistics.NanitePendingPages,statistics.NaniteUploadedPages,statistics.NaniteGeometryAssemblyCount,statistics.NaniteRasterExportCount,statistics.NaniteOcclusionQueries,statistics.NaniteOcclusionPhases,statistics.NaniteGeometryGeneration,statistics.NaniteMaterialBinCount};
+                        result.Geometry.NaniteReadbackBytes=statistics.NaniteReadbackBytes;
+                        result.Geometry.NaniteHostRebuiltVertices=statistics.NaniteHostRebuiltVertices;
+                        result.Geometry.NaniteScenePageBudget=statistics.NaniteScenePageBudget;
+                        result.Geometry.NaniteFamilyCount=statistics.NaniteFamilyCount;
+                        result.Geometry.NaniteViewCount=statistics.NaniteViewCount;
+                        result.Geometry.NaniteBudgetBlockedGroups=statistics.NaniteBudgetBlockedGroups;
+                        result.Geometry.NaniteCookRequests=statistics.NaniteCookRequests;
+                        result.Geometry.NaniteRootPages=statistics.NaniteRootPages;
+                        result.Geometry.NaniteAllocatedPages=statistics.NaniteAllocatedPages;
+                        result.Geometry.NaniteCookSourceBytes=statistics.NaniteCookSourceBytes;
+                        result.Geometry.NanitePreparationMicroseconds=statistics.NanitePreparationMicroseconds;
+                        result.Geometry.NaniteBudgetLimited=statistics.NaniteBudgetLimited;
+                        result.Geometry.GpuFrameMilliseconds=statistics.GpuFrameMilliseconds;
+                        result.Geometry.GpuFrameTimingAvailable=statistics.GpuFrameTimingAvailable;
+                        result.Geometry.MeshShaderDispatches=statistics.MeshShaderDispatchCount;
+                        result.Geometry.NaniteHardwareDispatches=statistics.NaniteHardwareDispatchCount;
+                        result.Geometry.LumenHardwareRaySlots=statistics.LumenHardwareRayCount;
+                        result.Geometry.RenderWidth=capture.RenderWidth?capture.RenderWidth:capture.Width;
+                        result.Geometry.RenderHeight=capture.RenderHeight?capture.RenderHeight:capture.Height;
+                        result.Geometry.TSRPasses=statistics.TemporalSuperResolutionPassCount;
+                        result.Geometry.TSRSerial=statistics.TemporalSuperResolutionSerial;
+                        result.Geometry.TSRHistoryValid=statistics.TemporalSuperResolutionHistoryValid;
+                        result.Geometry.TSRForegroundPixels=statistics.TemporalSuperResolutionForegroundPixels;
+                        result.Geometry.TSRValidMotionPixels=statistics.TemporalSuperResolutionValidMotionPixels;
+                        result.Geometry.TSRAccumulatedPixels=statistics.TemporalSuperResolutionAccumulatedPixels;
+                        result.Geometry.VirtualShadowSerial=statistics.VirtualShadowSerial;
+                        result.Geometry.VirtualShadowRequestedPages=statistics.VirtualShadowRequestedPages;
+                        result.Geometry.VirtualShadowResidentPages=statistics.VirtualShadowResidentPages;
+                        result.Geometry.VirtualShadowRenderedPages=statistics.VirtualShadowRenderedPages;
+                        result.Geometry.VirtualShadowCopiedPages=statistics.VirtualShadowCopiedPages;
+                        result.Geometry.VirtualShadowDrawCalls=statistics.VirtualShadowDrawCalls;
                     }
                     catch (const std::exception& exception)
                     {
@@ -1726,16 +2532,29 @@ public:
         RenderResult preview;
         preview.Status = RenderStatus::Completed;
         preview.Output = std::move(readbackResult.Output);
+        preview.NeedsTemporalFrame = readbackResult.NeedsTemporalFrame;
+        preview.PathTracingSamples = readbackResult.PathTracingSamples;
+        preview.BakedLightingStatus = std::move(readbackResult.BakedLightingStatus);
+        preview.VoxelGIStatus = std::move(readbackResult.VoxelGIStatus);
+        preview.LumenGIStatus=std::move(readbackResult.LumenGIStatus);
+        preview.HairFurStatus = std::move(readbackResult.HairFurStatus);
+        preview.HairGeometryPending = readbackResult.HairGeometryPending;
+        preview.Geometry = readbackResult.Geometry;
         if (!preview.Output.IsValid())
         {
             return Failed("The realtime RHI returned an invalid color framebuffer");
         }
-        if (preview.Status == RenderStatus::Completed)
+        if (!request.Settings.ContinuousRendering && !preview.Output.GpuColor && preview.Status == RenderStatus::Completed)
         {
             std::lock_guard<std::mutex> lock(CacheMutex_);
             CacheKey_ = key;
             CachedResult_ = preview;
             CacheValid_ = true;
+        }
+        else if (request.Settings.ContinuousRendering || preview.Output.GpuColor)
+        {
+            std::lock_guard<std::mutex> lock(CacheMutex_);
+            CachedResult_={};CacheValid_ = false;
         }
         return preview;
     }
@@ -1743,18 +2562,67 @@ public:
 private:
     BackendDescriptor Descriptor_;
     RealtimeBackendContext Context_;
+    // Published from the render worker; GUI reads never call GL or block on it.
+    static constexpr int DeviceSupportUnknown = 0;
+    static constexpr int DeviceSupportAvailable = 1;
+    static constexpr int DeviceSupportUnavailable = 2;
+    std::atomic<int> DeferredDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> SaoDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> TemporalDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> TemporalSuperResolutionDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VirtualShadowDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> ExposureDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> ParallaxDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> DisplacementDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> TessellationDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VirtualGeometryDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> NaniteDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> MeshShaderDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<std::uint64_t> SceneStorageBlockBytes_ {0};
+    std::atomic<bool> MaterialAnisotropicFiltering_ {false};
+    std::atomic<int> NaniteHardwareDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> LumenHardwareDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> GIDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> FogDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VolumeLightDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> LightShaftDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> PeelingDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> RayAODeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> RayReflectionDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> RayGIDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VoxelDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> LumenDeviceSupport_{DeviceSupportUnknown};
+    std::atomic<int> PathDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> GpuDrivenDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VisibilityDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> HybridDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> VSMDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> ContactDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> ForwardPlusDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> ClusteredDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<int> TiledDeviceSupport_ {DeviceSupportUnknown};
+    std::atomic<std::uint32_t> MultisampleCounts_ {1};
+    std::atomic<std::uint32_t> WeightedTransparencyCounts_ {0};
     std::mutex CacheMutex_;
     bool CacheValid_ = false;
     RealtimeCacheKey CacheKey_;
     RenderResult CachedResult_;
     bool SceneCacheValid_ = false;
     RealtimeSceneCacheKey SceneCacheKey_;
-    std::shared_ptr<const std::vector<Renderer::MeshData>> SceneCacheMeshes_;
+    using MeshList=std::vector<std::shared_ptr<const Renderer::MeshData>>;
+    std::shared_ptr<const MeshList> SceneCacheMeshes_;
+    std::unordered_map<SceneNodeId,std::shared_ptr<const MeshAsset>> SceneCacheSources_;
+    RendererImageCache SceneImageCache_;
+    RealtimeLightCacheKey LightCacheKey_;
+    std::shared_ptr<const Renderer::SceneLightCollection> SceneLights_;
     bool UploadedSceneValid_ = false;
     RealtimeSceneCacheKey UploadedSceneKey_;
     bool ShadowCacheValid_ = false;
     RealtimeSceneCacheKey ShadowCacheKey_;
     ShadowFrame CachedShadow_;
+    MeshBoundsCache WorldShadowBounds_;
+    std::uint64_t ShadowTransformRevision_ = 0;
+    std::uint64_t ShadowLightingRevision_ = 0;
 };
 
 class RasterRenderAdapter final : public IRenderAdapter
@@ -1766,6 +2634,8 @@ public:
     }
 
     [[nodiscard]] BackendDescriptor Descriptor() const override { return Descriptor_; }
+
+    [[nodiscard]] bool QueryMaterialAnisotropicFiltering() const override { return IsAvailable(); }
 
     [[nodiscard]] bool IsAvailable() const override
     {
@@ -1787,10 +2657,10 @@ private:
 
 [[nodiscard]] std::uint32_t RayMaterialIndex(
     const SceneSnapshot& source,
-    const MeshAsset& mesh,
+    const SceneNode& node,
     std::size_t firstIndex)
 {
-    const Material* material = MaterialForTriangle(source, mesh, firstIndex);
+    const Material* material = MaterialForTriangle(source, node, firstIndex);
     if (material == nullptr) return 0;
     return static_cast<std::uint32_t>(material - source.Materials.data());
 }
@@ -1887,12 +2757,7 @@ using RayTextureCache =
         }
     }
 
-    std::size_t triangleCount = 0;
-    for (const SceneNode& node : source.Nodes)
-    {
-        if (node.Visible && node.Mesh) triangleCount += node.Mesh->Indices.size() / 3;
-    }
-    scene->Triangles.reserve(triangleCount);
+    scene->Triangles.reserve(source.TriangleCountAtLoad);
     for (const SceneNode& node : source.Nodes)
     {
         if (cancellation.IsCancellationRequested()) return nullptr;
@@ -1948,7 +2813,7 @@ using RayTextureCache =
             triangle.TexCoord1 = {v1.TexCoord.X, v1.TexCoord.Y};
             triangle.TexCoord2 = {v2.TexCoord.X, v2.TexCoord.Y};
             triangle.SmoothNormals = true;
-            triangle.MaterialIndex = RayMaterialIndex(source, mesh, firstIndex);
+            triangle.MaterialIndex = RayMaterialIndex(source, node, firstIndex);
             scene->Triangles.push_back(triangle);
         }
     }
@@ -1972,7 +2837,7 @@ using RayTextureCache =
                 sourceLight.LightColor.R,
                 sourceLight.LightColor.G,
                 sourceLight.LightColor.B};
-            light.Intensity = sourceLight.Intensity;
+            light.Intensity = sourceLight.Enabled ? sourceLight.Intensity : 0;
             light.CastShadows = castsShadows;
             scene->DirectionalLights.push_back(light);
         }
@@ -1987,7 +2852,8 @@ using RayTextureCache =
                 sourceLight.LightColor.R,
                 sourceLight.LightColor.G,
                 sourceLight.LightColor.B};
-            light.Intensity = sourceLight.Intensity;
+            light.Intensity = sourceLight.Enabled ? sourceLight.Intensity : 0;
+            light.Range = sourceLight.Range;
             light.CastShadows = castsShadows;
             scene->PointLights.push_back(light);
         }
@@ -2007,7 +2873,8 @@ using RayTextureCache =
                 sourceLight.LightColor.R,
                 sourceLight.LightColor.G,
                 sourceLight.LightColor.B};
-            light.Intensity = sourceLight.Intensity;
+            light.Intensity = sourceLight.Enabled ? sourceLight.Intensity : 0;
+            light.Range = sourceLight.Range;
             light.Size = {
                 sourceLight.AreaSize.X,
                 sourceLight.AreaSize.Y};
@@ -2061,7 +2928,9 @@ public:
         {
             std::lock_guard<std::mutex> lock(SceneCacheMutex_);
             if (CachedScene_ && CachedDemo_ == request.Scene->Demo &&
-                CachedRevision_ == request.Scene->Revision)
+                CachedRevision_ == request.Scene->Revision &&
+                CachedTransformRevision_ == request.Scene->TransformRevision &&
+                CachedLightingRevision_ == request.Scene->LightingRevision)
             {
                 scene = CachedScene_;
             }
@@ -2074,6 +2943,8 @@ public:
                 std::lock_guard<std::mutex> lock(SceneCacheMutex_);
                 CachedDemo_ = request.Scene->Demo;
                 CachedRevision_ = request.Scene->Revision;
+                CachedTransformRevision_ = request.Scene->TransformRevision;
+                CachedLightingRevision_ = request.Scene->LightingRevision;
                 CachedScene_ = scene;
             }
         }
@@ -2101,6 +2972,7 @@ public:
         settings.MaxReflectionBounces = 2;
         settings.ShadowsEnabled = request.Settings.ShadowsEnabled;
         settings.ShadowStrength = 0.55f;
+        settings.GpuPresentation=request.Settings.GpuPresentation;
         RayTracing::RenderJob job = RHI_->RenderAsync(scene, camera, settings);
         while (!job.IsReady())
         {
@@ -2122,8 +2994,9 @@ public:
         else
         {
             result.Status = RenderStatus::Completed;
-            result.Output.Width = rayResult.Output.GetWidth();
-            result.Output.Height = rayResult.Output.GetHeight();
+            result.Output.GpuColor=rayResult.GpuColor;
+            result.Output.Width = rayResult.GpuColor?request.Settings.Width:rayResult.Output.GetWidth();
+            result.Output.Height = rayResult.GpuColor?request.Settings.Height:rayResult.Output.GetHeight();
             result.Output.PixelsRGBA8 = rayResult.Output.GetPixelsRGBA8();
             result = ApplyRayPresentationOverlay(
                 request, cancellation, PresentationSceneCache_, std::move(result));
@@ -2139,6 +3012,8 @@ private:
     std::mutex SceneCacheMutex_;
     DemoId CachedDemo_ = DemoId::Triangle;
     std::uint64_t CachedRevision_ = 0;
+    std::uint64_t CachedTransformRevision_ = 0;
+    std::uint64_t CachedLightingRevision_ = 0;
     std::shared_ptr<const RayTracing::Scene> CachedScene_;
 };
 
@@ -2232,6 +3107,78 @@ struct PickCache
 }
 
 } // namespace
+
+bool CookNaniteAssets(const SceneSnapshot& scene,std::size_t& families,std::string& error)
+{
+    // Reuse the editor's section conversion and demo framing. Offline cooking
+    // must produce exactly the keys requested by the interactive renderer.
+    CancellationSource cancellation;
+    auto meshes=BuildRendererMeshes(scene,cancellation.Token(),true);
+    std::vector<std::vector<const Renderer::MeshData*>> groups;
+    for (const auto& mesh:meshes)
+    {
+        auto found=std::find_if(groups.begin(),groups.end(),[&](const auto& group)
+        {return mesh.SelectionGroup && group.front()->SelectionGroup==mesh.SelectionGroup;});
+        if (found==groups.end()) { groups.push_back({}); found=std::prev(groups.end()); }
+        found->push_back(&mesh);
+    }
+    families=0;
+    for (const auto& group:groups)
+    {
+        std::vector<Renderer::NaniteAssetSection> sections;
+        for (const auto* mesh:group) sections.push_back({&mesh->Vertices,&mesh->Indices,Renderer::HashMeshGeometry(mesh->Vertices,mesh->Indices)});
+        std::sort(sections.begin(),sections.end(),Renderer::NaniteAssetSectionLess);
+        sections.erase(std::unique(sections.begin(),sections.end(),[](const auto& a,const auto& b)
+        {return Renderer::EqualMeshGeometry(*a.Vertices,*a.Indices,*b.Vertices,*b.Indices);}),sections.end());
+        Renderer::NaniteAssetInput input;
+        if (!Renderer::AssembleNaniteAsset(sections,input,error)) return false;
+        Renderer::NaniteHierarchy hierarchy; Renderer::NanitePages pages;
+        if (!Renderer::LoadOrBuildNaniteAsset(input.Vertices,input.Indices,input.Materials,Techniques::DefaultNanitePhysicalPages,hierarchy,pages,error)) return false;
+        ++families;
+    }
+    if (!families) { error="The selected demo has no Nanite geometry"; return false; }
+    error.clear(); return true;
+}
+
+bool CookBakedLightingAssets(const SceneSnapshot& scene,const Techniques::Settings& settings,std::string& error)
+{
+    const auto directory=scene.ActiveBakedLightingDirectory();
+    if (directory.empty()) { error="The scene has no baked lighting resource directory"; return false; }
+    CancellationSource cancellation;
+    auto meshes=BuildRendererMeshes(scene,cancellation.Token(),true);
+    std::sort(meshes.begin(),meshes.end(),[](const auto& a,const auto& b) { return a.Id<b.Id; });
+    const auto lights=BuildRendererSceneLights(scene,error); if (!lights) return false;
+    Renderer::PreparedAreaLighting area;
+    if (!area.Prepare(BuildRendererLighting(scene,lights),settings.AreaLights,error)) return false;
+    const auto& lighting=area.GetLighting();
+    std::vector<Renderer::SceneRayMeshView> views;
+    std::vector<Renderer::LightmapSourceInstance> instances;
+    std::cout<<"Preparing Sponza lightmap LODs and UV2 receivers...\n"<<std::flush;
+    for (const auto& mesh:meshes)
+    {
+        views.emplace_back(mesh);
+        auto geometry=std::make_shared<Renderer::LightmapSourceGeometry>(); geometry->Vertices=mesh.Vertices;
+        Renderer::MeshLodChain chain;
+        if (!Renderer::BuildMeshLods(mesh.Vertices,mesh.Indices,{},chain,error)) return false;
+        for (auto& level:chain.Levels) geometry->Levels.push_back(std::move(level.Indices));
+        Renderer::LightmapSourceInstance instance; instance.Geometry=std::move(geometry); instance.World=mesh.WorldTransform;
+        instance.Color=mesh.Color; instance.Material=mesh.Material; instance.Visible=mesh.Visible; instance.CastShadow=mesh.CastShadow;
+        instances.push_back(std::move(instance));
+    }
+    auto request=Renderer::MakeLightmapBakeRequest(std::move(instances),settings,lighting,true);
+    auto receivers=std::make_shared<Renderer::LightmapReceivers>();
+    if (!Renderer::BuildLightmapReceivers(request.Instances,request.Materials,request.Atlas,*receivers,error)) return false;
+    std::cout<<"Baking Sponza lightmap ("<<request.Atlas.Resolution<<" x "<<request.Atlas.Resolution<<", "<<request.Sampling.RayCount<<" rays per hemisphere)...\n"<<std::flush;
+    auto irradiance=std::make_shared<Renderer::BakedLightmap>();
+    if (!Renderer::BakeLightmap(receivers->Atlas,*receivers->TransportScene,lighting,request.Sampling,*irradiance,error)) return false;
+    Renderer::LightmapBakeResult result; result.Receivers=receivers; result.Irradiance=irradiance;
+    if (!Renderer::SaveLightmapAsset(directory/"irradiance.evlightmap",request,result,error)) return false;
+    std::cout<<"Baking Sponza light probes...\n"<<std::flush;
+    Renderer::BakedProbeCache probes;
+    if (!probes.Update(views,1,settings,lighting,true,error) || !probes.Samples()) return false;
+    return Renderer::SaveProbeAsset(directory/"irradiance.evprobes",
+        Renderer::ProbeAssetKey(views,settings,lighting,true),*probes.Samples(),error);
+}
 
 void RegisterModuleAdapters(EditorCore& editor)
 {

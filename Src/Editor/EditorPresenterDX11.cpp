@@ -1,3 +1,5 @@
+#include "Renderer/Types.h"
+#include "Renderer/D3DShaderCache.h"
 #include "Editor/EditorPresenterDX11.h"
 
 #if defined(_WIN32)
@@ -11,6 +13,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -239,7 +242,7 @@ float4 PS(VSOutput input) : SV_TARGET
         ID3DBlob* vertexBlob = nullptr;
         ID3DBlob* pixelBlob = nullptr;
         ID3DBlob* errorBlob = nullptr;
-        HRESULT result = D3DCompile(
+        HRESULT result = Evans::Renderer::CompileCachedD3DShader(
             shaderSource,
             std::strlen(shaderSource),
             "EvansEditorPresenter",
@@ -255,13 +258,13 @@ float4 PS(VSOutput input) : SV_TARGET
         {
             std::string error = errorBlob != nullptr
                 ? static_cast<const char*>(errorBlob->GetBufferPointer())
-                : HResultMessage("D3DCompile(VS)", result);
+                : HResultMessage("Evans::Renderer::CompileCachedD3DShader(VS)", result);
             SafeRelease(errorBlob);
             return Fail(error);
         }
         SafeRelease(errorBlob);
 
-        result = D3DCompile(
+        result = Evans::Renderer::CompileCachedD3DShader(
             shaderSource,
             std::strlen(shaderSource),
             "EvansEditorPresenter",
@@ -277,7 +280,7 @@ float4 PS(VSOutput input) : SV_TARGET
         {
             std::string error = errorBlob != nullptr
                 ? static_cast<const char*>(errorBlob->GetBufferPointer())
-                : HResultMessage("D3DCompile(PS)", result);
+                : HResultMessage("Evans::Renderer::CompileCachedD3DShader(PS)", result);
             SafeRelease(errorBlob);
             SafeRelease(vertexBlob);
             return Fail(error);
@@ -389,7 +392,7 @@ float4 PS(VSOutput input) : SV_TARGET
         {
             return false;
         }
-        if (ImageTexture != nullptr && ImageWidth == image.Width && ImageHeight == image.Height)
+        if (ImageTexture != nullptr && ImageWidth == image.Width && ImageHeight == image.Height && GpuImageTexture == bool(image.GpuColor))
         {
             return true;
         }
@@ -403,9 +406,9 @@ float4 PS(VSOutput input) : SV_TARGET
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.Usage = image.GpuColor ? D3D11_USAGE_DEFAULT : D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.CPUAccessFlags = image.GpuColor ? 0 : D3D11_CPU_ACCESS_WRITE;
         HRESULT result = Device->CreateTexture2D(&desc, nullptr, &ImageTexture);
         if (FAILED(result))
         {
@@ -416,6 +419,7 @@ float4 PS(VSOutput input) : SV_TARGET
         {
             return Fail(HResultMessage("Create viewport shader resource view", result));
         }
+        GpuImageTexture = bool(image.GpuColor);
         ImageWidth = image.Width;
         ImageHeight = image.Height;
         UploadedRevision = std::numeric_limits<std::uint64_t>::max();
@@ -433,6 +437,26 @@ float4 PS(VSOutput input) : SV_TARGET
             return true;
         }
 
+        if (image.GpuColor)
+        {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> shared;
+            HRESULT status = Device->OpenSharedResource(image.GpuColor->SharedHandle,
+                __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(shared.GetAddressOf()));
+            if (FAILED(status)) return Fail(HResultMessage("Open GPU viewport surface", status));
+            Microsoft::WRL::ComPtr<IDXGIKeyedMutex> mutex;
+            status = shared.As(&mutex);
+            if (FAILED(status)) return Fail(HResultMessage("Query GPU viewport mutex", status));
+            status = mutex->AcquireSync(0, 5000);
+            if (status != S_OK) return Fail(HResultMessage("Acquire GPU viewport consumer", status));
+            ID3D11ShaderResourceView* empty = nullptr;
+            Context->PSSetShaderResources(0, 1, &empty);
+            Context->CopyResource(ImageTexture, shared.Get());
+            status = mutex->ReleaseSync(0);
+            Context->Flush();
+            if (FAILED(status)) return Fail(HResultMessage("Release GPU viewport consumer", status));
+            UploadedRevision = revision;
+            return true;
+        }
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         const HRESULT result = Context->Map(ImageTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (FAILED(result))
@@ -546,60 +570,6 @@ float4 PS(VSOutput input) : SV_TARGET
         return SUCCEEDED(result) || Fail(HResultMessage("IDXGISwapChain::Present", result));
     }
 
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (SwapChain == nullptr || Context == nullptr || Device == nullptr)
-        {
-            return false;
-        }
-        ID3D11Texture2D* backBuffer = nullptr;
-        HRESULT result = SwapChain->GetBuffer(
-            0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer));
-        if (FAILED(result))
-        {
-            return Fail(HResultMessage("Get back buffer for capture", result));
-        }
-        D3D11_TEXTURE2D_DESC desc = {};
-        backBuffer->GetDesc(&desc);
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        desc.MiscFlags = 0;
-        ID3D11Texture2D* staging = nullptr;
-        result = Device->CreateTexture2D(&desc, nullptr, &staging);
-        if (SUCCEEDED(result))
-        {
-            Context->CopyResource(staging, backBuffer);
-        }
-        backBuffer->Release();
-        if (FAILED(result))
-        {
-            return Fail(HResultMessage("Create capture texture", result));
-        }
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        result = Context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(result))
-        {
-            staging->Release();
-            return Fail(HResultMessage("Map capture texture", result));
-        }
-        output.Width = desc.Width;
-        output.Height = desc.Height;
-        output.PixelsRGBA8.resize(static_cast<std::size_t>(desc.Width) * desc.Height * 4u);
-        const std::size_t destinationPitch = static_cast<std::size_t>(desc.Width) * 4u;
-        for (std::uint32_t row = 0; row < desc.Height; ++row)
-        {
-            std::memcpy(
-                output.PixelsRGBA8.data() + static_cast<std::size_t>(row) * destinationPitch,
-                static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(row) * mapped.RowPitch,
-                destinationPitch);
-        }
-        Context->Unmap(staging, 0);
-        staging->Release();
-        return true;
-    }
-
     HWND Window = nullptr;
     int Width = 0;
     int Height = 0;
@@ -615,6 +585,7 @@ float4 PS(VSOutput input) : SV_TARGET
     ID3D11RasterizerState* ViewportRasterizerState = nullptr;
     ID3D11DepthStencilState* ViewportDepthState = nullptr;
     ID3D11SamplerState* ViewportSampler = nullptr;
+    bool GpuImageTexture = false;
     ID3D11Texture2D* ImageTexture = nullptr;
     ID3D11ShaderResourceView* ImageView = nullptr;
     std::uint32_t ImageWidth = 0;
@@ -671,11 +642,6 @@ void EditorPresenterDX11::DrawImgui()
 bool EditorPresenterDX11::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterDX11::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterDX11::IsInitialized() const noexcept

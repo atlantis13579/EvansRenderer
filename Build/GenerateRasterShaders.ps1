@@ -87,7 +87,7 @@ try {
         $cudaSource)
     $ptx = [System.IO.File]::ReadAllText($ptxPath).Replace("`r`n", "`n").Replace("`r", "`n")
     $ptx = $ptx.TrimEnd("`n")
-    foreach ($entryPoint in @('ShadowDepthKernel', 'RasterKernel')) {
+    foreach ($entryPoint in @('TransformKernel', 'SetupKernel', 'ShadowDepthKernel', 'RasterKernel', 'OutlineKernel')) {
         if ($ptx -notmatch ('(?m)^\.visible \.entry ' + [regex]::Escape($entryPoint) + '\(')) {
             throw "Generated PTX does not contain the required $entryPoint entry point."
         }
