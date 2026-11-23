@@ -65,7 +65,7 @@ and DXR have smaller capability sets.
 | Materials | Existing OBJ/MTL materials, texture and tangent-space normal mapping, alpha testing, sorted alpha blending, parallax occlusion mapping, dielectric refraction |
 | Shadows | Single maps, stable cascades, fixed-radius PCF (basic soft shadows), contact-hardening PCSS, filtered variance moments, demand-paged Virtual Shadow Maps, screen-space contact shadows, scene-BVH ray shadows |
 | Ambient occlusion | SSAO, horizon-based HBAO, mip-based SAO, spatial GTAO, scene-BVH ray-traced AO |
-| Diffuse global illumination | One-bounce baked GI, generated UV2 lightmaps, visibility-weighted L2 SH probes, temporal SSGI, directional voxel cone tracing, bounded scene-BVH diffuse paths |
+| Diffuse global illumination | One-bounce baked GI (Baked using [ArvoRenderer](https://github.com/atlantis13579/ArvoRenderer)), generated UV2 lightmaps, visibility-weighted L2 SH probes, temporal SSGI, directional voxel cone tracing, bounded scene-BVH diffuse paths |
 | Reflections | Runtime cubemap and latitude-longitude captures, mirrored planar captures, SSR, GGX scene-BVH reflections. Hybrid rendering combines screen intersections with scene-ray fallback. |
 | Geometry | Frustum and back-face culling, quadric mesh LOD, indexed instancing, GPU instance compaction and indirect drawing, compute PN triangle tessellation, geometric displacement, streamed virtual geometry |
 | Antialiasing | Native MSAA with explicit resolves, display-domain FXAA, motion-reprojected TAA, independent temporal super resolution (TSR) |
@@ -96,6 +96,6 @@ runtime and plugins.
   bins. DX11 and OpenGL ES lack native mesh stages.
 - **Gaussian Splatting** represents a scene as translucent 3D Gaussians.
   Their positions, anisotropic scales, rotations, opacity, and degree-zero color
-  are trained by the [ElmanLLM](https://github.com/atlantis13579/Elman)
+  are trained using [ElmanLLM](https://github.com/atlantis13579/Elman)
   framework. Evans projects them to screen-space ellipses, sorts them by camera
   distance, and alpha-composites the splats into the final image.
