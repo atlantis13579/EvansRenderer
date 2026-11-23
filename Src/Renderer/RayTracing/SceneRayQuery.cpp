@@ -194,6 +194,19 @@ namespace Evans::Renderer
         return result;
     }
 
+    bool SceneRayQuery::GetTriangleMaterial(std::uint32_t triangle, MaterialData& material, Float4& color) const
+    {
+        if (triangle >= TriangleMeshes.size()) return false;
+        const auto& mesh = Meshes[TriangleMeshes[triangle]];
+        material = mesh.Material; color = mesh.Color;
+        if (!TextureMapping) material.DiffuseImage.reset();
+        if (!NormalMapping) material.NormalImage.reset();
+        if (!AlphaTesting) material.AlphaCutoff = 0;
+        material.Metallic = PBR ? material.Metallic.value_or(Metallic) : 0;
+        if (!PBR) material.MetallicRoughnessImage.reset();
+        return true;
+    }
+
     bool SceneRayQuery::GetTriangle(std::uint32_t triangle, SceneRayTriangle& output) const noexcept
     {
         if (triangle >= Geometry.GetTriangleCount()) return false;

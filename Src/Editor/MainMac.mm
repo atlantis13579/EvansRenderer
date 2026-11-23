@@ -342,8 +342,6 @@ NSString* StringFromUtf8(const std::string& text)
         Editor_->SelectDemo(demos[static_cast<std::size_t>(demoIndex)].Id);
     }
 
-    Evans::Editor::DrawRenderModeControls(*Editor_);
-    Evans::Editor::DrawRenderBufferControls(*Editor_);
     Evans::Editor::DrawTechniqueControls(*Editor_);
 
     imguiSeparatorLine();

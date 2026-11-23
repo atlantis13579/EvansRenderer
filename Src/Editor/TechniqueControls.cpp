@@ -16,6 +16,8 @@
 
 namespace Evans::Editor
 {
+void DrawLightmapBakePanel(EditorCore&,Techniques::Settings&,bool&);
+void DrawNeuralPanel(EditorCore&);
 namespace
 {
 constexpr bool ShowControlHelp=false;
@@ -45,7 +47,8 @@ public:
         static std::unordered_map<std::string,bool> expanded;
         imguiPushVisibility(true);
         imguiSeparatorLine();
-        auto& open=expanded.emplace(name,std::string(name)=="Rendering").first->second;
+        const std::string group(name);
+        auto& open=expanded.emplace(group,group=="Rendering" || group=="RenderMode").first->second;
         if (imguiCollapse(name,"",open)) open=!open;
         imguiPushVisibility(open); imguiIndent();
         imguiPushEnabled(available,reason?reason:"This category's techniques are unavailable in the current scene, pipeline or backend.");
@@ -171,8 +174,6 @@ void DrawViewportStatus(const EditorCore& editor,const Rect& viewport,int client
 
 void DrawRenderModeControls(EditorCore& editor)
 {
-    imguiSeparatorLine();
-    imguiLabel("Render Mode");
     const bool path=Techniques::UsesPathTracing(editor.Settings().Techniques.Pipeline) &&
         editor.QueryTechniqueSupport(Techniques::Technique::PathTracing).Available();
     imguiSetDisabledReason("Ray Tracing Full owns primary visibility; wire modes require rasterization.");
@@ -205,7 +206,6 @@ void DrawRenderBufferControls(EditorCore& editor)
     for (const auto& reason:reasons) pointers.push_back(reason.c_str());
     int selected=int(editor.Settings().Buffer);
     if (selected<0 || selected>=14 || !reasons[selected].empty()) {selected=0;editor.SetRenderBuffer(B::Color);}
-    imguiSeparatorLine();
     if (imguiCombo("Render Buffer",&selected,labels,14,true,pointers.data(),true)) editor.SetRenderBuffer(B(selected));
 }
 
@@ -311,22 +311,23 @@ void DrawTechniqueControls(EditorCore& editor)
     const bool fxaaAvailable = native && !path && QuerySupport(Technique::FXAA, backend).Available();
     const auto& scene=editor.Scene();
     ControlSections sections;
-    sections.Next("Rendering",native);
-    if (native)
+    sections.Next("Rendering");
     {
-        std::vector<const char*> pipelines {"Forward","Deferred","Forward+","Clustered Forward","Tiled Deferred","GPU Driven Visibility Buffer","Ray Tracing Hybrid","Ray Tracing Full"};
-        std::vector<RenderingPipeline> pipelineModes {RenderingPipeline::Forward,RenderingPipeline::Deferred,RenderingPipeline::ForwardPlus,RenderingPipeline::ClusteredForward,RenderingPipeline::TiledDeferred,RenderingPipeline::VisibilityBuffer,RenderingPipeline::Hybrid,RenderingPipeline::PathTracing};
+        std::vector<const char*> pipelines {"Forward","Deferred","Forward+","Clustered Forward","Tiled Deferred","GPU Driven Visibility Buffer","Ray Tracing Hybrid","Ray Tracing Full","3D Gaussian Splatting"};
+        std::vector<RenderingPipeline> pipelineModes {RenderingPipeline::Forward,RenderingPipeline::Deferred,RenderingPipeline::ForwardPlus,RenderingPipeline::ClusteredForward,RenderingPipeline::TiledDeferred,RenderingPipeline::VisibilityBuffer,RenderingPipeline::Hybrid,RenderingPipeline::PathTracing,RenderingPipeline::Neural3DGS};
         std::vector<std::string> reasons(pipelines.size());std::vector<const char*> reasonPointers;
         int pipelineIndex=0;
         for (std::size_t i=0;i<pipelineModes.size();++i)
         {
             auto candidate=requested; candidate.Pipeline=pipelineModes[i];
+            if(!native && candidate.Pipeline!=RenderingPipeline::Neural3DGS && candidate.Pipeline!=RenderingPipeline::Forward) reasons[i]="Requires a native raster backend.";
             // Selecting a pipeline releases constraints owned by the previous one.
             candidate.Nanite.Enabled=UsesVisibilityBuffer(candidate.Pipeline);candidate.MeshShaders=false;
             auto resolved=resolve(candidate);
             if (requested.Pipeline==pipelineModes[i]) pipelineIndex=int(i);
             if (resolved.Effective.Pipeline!=candidate.Pipeline) reasons[i]=resolved.Diagnostics.empty()?"Unavailable on this device.":resolved.Diagnostics.front();
             if (UsesVisibilityBuffer(candidate.Pipeline) && !editor.QueryTechniqueSupport(Technique::Nanite).Available()) reasons[i]="Requires native GPU cluster visibility and indirect geometry assembly.";
+            if (candidate.Pipeline==RenderingPipeline::Neural3DGS && !editor.HasNeuralAsset()) reasons[i]="The selected demo has no trained Gaussian asset in Contents.";
             if (scene.Demo==DemoId::FurCube && requested.Hair.Enabled && !resolved.Effective.Hair.Enabled) reasons[i]="Disable native fur before selecting this pipeline; ray geometry does not yet include generated fibers.";
         }
         for (const auto& reason:reasons) reasonPointers.push_back(reason.c_str());
@@ -338,7 +339,12 @@ void DrawTechniqueControls(EditorCore& editor)
             changed=true;
         }
     }
-    else imguiLabel(backend == Backend::DXR ? "Pipeline: DXR direct lighting" : "Pipeline: Software raster");
+    if(requested.Pipeline==RenderingPipeline::Neural3DGS)
+    {
+        sections.Next("Neural Rendering");
+        DrawNeuralPanel(editor);
+        sections.End();if(changed) editor.SetTechniqueSettings(requested);return;
+    }
     if (native && QuerySupport(Technique::Deferred, backend).Available() && !deferredAvailable)
         HelpLabel(deferredSupport.Reason);
     if (tiled) HelpLabel("G-buffer depth feeds tiled opaque lighting. Transparency uses full-frustum tile lists; HDR and per-pixel shading are required.");
@@ -409,6 +415,10 @@ void DrawTechniqueControls(EditorCore& editor)
     if (native && !path && requested.Shading == ShadingModel::Toon)
         changed |= imguiSlider("Light bands", &requested.ToonBands, 2.0f, 12.0f, 1.0f);
 
+    sections.Next("Render Buffer");
+    DrawRenderBufferControls(editor);
+    sections.Next("RenderMode");
+    DrawRenderModeControls(editor);
     const bool softwareMaterials = IsSoftwareRaster(backend);
     const bool rasterMaterials = native || softwareMaterials;
     sections.Next("Materials",rasterMaterials);
@@ -436,26 +446,6 @@ void DrawTechniqueControls(EditorCore& editor)
     }
     toggle("Alpha testing", requested.AlphaTesting, rasterMaterials && hasOpacityMap);
     if (rasterMaterials && !hasOpacityMap) HelpLabel("Scene has no cutout material");
-    const bool lightmapAvailable=(lightmapsAvailable || (softwareMaterials && lightmapSupport.Available())) && !path && scene.Demo==DemoId::SponzaAtrium &&
-        DemoCatalog::SupportsSponzaLightmaps(requested);
-    const bool lightmapOn=UsesLightmaps(requested.GlobalIllumination);
-    imguiPushVisibility(scene.Demo==DemoId::SponzaAtrium);
-    const bool hideDisabledLightmap=imguiSetHideDisabled(false);
-    if (imguiCheck("Lightmap",lightmapOn,lightmapAvailable))
-    {
-        requested.GlobalIllumination.Mode=lightmapOn ? GlobalIlluminationMode::None : GlobalIlluminationMode::Lightmaps;
-        changed=true;
-    }
-    imguiSetHideDisabled(hideDisabledLightmap);
-    if (!lightmapAvailable) imguiLabel(path ? "Lightmap requires raster rendering." :
-        !DemoCatalog::SupportsSponzaLightmaps(requested) ? "Lightmap requires the original mesh topology." : lightmapSupport.Reason);
-    if (lightmapOn && lightmapAvailable)
-    {
-        changed|=imguiSlider("Lightmap intensity",&requested.GlobalIllumination.Intensity,0,4,0.01f);
-        if (editor.ViewportBackend()==editor.SelectedBackend() && !editor.ViewportBakedLightingStatus().empty())
-            imguiLabel(editor.ViewportBakedLightingStatus().c_str());
-    }
-    imguiPopVisibility();
     const auto parallaxSupport=editor.QueryTechniqueSupport(Technique::ParallaxOcclusionMapping);
     toggle("Parallax occlusion mapping",requested.Parallax.Enabled,native && parallaxSupport.Available() && !path && !UsesHybridRendering(requested.Pipeline));
     if (requested.Parallax.Enabled)
@@ -969,17 +959,20 @@ void DrawTechniqueControls(EditorCore& editor)
         HelpLabel(rayAOSupport.Reason);
 
     imguiSeparatorLine();
-    sections.Next("Global illumination",giAvailable || rayGIAvailable || voxelAvailable || lumenAvailable || probesAvailable);
+    sections.Next("Global illumination",giAvailable || rayGIAvailable || voxelAvailable || lumenAvailable || probesAvailable || lightmapsAvailable);
     std::vector<const char*> giNames {"None"};
     std::vector<GlobalIlluminationMode> giModes {GlobalIlluminationMode::None};
     giNames={"None","Light probes","Lightmaps","Screen-space GI","Ray-traced scene","World-space voxel cones","Lumen"};
     giModes={GlobalIlluminationMode::None,GlobalIlluminationMode::BakedProbes,GlobalIlluminationMode::Lightmaps,GlobalIlluminationMode::ScreenSpace,GlobalIlluminationMode::RayTraced,GlobalIlluminationMode::Voxel,GlobalIlluminationMode::Lumen};
+    const bool lightmapAvailable=(lightmapsAvailable || (softwareMaterials && lightmapSupport.Available())) && !path && scene.Demo!=DemoId::BigWorld && scene.Demo!=DemoId::FurCube &&
+        DemoCatalog::SupportsSponzaLightmaps(requested);
     std::vector<std::string> giReasons(giModes.size());
     for (std::size_t i=1;i<giModes.size();++i)
     {
         auto candidate=requested;candidate.GlobalIllumination.Mode=giModes[i];const auto result=resolve(candidate);
         if (result.Effective.GlobalIllumination.Mode!=giModes[i]) giReasons[i]=path?"Ray Tracing Full integrates indirect light along camera paths.":"This GI estimator is unavailable on the current backend or pipeline.";
-        if ((giModes[i]==GlobalIlluminationMode::BakedProbes || giModes[i]==GlobalIlluminationMode::Lightmaps) && scene.Demo!=DemoId::SponzaAtrium) giReasons[i]="This scene has no baked lighting asset.";
+        if (giModes[i]==GlobalIlluminationMode::BakedProbes && scene.Demo!=DemoId::SponzaAtrium) giReasons[i]="This scene has no baked lighting asset.";
+        if (giModes[i]==GlobalIlluminationMode::Lightmaps && !lightmapAvailable) giReasons[i]="Lightmaps require a compatible raster scene and original mesh topology.";
     }
     int giIndex = -1;
     for (std::size_t i = 0; i < giModes.size(); ++i)
@@ -989,6 +982,17 @@ void DrawTechniqueControls(EditorCore& editor)
         requested.GlobalIllumination.Mode = giModes[static_cast<std::size_t>(giIndex)];
         changed = true;
     }
+    imguiPushVisibility(UsesLightmaps(requested.GlobalIllumination));
+    if (!lightmapAvailable) imguiLabel(path ? "Lightmap requires raster rendering." :
+        !DemoCatalog::SupportsSponzaLightmaps(requested) ? "Lightmap requires the original mesh topology." : lightmapSupport.Reason);
+    if (UsesLightmaps(requested.GlobalIllumination) && lightmapAvailable)
+    {
+        changed|=imguiSlider("Lightmap intensity",&requested.GlobalIllumination.Intensity,0,4,0.01f);
+        if (editor.ViewportBackend()==editor.SelectedBackend() && !editor.ViewportBakedLightingStatus().empty())
+            imguiLabel(editor.ViewportBakedLightingStatus().c_str());
+    }
+    DrawLightmapBakePanel(editor,requested,changed);
+    imguiPopVisibility();
     if (UsesBakedProbes(resolution.Effective.GlobalIllumination))
     {
         changed|=imguiSlider("Indirect intensity",&requested.GlobalIllumination.Intensity,0,4,0.01f);
@@ -1715,6 +1719,8 @@ void DrawTechniqueControls(EditorCore& editor)
     else if (!fxaaAvailable && !vignetteAvailable && !grainAvailable && !distortionAvailable)
         HelpLabel("Post effect integration pending.");
     else HelpLabel("Order: distortion, FXAA, vignette, grain");
+    sections.Next("Neural Rendering");
+    DrawNeuralPanel(editor);
     sections.End();
     if (changed) editor.SetTechniqueSettings(requested);
 }

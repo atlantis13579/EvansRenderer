@@ -48,7 +48,6 @@ namespace Evans::Renderer
             std::uint64_t Generation = 0;
             std::vector<LightmapSourceInstance> Instances;
             std::shared_ptr<std::atomic<bool>> Cancelled = std::make_shared<std::atomic<bool>>(false);
-            std::shared_ptr<const LightmapReceivers> Prepared;
         };
         mutable std::mutex Mutex;
         std::condition_variable Wake;
@@ -98,34 +97,9 @@ namespace Evans::Renderer
                         }
                         else error="Prebaked lightmap is missing, invalid or incompatible: "+job->Key.Archive.u8string();
                     }
-                    auto receivers = job->Prepared;
-                    if (job->Key.Archive.empty() && !completed && !receivers && !cancelled())
-                    {
-                        auto prepared = std::make_shared<LightmapReceivers>();
-                        if (BuildLightmapReceivers(job->Instances,job->Key.Materials,job->Key.Atlas,*prepared,error,cancelled))
-                        {
-                            receivers = std::move(prepared);
-                            std::lock_guard<std::mutex> lock(Mutex);
-                            if (job->Generation == Progress.RequestedGeneration && !cancelled()) ++Progress.ReceiverBuildCount;
-                        }
-                    }
-                    // Native streams and immutable queries now own all needed
-                    // data; release copied source topology before the long bake.
+                    if (job->Key.Archive.empty())
+                        error="No lightmap asset. Use Bake with Arvo in the Lightmap panel.";
                     job->Instances.clear();
-                    if (job->Key.Archive.empty() && !completed && receivers && !cancelled())
-                    {
-                        {
-                            std::lock_guard<std::mutex> lock(Mutex);
-                            if (job->Generation == Progress.RequestedGeneration && !cancelled()) Progress.State = LightmapBakeState::Baking;
-                        }
-                        auto irradiance = std::make_shared<BakedLightmap>();
-                        if (BakeLightmap(receivers->Atlas,*receivers->TransportScene,job->Key.Lighting,job->Key.Sampling,*irradiance,error,cancelled))
-                        {
-                            auto result = std::make_shared<LightmapBakeResult>();
-                            result->Generation = job->Generation; result->Receivers = std::move(receivers); result->Irradiance = std::move(irradiance);
-                            completed = std::move(result);
-                        }
-                    }
                 }
                 catch (const std::exception& exception) { error = std::string("Lightmap worker failed: ")+exception.what(); }
                 catch (...) { error = "Lightmap worker failed with an unknown exception"; }
@@ -175,9 +149,6 @@ namespace Evans::Renderer
         }
         auto job = std::make_shared<Impl::Job>(); job->Key = std::move(key); job->Generation = generation;
         job->Instances = std::move(request.Instances);
-        if (State->PublishedKey && State->Progress.Published && State->Progress.Published->Receivers->TransportScene &&
-            SameReceivers(*State->PublishedKey,job->Key))
-            job->Prepared = State->Progress.Published->Receivers;
         State->Pending = std::move(job); State->Progress.State = LightmapBakeState::Queued;
         if (!State->Worker.joinable())
         {

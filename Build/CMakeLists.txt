@@ -38,6 +38,14 @@ foreach(configuration Debug Release RelWithDebInfo MinSizeRel)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${configuration_upper} "${EVANS_ROOT}/Binaries/${configuration}")
 endforeach()
 
+add_library(EvansNeuralCore STATIC
+    "${EVANS_ROOT}/Src/Renderer/Neural/Json.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Neural/GaussianScene.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Neural/GaussianGlb.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Neural/TrainingGraph.cpp"
+    "${EVANS_ROOT}/Src/Renderer/Neural/TrainingData.cpp")
+target_include_directories(EvansNeuralCore PUBLIC "${EVANS_ROOT}/Src")
+
 add_executable(EvansEditor
     "${EVANS_ROOT}/Src/Maths/StaticAABBTree.cpp"
     "${EVANS_ROOT}/Src/Maths/TriMesh.cpp"
@@ -75,7 +83,7 @@ add_executable(EvansEditor
     "${EVANS_ROOT}/Src/Renderer/RayTracing/SceneRayShadingUpload.cpp"
     "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightProbes.cpp"
     "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedDiffuseLighting.cpp"
-    "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightmap.cpp"
+    "${EVANS_ROOT}/Src/Renderer/BakedLighting/ArvoLightmap.cpp"
     "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightmapCache.cpp"
     "${EVANS_ROOT}/Src/Renderer/BakedLighting/BakedLightingAssets.cpp"
     "${EVANS_ROOT}/Src/Renderer/BakedLighting/LightmapReceivers.cpp"
@@ -180,6 +188,7 @@ add_executable(EvansEditor
     "${EVANS_ROOT}/Src/Rasterizer/SoftwareRasterCore.cpp"
 
     "${EVANS_ROOT}/Src/Editor/AssetCooker.cpp"
+    "${EVANS_ROOT}/Src/Editor/LightmapBake.cpp"
     "${EVANS_ROOT}/Src/Editor/DragonDemo.cpp"
     "${EVANS_ROOT}/Src/Editor/HairDemo.cpp"
     "${EVANS_ROOT}/Src/Editor/VolumeDemos.cpp"
@@ -189,6 +198,7 @@ add_executable(EvansEditor
     "${EVANS_ROOT}/Src/Editor/ContentRoot.cpp"
     "${EVANS_ROOT}/Src/Editor/Demos.cpp"
     "${EVANS_ROOT}/Src/Editor/Editor.cpp"
+    "${EVANS_ROOT}/Src/Editor/NeuralWorkspace.cpp"
     "${EVANS_ROOT}/Src/Editor/ModuleAdapters.cpp"
     "${EVANS_ROOT}/Src/Editor/RenderAdapter.cpp"
     "${EVANS_ROOT}/Src/Editor/Resources.cpp"
@@ -203,7 +213,7 @@ target_compile_definitions(EvansEditor PRIVATE
     EVANS_NANITE_CACHE_DIRECTORY="${EVANS_ROOT}/Intermediate/Nanite"
     EVANS_SHADER_SOURCE_DIRECTORY="${EVANS_ROOT}/Src/Shaders"
 )
-target_link_libraries(EvansEditor PRIVATE Threads::Threads)
+target_link_libraries(EvansEditor PRIVATE Threads::Threads EvansNeuralCore)
 if(MSVC)
     target_compile_options(EvansEditor PRIVATE /W4 /permissive-)
 else()
@@ -215,6 +225,8 @@ if(WIN32 OR APPLE)
         "${EVANS_ROOT}/Src/Editor/EditorPresenter.cpp"
         "${EVANS_ROOT}/Src/Editor/Imgui.cpp"
         "${EVANS_ROOT}/Src/Editor/TechniqueControls.cpp"
+        "${EVANS_ROOT}/Src/Editor/NeuralPanel.cpp"
+        "${EVANS_ROOT}/Src/Editor/LightmapPanel.cpp"
         "${EVANS_ROOT}/Src/Editor/HairControls.cpp"
         "${EVANS_ROOT}/Src/Editor/DragonControls.cpp"
         "${EVANS_ROOT}/Src/Editor/VolumeControls.cpp"

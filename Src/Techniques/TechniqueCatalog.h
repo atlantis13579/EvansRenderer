@@ -31,7 +31,7 @@ namespace Evans::Techniques
 
 // Values are part of the independently authored native-shader interface.
 enum class ShadingModel : std::uint32_t { Phong = 0, Flat = 1, Gouraud = 2, PBR = 3, Toon = 4 };
-enum class RenderingPipeline : std::uint32_t { Forward = 0, Deferred = 1, ForwardPlus = 2, ClusteredForward = 3, TiledDeferred = 4, PathTracing = 5, VisibilityBuffer = 6, Hybrid = 7 };
+enum class RenderingPipeline : std::uint32_t { Forward = 0, Deferred = 1, ForwardPlus = 2, ClusteredForward = 3, TiledDeferred = 4, PathTracing = 5, VisibilityBuffer = 6, Hybrid = 7, Neural3DGS = 8 };
 [[nodiscard]] inline bool UsesHybridRendering(RenderingPipeline pipeline) noexcept
 { return pipeline == RenderingPipeline::Hybrid; }
 [[nodiscard]] inline bool UsesVisibilityBuffer(RenderingPipeline pipeline) noexcept

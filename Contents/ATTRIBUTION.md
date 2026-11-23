@@ -30,8 +30,8 @@ widely used 1987 version. The historical model does not prescribe a material.
 
 Retain the CC BY 3.0 attribution with the original OBJ archive and the
 upstream CRYENGINE license notice with the Khronos material set.
-`Baked/` and `Baked/PBR/` contain the indirect lighting for their respective
-material sets and the corresponding UV2 receiver streams.
+`Baked/` contains the PBR material set's indirect lighting and corresponding
+UV2 receiver streams, shared across Sponza shading modes.
 
 ## Stanford Dragon
 

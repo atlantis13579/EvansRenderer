@@ -16,7 +16,7 @@ namespace Evans::Renderer
         BakedLightmapSettings Sampling;
         LightingState Lighting;
         // A nonempty archive selects immutable prebaked lighting. Missing or
-        // incompatible files fail visibly and never invoke the live baker.
+        // incompatible files fail visibly; baking is an explicit external job.
         std::filesystem::path Archive;
     };
 
@@ -45,8 +45,7 @@ namespace Evans::Renderer
     // One lazily started worker, one pending request. Superseding requests cancel
     // active work and replace the pending slot, never create detached threads.
     // Shader compilation and all GPU operations remain on the render thread.
-    // Atlas/query builders are cancellation boundaries; ray integration checks
-    // cancellation per ray. Destruction joins the owned worker.
+    // Only archive loading runs here. Destruction joins the owned worker.
     class BakedLightmapCache final
     {
     public:

@@ -9,22 +9,40 @@ namespace Evans::Editor
 {
     std::optional<int> RunAssetCookCommand(const std::vector<std::string>& arguments)
     {
-        if (arguments.size()>=2 && arguments[1]=="--bake-sponza")
+        if (arguments.size()>=2 && arguments[1]=="--bake-lightmap")
         {
-            if (arguments.size()>3 || (arguments.size()==3 && arguments[2]!="pbr")) { std::cerr<<"Usage: EvansEditor --bake-sponza [pbr]\n"; return 2; }
+            if (arguments.size()<5 || arguments.size()>9)
+            { std::cerr<<"Usage: EvansEditor --bake-lightmap ARVO_EDITOR OUTPUT_DIRECTORY triangle|teapot|sponza|dragon [resolution] [samples] [bounces] [cuda|cpu] (Sponza writes PBR lighting to Contents/Scenes/Sponza/Baked; default backend: cuda)\n"; return 2; }
             try
             {
-                DemoCatalog catalog(ResolveContentRoot()); auto scene=catalog.Load(DemoId::SponzaAtrium);
-                Techniques::Settings settings; DemoCatalog::ApplySponzaAppearance(settings); std::string error;
-                if (arguments.size()==3)
+                DemoId demo;
+                if(arguments[4]=="triangle") demo=DemoId::Triangle;
+                else if(arguments[4]=="teapot") demo=DemoId::UtahTeapot;
+                else if(arguments[4]=="sponza") demo=DemoId::SponzaAtrium;
+                else if(arguments[4]=="dragon") demo=DemoId::StanfordDragon;
+                else throw std::runtime_error("Unknown bake scene");
+                DemoCatalog catalog(ResolveContentRoot()); auto scene=catalog.Load(demo);
+                Techniques::Settings settings; if(demo==DemoId::SponzaAtrium) DemoCatalog::ApplySponzaAppearance(settings);
+                Renderer::ArvoBakeOptions options; options.Executable=std::filesystem::u8path(arguments[2]); options.Directory=std::filesystem::u8path(arguments[3]); options.ProjectRoot=ResolveContentRoot().parent_path();
+                if(demo==DemoId::SponzaAtrium)
                 {
-                    scene.UsePbrMaterials(true);
+                    options.Directory=scene.BakedLightingDirectory;
                     settings.Shading=Techniques::ShadingModel::PBR;
                 }
-                if (!CookBakedLightingAssets(scene,settings,error)) { std::cerr<<"Sponza bake failed: "<<error<<'\n'; return 1; }
-                std::cout<<"Baked lighting saved to "<<scene.ActiveBakedLightingDirectory().string()<<'\n'<<std::flush; return 0;
+                if(arguments.size()>5) settings.GlobalIllumination.Lightmaps.Resolution=std::stoul(arguments[5]);
+                if(arguments.size()>6) options.Samples=std::stoul(arguments[6]);
+                if(arguments.size()>7) options.Bounces=std::stoul(arguments[7]);
+                if(arguments.size()>8)
+                {
+                    if(arguments[8]!="cuda" && arguments[8]!="cpu") throw std::runtime_error("Expected bake backend cuda|cpu");
+                    if(arguments[8]=="cpu") options.Backend=Renderer::ArvoBakeBackend::CPU;
+                }
+                std::string error;
+                if(!BakeSceneWithArvo(scene,settings,options,error,{},[](const auto& message){std::cout<<message<<'\n'<<std::flush;}))
+                { std::cerr<<error<<'\n'; return 1; }
+                std::cout<<"Lightmap saved to "<<options.Directory.u8string()<<'\n'; return 0;
             }
-            catch (const std::exception& e) { std::cerr<<"Sponza bake failed: "<<e.what()<<'\n'; return 1; }
+            catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
         }
         if (arguments.size()<2 || arguments[1]!="--cook-nanite") return std::nullopt;
         // EvansEditor --cook-nanite [all|triangle|teapot|sponza|dragon]

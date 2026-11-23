@@ -221,6 +221,7 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
     if (demo == DemoId::SponzaAtrium)
     {
         scene.AlternateMaterials = FileResourceLoader::LoadMaterialLibrary(ContentRoot_ / "Scenes/Sponza/PBR/Sponza.mtl");
+        scene.UsePbrMaterials(true);
         ConfigureSponzaLighting(scene);
         scene.BakedLightingDirectory=ContentRoot_/"Scenes/Sponza/Baked";
     }

@@ -308,8 +308,6 @@ void DrawEditorImgui(WindowState& state)
         state.Editor->SelectDemo(demos[static_cast<std::size_t>(demoIndex)].Id);
     }
 
-    Evans::Editor::DrawRenderModeControls(*state.Editor);
-    Evans::Editor::DrawRenderBufferControls(*state.Editor);
     Evans::Editor::DrawTechniqueControls(*state.Editor);
 
     imguiSeparatorLine();
@@ -705,7 +703,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         arguments.push_back(std::move(value));
     }
     if (nativeArguments) LocalFree(nativeArguments);
-    if (arguments.size()>1 && (arguments[1]=="--cook-nanite" || arguments[1]=="--bake-sponza"))
+    if (arguments.size()>1 && (arguments[1]=="--cook-nanite" || arguments[1]=="--bake-lightmap"))
     {
         const auto output=GetStdHandle(STD_OUTPUT_HANDLE);
         if (!output || output==INVALID_HANDLE_VALUE) AttachConsole(ATTACH_PARENT_PROCESS);

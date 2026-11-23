@@ -73,42 +73,12 @@ and DXR have smaller capability sets.
 | Post-processing | Reinhard and ACES-fitted tone mapping, bloom, analytic color grading, thin-lens depth of field, rigid motion blur, screen-space distortion, lens flare, film grain, vignette, temporal exposure adaptation |
 | Transparency | Sorted source-over blending, weighted blended OIT, bounded depth-peeling OIT |
 
-## Dependencies and composition
-
-The editor retains requested settings and alternatives for disabled modes. Its controls
-and the renderer share API, device, and resource compatibility rules. The controls
-explain incompatible choices.
-
-| Selection | Rules |
-| --- | --- |
-| Pipeline | One pipeline is active. Deferred pipelines reuse opaque material inputs and shade transparency in forward passes. Gouraud requires Forward. |
-| Surface shading | Flat, Gouraud, Phong, PBR, and Toon are exclusive. Flat and Gouraud suppress fragment normal mapping. NPR is a separate image effect. Physically based area lights require PBR and HDR. |
-| Shadows | Single, cascaded, virtual, and ray-traced coverage are alternatives. Map filters are hard, PCF, PCSS, or VSM. Contact shadows supplement primary visibility. Cascades require a directional light. |
-| AO, diffuse GI, and reflections | Select one estimator per family and combine across families. Baked lighting produces inputs for either lightmaps or probes as diffuse receivers. |
-| Geometry | GPU-driven drawing requires instancing. Nanite replaces ordinary LOD and separate virtual geometry and requires single-sample visibility rendering. Native mesh stages accept ordinary visibility geometry or Nanite hardware bins. |
-| Antialiasing | FXAA, TAA, and TSR share a selector. MSAA controls geometry samples independently where supported. Visibility rendering, depth peeling, and nearest-layer refraction require single-sample rendering. |
-| Transparency | Sorted blending, weighted blended OIT, and depth peeling are exclusive. Refraction uses opaque color and depth plus nearest-layer data. |
-| Temporal stages | Stages produce motion vectors, valid correspondence, and private committed histories as needed. Camera cuts, resizing, topology changes, and pipeline changes invalidate incompatible histories. |
-| HDR stages | Allocate floating-point scene-linear color as needed. Bloom, grading, and flare precede tone mapping. Display effects follow. Required resolves default to Reinhard. |
-| Path Tracing | Owns camera visibility, transport, antialiasing, and progressive accumulation. Switching back restores retained raster settings. Display color changes preserve accumulated radiance. |
-
-Captures, scene/cache preparation, and primary shadows precede opaque visibility and
-lighting. Resolved depth and materials feed AO, diffuse GI, and reflections. Temporal
-and lens effects process opaque HDR before sharp transparency. HDR and display
-processing precede selection outlines. The pass plan tracks producers and consumers.
-Each RHI owns native resources and runs its passes. Successful presentation commits
-correspondence and accumulation histories.
-
-Forward+ builds separate opaque-depth and full-frustum transparent tile lists. Clustered
-Forward assigns lights to depth slices independently of an opaque depth prepass. Tiled
-Deferred combines G-buffer lighting with tile assignment. Captures, volumetric samples,
-and overflowing lists retain complete lighting. Visibility rendering stores triangle
-identity and reconstructs perspective-correct material attributes for deferred lighting.
 
 ## Experimental rendering
 
-Lumen, Nanite, and mesh shading are standalone teaching implementations with limited
-scope. They run independently of the Unreal Engine runtime and plugins.
+Lumen, Nanite, mesh shading, and Gaussian Splatting are standalone teaching
+implementations with limited scope. They run independently of the Unreal Engine
+runtime and plugins.
 
 - **Lumen** uses mesh and global distance fields, material cards, surface-cache
   radiosity, hierarchical screen tracing, screen probes, and scrolling world-radiance
@@ -124,21 +94,8 @@ scope. They run independently of the Unreal Engine runtime and plugins.
 - **Mesh shaders** use native DX12 and Vulkan mesh dispatch or Metal object/mesh stages
   on supported devices. They accept ordinary visibility triangles or Nanite hardware
   bins. DX11 and OpenGL ES lack native mesh stages.
-
-## Algorithm boundaries
-
-Screen-space AO, GI, reflections, and contact shadows have limited off-screen
-information. Environment captures approximate glossy reflections with ordinary mip
-filtering, and local probes retain parallax error. Scene-BVH raster effects traverse the
-BVH in shaders and run independently of hardware ray queries.
-
-Path Tracing supports opaque and cutout geometry. Transmission and participating-media
-transport remain TODOs. Hair uses generated tapered ribbons, and scene-ray acceleration
-is mesh-only. Subsurface diffusion uses visible direct diffuse with separate
-thickness-based transmission. Motion blur handles rigid camera and object motion. Lens
-and temporal reconstruction share the occlusion limits of a single depth image.
-
-Techniques reuse demo geometry and materials plus generated render targets, UV charts,
-probes, height fields, strands, and densities. Measured fiber data, thickness, and
-density assets remain TODOs where needed. Upscaling runs without vendor SDKs. Models and
-textures retain their respective licenses.
+- **Gaussian Splatting** represents a scene as translucent 3D Gaussians.
+  Their positions, anisotropic scales, rotations, opacity, and degree-zero color
+  are trained by the [ElmanLLM](https://github.com/atlantis13579/Elman)
+  framework. Evans projects them to screen-space ellipses, sorts them by camera
+  distance, and alpha-composites the splats into the final image.

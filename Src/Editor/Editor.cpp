@@ -108,7 +108,7 @@ void SelectMaterialLibrary(Techniques::Settings& settings, SceneSnapshot& scene)
             scene.UsingDefaultPbrReflection = false;
         }
     }
-    scene.UsePbrMaterials(pbr);
+    scene.UsePbrMaterials(scene.Demo == DemoId::SponzaAtrium || pbr);
 }
 
 void ConstrainSponzaAtmosphere(Techniques::Settings& settings,const SceneSnapshot& scene)
@@ -126,12 +126,17 @@ void ConstrainSponzaAtmosphere(Techniques::Settings& settings,const SceneSnapsho
 } // namespace
 
 EditorCore::EditorCore(std::filesystem::path contentRoot)
-    : Demos_(std::move(contentRoot)), Scene_(Demos_.Load(DemoId::Triangle))
+    : Demos_(contentRoot), Scene_(Demos_.Load(DemoId::Triangle))
 {
+    LoadLightmapPreferences(contentRoot);
+    Neural_=std::make_unique<NeuralWorkspace>(contentRoot);
 }
 
 EditorCore::~EditorCore()
 {
+    Neural_->Cancel();
+    CancelLightmapBake();
+    if (LightmapTask_) DrainFuture(LightmapTask_->Future);
     if (ActiveJob_)
     {
         ActiveJob_->Cancellation.Cancel();
@@ -283,6 +288,11 @@ void EditorCore::SetBigWorldSettings(const BigWorldSettings& settings)
 void EditorCore::SetTechniqueSettings(const Evans::Techniques::Settings& settings)
 {
     auto sanitized = Evans::Techniques::SanitizeSettings(settings);
+    if(sanitized.Pipeline==Techniques::RenderingPipeline::Neural3DGS)
+    {
+        if(!HasNeuralAsset()) return;
+        if(Settings_.Techniques.Pipeline!=Techniques::RenderingPipeline::Neural3DGS && !Neural_->Load()) return;
+    }
     if (sanitized.Shadows==Techniques::ShadowRepresentation::RayTraced &&
         QueryTechniqueSupport(Techniques::Technique::RayTracedShadows).State==Techniques::Availability::SceneLimit)
         sanitized.Shadows=Techniques::ShadowRepresentation::SingleMap;
@@ -297,8 +307,7 @@ void EditorCore::SetTechniqueSettings(const Evans::Techniques::Settings& setting
         if (Techniques::UsesEnvironmentCapture(sanitized.Reflections)) sanitized.Reflections.Mode=Techniques::ReflectionMode::None;
     }
     if (Scene_.Demo!=DemoId::FurCube) sanitized.Hair.Enabled=false;
-    if (Scene_.Demo!=DemoId::SponzaAtrium && (sanitized.GlobalIllumination.Mode==Techniques::GlobalIlluminationMode::Lightmaps ||
-        sanitized.GlobalIllumination.Mode==Techniques::GlobalIlluminationMode::BakedProbes)) sanitized.GlobalIllumination.Mode=Techniques::GlobalIlluminationMode::None;
+    if (Scene_.Demo!=DemoId::SponzaAtrium && sanitized.GlobalIllumination.Mode==Techniques::GlobalIlluminationMode::BakedProbes) sanitized.GlobalIllumination.Mode=Techniques::GlobalIlluminationMode::None;
     if (Scene_.Demo==DemoId::SponzaAtrium && sanitized.GlobalIllumination.Mode==Techniques::GlobalIlluminationMode::Lightmaps &&
         !DemoCatalog::SupportsSponzaLightmaps(sanitized))
         sanitized.GlobalIllumination.Mode=QueryTechniqueSupport(Techniques::Technique::LightProbes).Available() ?
@@ -613,6 +622,8 @@ void EditorCore::HandleDemoPointer(float x,float y,bool insideViewport)
 
 void EditorCore::Tick(float deltaSeconds)
 {
+    Neural_->Poll();
+    PollLightmapBake();
     CollectFinishedDemoLoad();
     CollectFinishedPick();
     CollectFinishedJobs();
@@ -627,10 +638,7 @@ void EditorCore::Tick(float deltaSeconds)
     Scene_.SampleTimeSeconds += elapsed;
     const bool cameraChanged = UpdateCameraMovement(elapsed);
     const std::uint64_t previousRevision = Scene_.TransformRevision;
-    Demos_.Update(
-        Scene_,
-        elapsed,
-        Settings_.TeapotRotationDegreesPerSecond);
+    Demos_.Update(Scene_,elapsed,Settings_.TeapotRotationDegreesPerSecond);
     const bool sceneChanged = Scene_.TransformRevision != previousRevision;
 
     if (cameraChanged)
@@ -897,7 +905,7 @@ void EditorCore::StartRender(std::shared_ptr<const SceneSnapshot> prepared)
     {
         job->Future = std::async(
             std::launch::async,
-            [adapter, request = std::move(request), token, preparation = job->Preparation]() mutable
+            [adapter, request = std::move(request), token, preparation = job->Preparation, neural=Neural_->Model]() mutable
             {
                 const Renderer::ShaderPreparationScope preparationScope(preparation);
                 if (token.IsCancellationRequested())
@@ -906,6 +914,18 @@ void EditorCore::StartRender(std::shared_ptr<const SceneSnapshot> prepared)
                 }
                 try
                 {
+                    if(request.Settings.Techniques.Pipeline==Techniques::RenderingPipeline::Neural3DGS)
+                    {
+                        if(!neural) throw std::runtime_error("Load a trained model in Neural Rendering first");
+                        RenderResult result;
+                        const float yaw=request.Scene->Nodes.empty()?0.f:request.Scene->Nodes.front().LocalTransform.RotationDegrees.Y;
+                        const auto view=Neural::ModelView(Neural::MakeView(request.Scene->SceneCamera,
+                            int(request.Settings.Width),int(request.Settings.Height)),yaw);
+                        result.Output=Neural::DisplayImage(Neural::Render(*neural,view,[&token]{return token.IsCancellationRequested();}));
+                        result.Status=RenderStatus::Completed;
+                        result.Geometry.RasterExecutionPath="Neural 3DGS: CPU anisotropic splatting";
+                        return result;
+                    }
                     return adapter->Render(request, token);
                 }
                 catch (const std::exception& exception)

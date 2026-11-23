@@ -35,12 +35,4 @@ namespace Evans::Renderer
         std::uint64_t SurfaceSampleCount = 0, SurfaceHitCount = 0, ShadowQueryCount = 0;
     };
 
-    // Atlas must come from BuildLightmapAtlas. Transport geometry is separate
-    // from receiver geometry so LOD receivers can later share one full-detail
-    // lighting scene. Both inputs are immutable snapshots for the entire bake.
-    // A true cancellation callback aborts; failure never replaces old output.
-    [[nodiscard]] bool BakeLightmap(std::shared_ptr<const LightmapAtlas> atlas,
-        const SceneRayQuery& transportScene, const LightingState& lighting,
-        const BakedLightmapSettings& settings, BakedLightmap& output, std::string& error,
-        const std::function<bool()>& cancelled = {});
 }

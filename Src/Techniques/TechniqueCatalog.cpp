@@ -947,7 +947,7 @@ Settings SanitizeSettings(Settings settings) noexcept
 {
     if (unsigned(settings.MeshDispatch)>unsigned(MeshShaderDispatchMode::Task)) settings.MeshDispatch=MeshShaderDispatchMode::Automatic;
     if (static_cast<std::uint32_t>(settings.Pipeline) >
-        static_cast<std::uint32_t>(RenderingPipeline::Hybrid)) settings.Pipeline = RenderingPipeline::Forward;
+        static_cast<std::uint32_t>(RenderingPipeline::Neural3DGS)) settings.Pipeline = RenderingPipeline::Forward;
     if (static_cast<std::uint32_t>(settings.Shading) >
         static_cast<std::uint32_t>(ShadingModel::Toon)) settings.Shading = ShadingModel::Phong;
     if (settings.Shadows != ShadowRepresentation::Cascaded && settings.Shadows != ShadowRepresentation::Virtual && settings.Shadows != ShadowRepresentation::RayTraced) settings.Shadows = ShadowRepresentation::SingleMap;
@@ -1058,7 +1058,7 @@ const std::vector<Definition>& Catalog()
         {T::NPR, "Non-photorealistic rendering", Group::SpecializedShading, A::Implemented, Color, 0, Composable, "XDoG ink contours, analytic tonal crosshatching and posterized color after tone mapping; independent of surface shading."},
         {T::AreaLights, "Physically based area lights", Group::SpecializedShading, A::Implemented, Surface | HDR, 0, Composable, "Independent native GGX rectangle quadrature with radiance/power units; PBR/HDR required. Raster visibility follows the selected shadow method; CPU baking traces each sample. Metal device validation pending."},
         {T::BakedGI, "Baked global illumination", Group::GlobalIllumination, A::Implemented, G | M | L, Mask(R::BakedLighting), Composable, "Material-aware scene rays bake one diffuse bounce; native SH and distance-moment projection is cached until scene lighting changes. Metal device validation pending."},
-        {T::Lightmaps, "Lightmaps", Group::GlobalIllumination, A::Implemented, Mask(R::LightmapUV) | Mask(R::BakedLighting) | Screen | C | HDR | Mask(R::GBuffer), Mask(R::IndirectRadiance) | HDR, GISlot, "Background one-bounce surface baking, per-instance/LOD UV2 charts and chart-isolated gutters; depth-equal native receivers preserve material masking and MSAA coverage. Metal device validation pending."},
+        {T::Lightmaps, "Lightmaps", Group::GlobalIllumination, A::Implemented, Mask(R::LightmapUV) | Mask(R::BakedLighting) | Screen | C | HDR | Mask(R::GBuffer), Mask(R::IndirectRadiance) | HDR, GISlot, "External Arvo diffuse path-traced lightmaps, per-instance/LOD UV2 charts and chart-isolated gutters; depth-equal native receivers preserve material masking and MSAA coverage. Metal device validation pending."},
         {T::LightProbes, "Light probes", Group::GlobalIllumination, A::Implemented, Mask(R::BakedLighting) | Screen | C | HDR | Mask(R::GBuffer), Mask(R::Probes) | Mask(R::IndirectRadiance) | HDR, GISlot, "L2 SH irradiance with eight-neighbor interpolation and octahedral distance-moment visibility; independent of camera history. Metal device validation pending."},
         {T::SSGI, "Screen-space GI", Group::GlobalIllumination, A::Implemented, Screen | HDR | C | Velocity | Mask(Resource::GBuffer) | Mask(Resource::GlobalIlluminationHistory), Mask(Resource::IndirectRadiance) | HDR, GISlot, "Cosine hemisphere diffuse transport, bilateral filtering and depth/normal-validated private history; missing rays retain ambient fallback."},
         {T::VoxelGI, "Voxel GI", Group::GlobalIllumination, A::Implemented, Surface | Screen | Mask(R::GBuffer) | Mask(R::Voxels) | HDR, HDR, GISlot, "Asynchronous world-space voxel coverage, directional direct-diffuse radiance mips and native hemisphere cone tracing. Metal device validation pending."},
@@ -1201,6 +1201,13 @@ Resolution ResolveSettings(const Settings& requested, Backend backend)
 {
     Resolution result;
     result.Effective = SanitizeSettings(requested);
+    if(result.Effective.Pipeline==RenderingPipeline::Neural3DGS)
+    {
+        // The neural pipeline owns visibility and color; retained raster options are inactive.
+        result.Effective=Settings{};
+        result.Effective.Pipeline=RenderingPipeline::Neural3DGS;
+        return result;
+    }
     if (result.Effective.GlobalIllumination.Lumen.HardwareRayTracing && backend!=Backend::DX12 && backend!=Backend::Vulkan && backend!=Backend::Metal)
     { result.Effective.GlobalIllumination.Lumen.HardwareRayTracing=false; result.Diagnostics.emplace_back("This API uses Lumen distance-field tracing; the hardware request is retained."); }
     if (UsesLumenScene(result.Effective) && result.Effective.GlobalIllumination.Lumen.HardwareRayTracing && result.Effective.GlobalIllumination.Lumen.GlobalDistance.Enabled)
@@ -1725,6 +1732,7 @@ Resolution ResolveSettingsForDevice(const Settings& requested, Backend backend, 
     bool bakedProbesSupported, bool lightmapsSupported, bool refractionSupported, bool depthPeelingSupported, bool rayTracedAOSupported,
     bool rayTracedReflectionsSupported, bool rayTracedGISupported, bool pathTracingSupported, bool gpuDrivenSupported, bool visibilityBufferSupported, bool hybridRenderingSupported, bool voxelGISupported, bool temporalEffectsSupported, bool parallaxSupported, bool displacementSupported, bool tessellationSupported, bool virtualGeometrySupported, bool temporalSuperResolutionSupported, bool virtualShadowsSupported, bool lumenSupported, bool naniteSupported, bool meshShadersSupported, bool naniteHardwareSupported, bool lumenHardwareSupported)
 {
+    if(requested.Pipeline==RenderingPipeline::Neural3DGS) return ResolveSettings(requested,backend);
     auto fallback = requested;
     std::vector<std::string> diagnostics;
     if (UsesVisibilityBuffer(requested.Pipeline) && (!naniteSupported || !gpuDrivenSupported || !virtualGeometrySupported || !naniteHardwareSupported))

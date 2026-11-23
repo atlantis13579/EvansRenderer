@@ -1,4 +1,5 @@
 #include "Editor/ModuleAdapters.h"
+#include "Renderer/BakedLighting/ArvoLightmap.h"
 #include "Rasterizer/ParallelExecutor.h"
 #include "Maths/ColorSpace.h"
 #include "Editor/BigWorld.hpp"
@@ -755,14 +756,14 @@ struct RasterSceneCache
             ClipSpace != clipSpace || SelectedNode != settings.SelectedNode;
         const bool reproject = clipSpace && (CameraRevision != scene.CameraRevision ||
             Width != settings.Width || Height != settings.Height);
-        const bool lightmaps = !clipSpace && scene.Demo == DemoId::SponzaAtrium &&
+        const bool lightmaps = !clipSpace &&
             Techniques::UsesLightmaps(settings.Techniques.GlobalIllumination);
         if (rebuild || reproject || lightmaps != Lightmaps)
         {
             Valid = false;
             if (rebuild || lightmaps != Lightmaps)
             {
-                Built = std::make_shared<RasterSceneBuild>(!clipSpace && scene.Demo == DemoId::SponzaAtrium ?
+                Built = std::make_shared<RasterSceneBuild>(!clipSpace && (scene.Demo == DemoId::SponzaAtrium || lightmaps) ?
                     BuildSponzaRasterScene(scene, settings, cancellation) :
                     BuildRasterScene(scene, settings, cancellation, clipSpace));
                 MaterialMips = false;
@@ -954,7 +955,7 @@ struct LightSelection
         rasterSettings.NormalMapping = request.Settings.Techniques.NormalMapping;
         rasterSettings.AlphaTesting = request.Settings.Techniques.AlphaTesting;
         rasterSettings.AnisotropicFiltering = request.Settings.Techniques.AnisotropicFiltering;
-        if (request.Scene->Demo == DemoId::SponzaAtrium)
+        if (request.Scene->Demo == DemoId::SponzaAtrium || Techniques::UsesLightmaps(request.Settings.Techniques.GlobalIllumination))
         {
             const auto& techniques = request.Settings.Techniques;
             const auto& hdr = techniques.PostProcessing.HDR;
@@ -1555,8 +1556,12 @@ RasterSceneBuild BuildSponzaRasterScene(const SceneSnapshot& scene, const Viewpo
         }
         if (instances.size() == meshes.size())
         {
-            const auto request = Renderer::MakeLightmapBakeRequest(std::move(instances), settings.Techniques, {}, true);
-            atlas = Renderer::LoadLightmapAsset(scene.ActiveBakedLightingDirectory() / "irradiance.evlightmap", request);
+            auto bakeSettings=settings.Techniques;
+            if (scene.Demo==DemoId::SponzaAtrium &&
+                (scene.LightmapDirectory.empty() || scene.LightmapDirectory==scene.BakedLightingDirectory))
+                bakeSettings.Shading=Techniques::ShadingModel::PBR;
+            const auto request = Renderer::MakeLightmapBakeRequest(std::move(instances), bakeSettings, {}, true);
+            atlas = Renderer::LoadLightmapAsset(scene.ActiveLightmapDirectory() / "irradiance.evlightmap", request);
             result.LightmapStatus = atlas ? "Loaded baked resource" : "Failed: prebaked lightmap does not match the scene";
         }
     }
@@ -2104,7 +2109,8 @@ public:
              hasShadowFrame = shadowFrame.Valid, uploadScene, cancellation, incrementalWorld, previousMeshes, dynamicNodes,
              worldTransforms = std::move(worldTransforms), sampleTime = request.Scene->SampleTimeSeconds,
              triangleCount=request.Scene->TriangleCountAtLoad,
-             world=request.Scene->World, historyEpoch = request.HistoryEpoch, bakedLightingDirectory=request.Scene->ActiveBakedLightingDirectory(),
+             world=request.Scene->World, historyEpoch = request.HistoryEpoch, bakedLightingDirectory=request.Scene->ActiveBakedLightingDirectory(), lightmapDirectory=request.Scene->ActiveLightmapDirectory(),
+             fixedBakedShading=request.Scene->Demo==DemoId::SponzaAtrium,
              environment=request.Scene->Environment, volume=request.Scene->Volume](
                 Renderer::Renderer& renderer)
             {
@@ -2229,6 +2235,9 @@ public:
                     renderer.SetTechniqueSettings(sceneSettings);
                     renderer.SetRenderBuffer(settings.Buffer);
                     renderer.SetBakedLightingDirectory(bakedLightingDirectory);
+                    renderer.SetLightmapDirectory(lightmapDirectory);
+                    renderer.SetBakedLightingShadingOverride(fixedBakedShading ?
+                        std::optional<Techniques::ShadingModel>{Techniques::ShadingModel::PBR} : std::nullopt);
                     renderer.SetEnvironmentRadiance(environment);
                     renderer.SetDensityVolume(volume);
                     const bool paths = Techniques::UsesPathTracing(renderer.GetTechniqueSettings().Pipeline);
@@ -3140,10 +3149,10 @@ bool CookNaniteAssets(const SceneSnapshot& scene,std::size_t& families,std::stri
     error.clear(); return true;
 }
 
-bool CookBakedLightingAssets(const SceneSnapshot& scene,const Techniques::Settings& settings,std::string& error)
+bool BakeSceneWithArvo(const SceneSnapshot& scene,const Techniques::Settings& settings,
+    const Renderer::ArvoBakeOptions& options,std::string& error,const std::function<bool()>& cancelled,
+    const std::function<void(const std::string&)>& status)
 {
-    const auto directory=scene.ActiveBakedLightingDirectory();
-    if (directory.empty()) { error="The scene has no baked lighting resource directory"; return false; }
     CancellationSource cancellation;
     auto meshes=BuildRendererMeshes(scene,cancellation.Token(),true);
     std::sort(meshes.begin(),meshes.end(),[](const auto& a,const auto& b) { return a.Id<b.Id; });
@@ -3151,12 +3160,11 @@ bool CookBakedLightingAssets(const SceneSnapshot& scene,const Techniques::Settin
     Renderer::PreparedAreaLighting area;
     if (!area.Prepare(BuildRendererLighting(scene,lights),settings.AreaLights,error)) return false;
     const auto& lighting=area.GetLighting();
-    std::vector<Renderer::SceneRayMeshView> views;
     std::vector<Renderer::LightmapSourceInstance> instances;
-    std::cout<<"Preparing Sponza lightmap LODs and UV2 receivers...\n"<<std::flush;
+    if (status) status("Preparing scene and LODs...");
     for (const auto& mesh:meshes)
     {
-        views.emplace_back(mesh);
+        if (cancelled && cancelled()) { error="Arvo lightmap bake cancelled"; return false; }
         auto geometry=std::make_shared<Renderer::LightmapSourceGeometry>(); geometry->Vertices=mesh.Vertices;
         Renderer::MeshLodChain chain;
         if (!Renderer::BuildMeshLods(mesh.Vertices,mesh.Indices,{},chain,error)) return false;
@@ -3166,18 +3174,9 @@ bool CookBakedLightingAssets(const SceneSnapshot& scene,const Techniques::Settin
         instances.push_back(std::move(instance));
     }
     auto request=Renderer::MakeLightmapBakeRequest(std::move(instances),settings,lighting,true);
-    auto receivers=std::make_shared<Renderer::LightmapReceivers>();
-    if (!Renderer::BuildLightmapReceivers(request.Instances,request.Materials,request.Atlas,*receivers,error)) return false;
-    std::cout<<"Baking Sponza lightmap ("<<request.Atlas.Resolution<<" x "<<request.Atlas.Resolution<<", "<<request.Sampling.RayCount<<" rays per hemisphere)...\n"<<std::flush;
-    auto irradiance=std::make_shared<Renderer::BakedLightmap>();
-    if (!Renderer::BakeLightmap(receivers->Atlas,*receivers->TransportScene,lighting,request.Sampling,*irradiance,error)) return false;
-    Renderer::LightmapBakeResult result; result.Receivers=receivers; result.Irradiance=irradiance;
-    if (!Renderer::SaveLightmapAsset(directory/"irradiance.evlightmap",request,result,error)) return false;
-    std::cout<<"Baking Sponza light probes...\n"<<std::flush;
-    Renderer::BakedProbeCache probes;
-    if (!probes.Update(views,1,settings,lighting,true,error) || !probes.Samples()) return false;
-    return Renderer::SaveProbeAsset(directory/"irradiance.evprobes",
-        Renderer::ProbeAssetKey(views,settings,lighting,true),*probes.Samples(),error);
+    auto transportOptions=options; transportOptions.Environment=scene.Environment;
+    transportOptions.EnvironmentScale=settings.Reflections.DiffuseIBL;
+    return Renderer::BakeWithArvo(request,transportOptions,error,cancelled,status);
 }
 
 void RegisterModuleAdapters(EditorCore& editor)

@@ -3,6 +3,9 @@
 #include "Editor/Demos.hpp"
 #include "Editor/RenderAdapter.hpp"
 #include "Renderer/ShaderPreparationProgress.h"
+#include "Renderer/BakedLighting/ArvoLightmap.h"
+#include "Editor/NeuralWorkspace.h"
+#include <mutex>
 
 #include <array>
 #include <chrono>
@@ -61,6 +64,18 @@ public:
     // Tick never waits for background work. Completed jobs are collected here.
     void Tick(float deltaSeconds);
     void RequestRender();
+    Renderer::ArvoBakeOptions& LightmapOptions() noexcept { return LightmapOptions_; }
+    std::filesystem::path LightmapBakeDirectory() const;
+    void StartLightmapBake(const Techniques::Settings& settings);
+    void CancelLightmapBake();
+    void LoadLightmapOutput(const Techniques::Settings& settings);
+    void PollLightmapBake();
+    bool IsLightmapBaking() const noexcept { return LightmapTask_ != nullptr; }
+    std::string LightmapBakeMessage() const;
+    void SaveLightmapPreferences() const;
+    void LoadLightmapPreferences(const std::filesystem::path& contentRoot);
+    NeuralWorkspace& NeuralRendering() noexcept { return *Neural_; }
+    bool HasNeuralAsset() const { return HasLoadedSelectedDemo() && Scene_.Demo==DemoId::UtahTeapot && Neural_->HasAsset(); }
 
     [[nodiscard]] const SceneSnapshot& Scene() const noexcept { return Scene_; }
     [[nodiscard]] const ViewportSettings& Settings() const noexcept { return Settings_; }
@@ -97,6 +112,23 @@ public:
     [[nodiscard]] Techniques::Support QueryTechniqueSupport(Techniques::Technique technique) const;
 
 private:
+    std::unique_ptr<NeuralWorkspace> Neural_;
+    struct LightmapTask
+    {
+        std::atomic<bool> Cancelled{false};
+        mutable std::mutex Mutex;
+        std::string Message;
+        std::future<std::string> Future;
+        DemoId Demo;
+        std::uint64_t Revision=0,TransformRevision=0,LightingRevision=0;
+        std::filesystem::path Directory;
+        Techniques::LightmapSettings Atlas;
+        Techniques::Settings Settings;
+    };
+    std::unique_ptr<LightmapTask> LightmapTask_;
+    Renderer::ArvoBakeOptions LightmapOptions_;
+    std::filesystem::path LightmapPreferences_;
+    std::string LightmapMessage_;
     struct RenderJob
     {
         std::chrono::steady_clock::time_point Started=std::chrono::steady_clock::now();

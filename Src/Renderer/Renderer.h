@@ -61,6 +61,8 @@ namespace Evans::Renderer
         void SetDensityVolume(std::shared_ptr<const DensityVolume> source);
         void SetEnvironmentRadiance(std::shared_ptr<const EnvironmentRadiance> source);
         void SetBakedLightingDirectory(const std::filesystem::path& directory);
+        void SetBakedLightingShadingOverride(std::optional<Techniques::ShadingModel> shading);
+        void SetLightmapDirectory(const std::filesystem::path& directory);
         void SetHairSelectionGroup(std::uint64_t selectionGroup) { m_HairSelectionGroup=selectionGroup; }
 		const Techniques::Settings& GetTechniqueSettings() const;
 		void SetLighting(const LightingState& lighting);
@@ -465,7 +467,8 @@ namespace Evans::Renderer
         std::vector<const MeshResource*> m_PeelingMeshes;
         PreparedRefractionGeometry m_RefractionGeometry;
         BakedProbeCache m_BakedProbes;
-        std::filesystem::path m_BakedLightingDirectory;
+        std::filesystem::path m_BakedLightingDirectory, m_LightmapDirectory;
+        std::optional<Techniques::ShadingModel> m_BakedLightingShadingOverride;
         BakedLightmapCache m_BakedLightmaps;
         VoxelRadianceCache m_VoxelGI;
         std::unique_ptr<LumenRenderCache> m_LumenGI;

@@ -576,10 +576,22 @@ namespace Evans::Renderer
         m_EnvironmentSource=std::move(source); ResetFrameHistory();
     }
 
+    void Renderer::SetLightmapDirectory(const std::filesystem::path& directory)
+    {
+        if (directory==m_LightmapDirectory) return;
+        m_LightmapDirectory=directory; m_BakedLightmaps.Reset(); m_LightmapStatus={}; ResetFrameHistory();
+    }
+
     void Renderer::SetBakedLightingDirectory(const std::filesystem::path& directory)
     {
         if (directory==m_BakedLightingDirectory) return;
         m_BakedLightingDirectory=directory; m_BakedLightmaps.Reset(); m_BakedProbes={}; m_LightmapStatus={}; ResetFrameHistory();
+    }
+
+    void Renderer::SetBakedLightingShadingOverride(std::optional<Techniques::ShadingModel> shading)
+    {
+        if (shading==m_BakedLightingShadingOverride) return;
+        m_BakedLightingShadingOverride=shading; m_BakedLightmaps.Reset(); m_BakedProbes={}; m_LightmapStatus={}; ResetFrameHistory();
     }
 
 	void Renderer::SetRenderMode(RenderMode mode)
@@ -1111,9 +1123,9 @@ namespace Evans::Renderer
             }
             if (Techniques::UsesLightmaps(m_Techniques.GlobalIllumination))
             {
-                const char* states[]{"Idle","Queued","Preparing UV2 receivers","Baking indirect light","Ready","Failed"};
+                const char* states[]{"Idle","Queued","Loading baked resource","Waiting for external bake","Ready","Failed"};
                 m_LastFrameCapture.BakedLightingStatus=states[static_cast<std::size_t>(m_LightmapStatus.State)];
-                if (!m_BakedLightingDirectory.empty() && m_LightmapStatus.State!=LightmapBakeState::Failed)
+                if ((!m_LightmapDirectory.empty() || !m_BakedLightingDirectory.empty()) && m_LightmapStatus.State!=LightmapBakeState::Failed)
                     m_LastFrameCapture.BakedLightingStatus="Loading baked resource";
                 if (m_LightmapStatus.Current() && m_LightmapStatus.Published->LoadedFromAsset) m_LastFrameCapture.BakedLightingStatus="Loaded baked resource";
                 if (!m_LightmapStatus.Error.empty()) m_LastFrameCapture.BakedLightingStatus += ": " + m_LightmapStatus.Error;
@@ -2099,9 +2111,13 @@ namespace Evans::Renderer
             m_LightmapInstances=std::move(instances); m_LightmapSourceRevision=m_ProbeSceneRevision;
             m_LightmapVirtualSerial=m_VirtualGeometry?m_VirtualGeometry->Serial:0; m_LightmapNaniteSerial=m_NaniteGeometry?m_NaniteGeometry->Serial:0; ++m_LightmapGeometryRevision;
         }
-        auto request=MakeLightmapBakeRequest(m_LightmapInstances,m_Techniques,m_RenderLighting,m_ShadowsEnabled,m_LightmapTraceDistance);
+        auto bakeSettings=m_Techniques;
+        if (m_BakedLightingShadingOverride && m_LightmapDirectory==m_BakedLightingDirectory)
+            bakeSettings.Shading=*m_BakedLightingShadingOverride;
+        auto request=MakeLightmapBakeRequest(m_LightmapInstances,bakeSettings,m_RenderLighting,m_ShadowsEnabled,m_LightmapTraceDistance);
         request.SceneRevision=m_LightmapGeometryRevision;
-        if (!m_BakedLightingDirectory.empty()) request.Archive=m_BakedLightingDirectory/"irradiance.evlightmap";
+        const auto& archiveDirectory=m_LightmapDirectory.empty()?m_BakedLightingDirectory:m_LightmapDirectory;
+        if (!archiveDirectory.empty()) request.Archive=archiveDirectory/"irradiance.evlightmap";
         m_BakedLightmaps.Request(std::move(request)); m_LightmapStatus=m_BakedLightmaps.Status();
         if (!m_LightmapStatus.Current()) return true;
         LightmapFrame frame; frame.Source=m_LightmapStatus.Published;
@@ -2390,7 +2406,9 @@ namespace Evans::Renderer
             meshes.push_back(std::move(view));
         }
         const auto archive=m_BakedLightingDirectory.empty()?std::filesystem::path{}:m_BakedLightingDirectory/"irradiance.evprobes";
-        if (!m_BakedProbes.Update(meshes,m_ProbeSceneRevision,m_Techniques,m_RenderLighting,m_ShadowsEnabled,m_LastError,archive)) return false;
+        auto bakeSettings=m_Techniques;
+        if (m_BakedLightingShadingOverride) bakeSettings.Shading=*m_BakedLightingShadingOverride;
+        if (!m_BakedProbes.Update(meshes,m_ProbeSceneRevision,bakeSettings,m_RenderLighting,m_ShadowsEnabled,m_LastError,archive)) return false;
         m_RHI->SetBakedProbeSamples(m_BakedProbes.Samples());
         return true;
     }

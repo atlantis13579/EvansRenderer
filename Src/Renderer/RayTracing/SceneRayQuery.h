@@ -66,6 +66,8 @@ namespace Evans::Renderer
         [[nodiscard]] bool Trace(Float3 origin, Float3 direction, float minimumDistance,
             float maximumDistance, SceneRayHit& hit, bool shadowCastersOnly = false) const;
         [[nodiscard]] bool GetTriangle(std::uint32_t triangle, SceneRayTriangle& output) const noexcept;
+        // Export the immutable material snapshot for an external offline baker.
+        [[nodiscard]] bool GetTriangleMaterial(std::uint32_t triangle, MaterialData& material, Float4& color) const;
         // Lightmap texels address a known triangle directly, avoiding a second
         // closest-hit query that could select a coincident layer. Returns false
         // for invalid barycentrics, degenerate geometry or rejected alpha.

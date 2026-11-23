@@ -196,6 +196,9 @@ struct SceneSnapshot
     bool UsingDefaultPbrReflection = false;
     std::vector<SceneNode> Nodes;
     std::filesystem::path BakedLightingDirectory;
+    std::filesystem::path LightmapDirectory;
+    [[nodiscard]] std::filesystem::path ActiveLightmapDirectory() const
+    { return LightmapDirectory.empty() ? ActiveBakedLightingDirectory() : LightmapDirectory; }
     std::shared_ptr<const Renderer::EnvironmentRadiance> Environment;
     void UsePbrMaterials(bool enabled)
     {
@@ -206,7 +209,7 @@ struct SceneSnapshot
     }
     [[nodiscard]] std::filesystem::path ActiveBakedLightingDirectory() const
     {
-        return UsingPbrMaterials && !BakedLightingDirectory.empty() ? BakedLightingDirectory / "PBR" : BakedLightingDirectory;
+        return BakedLightingDirectory;
     }
     std::shared_ptr<const Renderer::DensityVolume> Volume;
     std::shared_ptr<const BigWorldState> World;

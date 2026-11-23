@@ -24,7 +24,7 @@ namespace Evans::Renderer
         // Increment with transport, UV2, LOD or archive layout changes. These
         // are Evans resources, not a serialization of C++ ownership or a BVH.
         constexpr std::uint64_t ArchiveVersion=1,LightmapMagic=0x50414d4c4b425645ull,ProbeMagic=0x45424f5250425645ull;
-        constexpr std::uint64_t LightmapArchiveVersion=2;
+        constexpr std::uint64_t LightmapArchiveVersion=3;
         constexpr std::uint64_t HashSeed=14695981039346656037ull,HashPrime=1099511628211ull;
         constexpr std::size_t MaximumArchiveBytes=512ull*1024*1024,HeaderWords=5,HeaderBytes=HeaderWords*sizeof(std::uint64_t);
         constexpr std::uint32_t RepeatedTexelsBit=1u<<31,MaximumTexelBlock=RepeatedTexelsBit-1;
@@ -263,10 +263,10 @@ namespace Evans::Renderer
 
     std::uint64_t LightmapReceiverKey(const LightmapBakeRequest& request)
     {
-        // Lighting is frozen in the authored asset. Realtime light edits and
-        // shading controls must not turn its checkbox into a new bake request.
-        Hash h; h.Scalar(LightmapArchiveVersion); AtlasSettings(h,request.Atlas);
-        h.Flag(request.Materials.AlphaBlending); h.Flag(request.Materials.Refraction.Enabled);
+        // Light edits remain realtime, but transport materials and geometry must
+        // still match the immutable bake. Changing them requires an explicit rebake.
+        SceneHash hash; auto& h=hash.Digest; h.Scalar(LightmapArchiveVersion); AtlasSettings(h,request.Atlas);
+        Materials(h,request.Materials);
         h.Scalar(std::uint64_t(request.Instances.size()));
         for (const auto& instance:request.Instances)
         {
@@ -274,7 +274,9 @@ namespace Evans::Renderer
             h.Flag(instance.Visible); h.Scalar(instance.World);
             if (!instance.Geometry || instance.Geometry->Levels.empty()) continue;
             const auto& geometry=*instance.Geometry;
-            h.Scalar(HashMeshGeometry(geometry.Vertices,geometry.Levels.front()));
+            SceneRayMeshView mesh; mesh.Vertices=&geometry.Vertices; mesh.Indices=&geometry.Levels.front();
+            mesh.World=instance.World; mesh.Color=instance.Color; mesh.Material=instance.Material;
+            mesh.Visible=instance.Visible; mesh.CastShadow=instance.CastShadow; hash.Mesh(mesh);
             h.Scalar(std::uint64_t(geometry.Levels.size()));
             for (const auto& level:geometry.Levels) h.Vector(level);
             h.Scalar(std::uint64_t(geometry.Segments.size()));
