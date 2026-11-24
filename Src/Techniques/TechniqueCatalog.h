@@ -339,6 +339,25 @@ struct PostProcessSettings
     float DistortionStrength = 0.2f;
     bool Vignette = false;
     bool FilmGrain = false;
+    bool Pixelation = false;
+    float PixelSize = 8.0f;
+    bool ColorEdgeOutline = false;
+    float ColorEdgeThreshold = 0.15f;
+    float ColorEdgeStrength = 1.0f;
+    bool DynamicDistortion = false;
+    float DynamicDistortionAmplitude = 4.0f; // pixels
+    float DynamicDistortionFrequency = 12.0f; // cycles across the viewport
+    float DynamicDistortionSpeed = 1.0f; // cycles per second
+    bool OilPaint = false;
+    float OilPaintRadius = 2.0f;
+    float OilPaintStrength = 1.0f;
+    bool Watercolor = false;
+    float WatercolorRadius = 2.0f;
+    float WatercolorStrength = 1.0f;
+    bool DepthNormalOutline = false;
+    float DepthEdgeThreshold = 0.01f;
+    float NormalEdgeThreshold = 0.2f;
+    float DepthNormalEdgeStrength = 1.0f;
     float VignetteStrength = 0.35f;
     float FilmGrainStrength = 0.08f;
     // Static screen-space noise: the full seed is preserved, without animation.
@@ -372,10 +391,12 @@ inline constexpr float MinimumDistortionStrength = -0.3f;
 inline constexpr float MaximumDistortionStrength = 1.0f;
 enum class PostProcessPassKind : std::uint32_t
 {
-    FXAA = 0, Vignette = 1, FilmGrain = 2, ScreenSpaceDistortion = 3, NPR = 4, Count
+    FXAA = 0, Vignette = 1, FilmGrain = 2, ScreenSpaceDistortion = 3, NPR = 4,
+    Pixelation = 5, ColorEdgeOutline = 6, DynamicDistortion = 7,
+    OilPaint = 8, Watercolor = 9, DepthNormalOutline = 10, Count
 };
-// Ordered native color passes. Each reads the previous output and writes a
-// different attachment; no depth, velocity or temporal history is required.
+// Ordered native fullscreen passes. Each reads the previous color and writes a
+// different attachment. DepthNormalOutline also reads scene depth and normals.
 [[nodiscard]] std::vector<PostProcessPassKind> BuildPostProcessPlan(const PostProcessSettings& settings);
 
 struct LodSettings

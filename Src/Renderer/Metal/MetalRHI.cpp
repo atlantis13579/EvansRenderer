@@ -2111,7 +2111,7 @@ namespace Evans::Renderer
         {
             const std::size_t index = static_cast<std::size_t>(pass);
             if (index >= PostPipelines.size()) { Fail("Invalid Metal post-process pass"); return nullptr; }
-            constexpr const char* filenames[] = {"FXAA.metal", "Vignette.metal", "FilmGrain.metal", "ScreenSpaceDistortion.metal", "NPR.metal"};
+            constexpr const char* filenames[] = {"FXAA.metal", "Vignette.metal", "FilmGrain.metal", "ScreenSpaceDistortion.metal", "NPR.metal", "Pixelation.metal", "ColorEdgeOutline.metal", "DynamicDistortion.metal", "OilPaint.metal", "Watercolor.metal", "DepthNormalOutline.metal"};
             static_assert(std::size(filenames) == PostProcessTechniqueCount);
             if (!PostPipelines[index]) PostPipelines[index] = CreateFullscreenPipeline(filenames[index], false, false);
             return PostPipelines[index];
@@ -2900,6 +2900,11 @@ namespace Evans::Renderer
                 Send<void, NSUInteger>(encoder, "setCullMode:", CullModeNone);
                 Send<void, NSUInteger>(encoder, "setTriangleFillMode:", TriangleFillModeFill);
                 Send<void, ObjCObject, NSUInteger>(encoder, "setFragmentTexture:atIndex:", resultTexture, 0);
+                if (pass == Techniques::PostProcessPassKind::DepthNormalOutline)
+                {
+                    Send<void, ObjCObject, NSUInteger>(encoder, "setFragmentTexture:atIndex:", DepthTexture, 1);
+                    Send<void, ObjCObject, NSUInteger>(encoder, "setFragmentTexture:atIndex:", GBufferTextures[1], 2);
+                }
                 Send<void, const void*, NSUInteger, NSUInteger>(encoder, "setFragmentBytes:length:atIndex:", &constants, sizeof(constants), 0);
                 Send<void, NSUInteger, NSUInteger, NSUInteger>(encoder, "drawPrimitives:vertexStart:vertexCount:", PrimitiveTypeTriangle, 0, 3);
                 Send<void>(encoder, "endEncoding");

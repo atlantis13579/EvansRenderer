@@ -49,6 +49,12 @@ namespace Evans::Renderer
         case Techniques::PostProcessPassKind::FilmGrain: return "FilmGrain";
         case Techniques::PostProcessPassKind::ScreenSpaceDistortion: return "ScreenSpaceDistortion";
         case Techniques::PostProcessPassKind::NPR: return "NPR";
+        case Techniques::PostProcessPassKind::Pixelation: return "Pixelation";
+        case Techniques::PostProcessPassKind::ColorEdgeOutline: return "ColorEdgeOutline";
+        case Techniques::PostProcessPassKind::DynamicDistortion: return "DynamicDistortion";
+        case Techniques::PostProcessPassKind::OilPaint: return "OilPaint";
+        case Techniques::PostProcessPassKind::Watercolor: return "Watercolor";
+        case Techniques::PostProcessPassKind::DepthNormalOutline: return "DepthNormalOutline";
         case Techniques::PostProcessPassKind::Count: break;
         }
         return nullptr;

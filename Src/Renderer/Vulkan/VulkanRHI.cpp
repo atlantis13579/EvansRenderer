@@ -2326,7 +2326,14 @@ struct VulkanRHI::Impl
             std::memcpy(static_cast<std::uint8_t*>(UniformBuffer.Mapped) + offset, &constants, sizeof(constants));
             UniformOffset = offset + sizeof(RealtimeDrawConstants);
             const VkDescriptorSet descriptorSet = DescriptorSets[DescriptorSetIndex++];
-            UpdateDescriptorSet(descriptorSet, {DummyDepth.View, result->View, DummyColor.View, DummyColor.View}, PostSampler);
+            const bool geometryEdge = pass == Techniques::PostProcessPassKind::DepthNormalOutline;
+            if (geometryEdge)
+            {
+                TransitionImage(CommandBuffer, MainDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                TransitionImage(CommandBuffer, GBufferImages[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+            UpdateDescriptorSet(descriptorSet, {geometryEdge ? MainDepth.View : DummyDepth.View,
+                result->View, geometryEdge ? GBufferImages[1].View : DummyColor.View, DummyColor.View}, PostSampler);
             TransitionImage(CommandBuffer, *result, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             TransitionImage(CommandBuffer, PostImages[destination], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             VkClearValue clear{};

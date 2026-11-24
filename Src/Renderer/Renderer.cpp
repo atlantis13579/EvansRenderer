@@ -1202,6 +1202,9 @@ namespace Evans::Renderer
                 (m_Techniques.GlobalIllumination.Lumen.GlobalDistance.Enabled && GetLumenGlobalDistanceState()==LumenGlobalDistanceState::Updating) ||
                 (m_Techniques.GlobalIllumination.Lumen.WorldCache.Enabled && GetLumenWorldCacheState()==LumenWorldCacheState::Queued));
             m_LastFrameCapture.NeedsTemporalFrame |= m_Techniques.PostProcessing.TemporalEffects.Enabled;
+            const auto& dynamicWarp = m_Techniques.PostProcessing;
+            m_LastFrameCapture.NeedsTemporalFrame |= dynamicWarp.DynamicDistortion &&
+                dynamicWarp.DynamicDistortionAmplitude > 0.0f && dynamicWarp.DynamicDistortionSpeed != 0.0f;
             m_LastFrameCapture.NeedsTemporalFrame |= m_VoxelStatus.State==VoxelUpdateState::Queued || m_VoxelStatus.State==VoxelUpdateState::Preparing ||
                 m_VoxelStatus.State==VoxelUpdateState::Voxelizing || m_VoxelStatus.State==VoxelUpdateState::Injecting;
             m_LastFrameCapture.NeedsTemporalFrame |= m_LightmapStatus.State==LightmapBakeState::Queued ||

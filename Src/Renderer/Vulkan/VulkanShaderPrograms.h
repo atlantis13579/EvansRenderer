@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Renderer/Vulkan/VulkanShaderCompiler.h"
+#include "Renderer/TechniqueShader.h"
+
+#include <iterator>
 
 namespace Evans::Renderer
 {
@@ -555,13 +558,32 @@ inline constexpr VulkanShaderProgram VulkanPostScreenSpaceDistortionFragment {"S
 
 inline constexpr VulkanShaderProgram VulkanPostNPRVertex {"NPR.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
 inline constexpr VulkanShaderProgram VulkanPostNPRFragment {"NPR.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostPixelationVertex {"Pixelation.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostPixelationFragment {"Pixelation.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostColorEdgeOutlineVertex {"ColorEdgeOutline.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostColorEdgeOutlineFragment {"ColorEdgeOutline.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostDynamicDistortionVertex {"DynamicDistortion.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostDynamicDistortionFragment {"DynamicDistortion.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostOilPaintVertex {"OilPaint.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostOilPaintFragment {"OilPaint.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostWatercolorVertex {"Watercolor.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostWatercolorFragment {"Watercolor.glsl", VulkanShaderStage::Fragment, ""};
+inline constexpr VulkanShaderProgram VulkanPostDepthNormalOutlineVertex {"DepthNormalOutline.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};
+inline constexpr VulkanShaderProgram VulkanPostDepthNormalOutlineFragment {"DepthNormalOutline.glsl", VulkanShaderStage::Fragment, ""};
 inline constexpr VulkanShaderProgram VulkanPostProcessShaders[][2] = {
     {VulkanPostFXAAVertex, VulkanPostFXAAFragment},
     {VulkanPostVignetteVertex, VulkanPostVignetteFragment},
     {VulkanPostFilmGrainVertex, VulkanPostFilmGrainFragment},
     {VulkanPostScreenSpaceDistortionVertex, VulkanPostScreenSpaceDistortionFragment},
     {VulkanPostNPRVertex, VulkanPostNPRFragment},
+    {VulkanPostPixelationVertex, VulkanPostPixelationFragment},
+    {VulkanPostColorEdgeOutlineVertex, VulkanPostColorEdgeOutlineFragment},
+    {VulkanPostDynamicDistortionVertex, VulkanPostDynamicDistortionFragment},
+    {VulkanPostOilPaintVertex, VulkanPostOilPaintFragment},
+    {VulkanPostWatercolorVertex, VulkanPostWatercolorFragment},
+    {VulkanPostDepthNormalOutlineVertex, VulkanPostDepthNormalOutlineFragment},
 };
+static_assert(std::size(VulkanPostProcessShaders) == PostProcessTechniqueCount);
 
 // Sao source variants.
 inline constexpr VulkanShaderProgram VulkanSaoVertex {"SAO.glsl", VulkanShaderStage::Vertex, "EVANS_VERTEX_STAGE=1"};

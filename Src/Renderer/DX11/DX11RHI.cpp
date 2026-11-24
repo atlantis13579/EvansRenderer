@@ -1508,7 +1508,14 @@ namespace Evans::Renderer
 				ID3D11ShaderResourceView* source = sourceIsMain ? SceneColorView.Get() : PostView.Get();
 				ID3D11RenderTargetView* target = sourceIsMain ? PostTarget.Get() : ColorTarget.Get();
 				Context->OMSetRenderTargets(1, &target, nullptr);
-				Context->PSSetShaderResources(0, 1, &source);
+				ID3D11ShaderResourceView* inputs[3] {source, nullptr, nullptr};
+				if (pass == Techniques::PostProcessPassKind::DepthNormalOutline)
+				{
+					inputs[1] = DepthShaderView.Get();
+					inputs[2] = GBufferSurfaces[1].View.Get();
+					if (!inputs[1] || !inputs[2]) return Fail("Depth/normal outline requires scene depth and material normals");
+				}
+				Context->PSSetShaderResources(0, 3, inputs);
 				const auto index = static_cast<std::size_t>(pass);
 				Context->VSSetShader(PostVertexShaders[index].Get(), nullptr, 0);
 				Context->PSSetShader(PostPixelShaders[index].Get(), nullptr, 0);

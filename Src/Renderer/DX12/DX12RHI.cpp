@@ -3841,20 +3841,26 @@ namespace Evans::Renderer
 		bool EnsurePostRootSignature()
 		{
 			if (PostRootSignature) return true;
-			D3D12_DESCRIPTOR_RANGE imageRange {};
-			imageRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-			imageRange.NumDescriptors = 1;
-			imageRange.BaseShaderRegister = 0;
-			imageRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-			D3D12_ROOT_PARAMETER parameters[2] {};
+			D3D12_DESCRIPTOR_RANGE imageRanges[3] {};
+			for (UINT index = 0; index < 3; ++index)
+			{
+				imageRanges[index].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+				imageRanges[index].NumDescriptors = 1;
+				imageRanges[index].BaseShaderRegister = index;
+				imageRanges[index].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+			}
+			D3D12_ROOT_PARAMETER parameters[4] {};
 			parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 			parameters[0].Constants.ShaderRegister = 0;
 			parameters[0].Constants.Num32BitValues = sizeof(PostProcessConstants) / sizeof(std::uint32_t);
 			parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-			parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-			parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-			parameters[1].DescriptorTable.pDescriptorRanges = &imageRange;
-			parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+			for (UINT index = 1; index < 4; ++index)
+			{
+				parameters[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+				parameters[index].DescriptorTable.NumDescriptorRanges = 1;
+				parameters[index].DescriptorTable.pDescriptorRanges = &imageRanges[index - 1];
+				parameters[index].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+			}
 			D3D12_STATIC_SAMPLER_DESC sampler {};
 			sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 			sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3960,6 +3966,16 @@ namespace Evans::Renderer
 				const auto target = RTVArena.Cpu(outputIsMain ? PostColorRTV : MainColorRTV);
 				CommandList->OMSetRenderTargets(1, &target, FALSE, nullptr);
 				CommandList->SetGraphicsRootDescriptorTable(1, SRVArena.Gpu(outputIsMain ? MainColorSRV : PostColorSRV));
+				if (pass == Techniques::PostProcessPassKind::DepthNormalOutline)
+				{
+					if (!MainDepth || !GBufferSurfaces[1].Resource)
+						return Fail("Depth/normal outline requires scene depth and material normals");
+					Transition(MainDepth.Get(), MainDepthState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					Transition(GBufferSurfaces[1].Resource.Get(), GBufferSurfaces[1].State,
+						D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+					CommandList->SetGraphicsRootDescriptorTable(2, SRVArena.Gpu(MainDepthSRV));
+					CommandList->SetGraphicsRootDescriptorTable(3, SRVArena.Gpu(GBufferSurfaces[1].SRV));
+				}
 				CommandList->SetPipelineState(PostPipelines[static_cast<std::size_t>(pass)].Get());
 				CommandList->DrawInstanced(3, 1, 0, 0);
 				outputIsMain = !outputIsMain;

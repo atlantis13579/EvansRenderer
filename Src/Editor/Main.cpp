@@ -221,35 +221,6 @@ Rect EditorViewportBounds(const WindowState& state)
         std::max(1.0f, static_cast<float>(state.ClientHeight) - top - EditorViewportMargin)};
 }
 
-int BackendSelectionIndex(
-    const std::vector<Evans::Editor::BackendDescriptor>& backends,
-    const std::string& selectedBackend)
-{
-    for (std::size_t index = 0; index < backends.size(); ++index)
-    {
-        if (backends[index].Id == selectedBackend)
-        {
-            return static_cast<int>(index);
-        }
-    }
-    return 0;
-}
-
-const char* BackendUiLabel(const std::string& id)
-{
-    if (id == "renderer.dx11") return "Renderer / DX11";
-    if (id == "renderer.dx12") return "Renderer / DX12";
-    if (id == "renderer.metal") return "Renderer / Metal";
-    if (id == "renderer.opengles") return "Renderer / OpenGL ES";
-    if (id == "renderer.vulkan") return "Renderer / Vulkan";
-    if (id == "rasterizer.cpu") return "Rasterizer / CPU";
-    if (id == "rasterizer.cuda") return "Rasterizer / CUDA";
-    if (id == "rasterizer.compute") return "Rasterizer / Compute";
-    if (id == "rasterizer.metal") return "Rasterizer / Metal";
-    if (id == "renderer.dxr") return "Renderer / DXR";
-    return "Unknown RHI";
-}
-
 int DemoSelectionIndex(Evans::Editor::DemoId demo)
 {
     const std::vector<Evans::Editor::DemoDescriptor>& descriptors =
@@ -275,24 +246,6 @@ void DrawEditorImgui(WindowState& state)
         panelHeight,
         &state.PanelScroll);
 
-    const std::vector<Evans::Editor::BackendDescriptor> backends = state.Editor->Backends();
-    std::vector<const char*> backendLabels;
-    backendLabels.reserve(backends.size());
-    for (const Evans::Editor::BackendDescriptor& backend : backends)
-    {
-        backendLabels.push_back(BackendUiLabel(backend.Id));
-    }
-
-    imguiLabel("RHI Backend");
-    int backendIndex = BackendSelectionIndex(backends, state.Editor->SelectedBackend());
-    if (!backendLabels.empty() &&
-        imguiCombo("", &backendIndex, backendLabels.data(), static_cast<int>(backendLabels.size())))
-    {
-        state.Editor->SelectBackend(backends[static_cast<std::size_t>(backendIndex)].Id);
-    }
-
-    imguiSeparatorLine();
-    imguiLabel("Scene");
     const std::vector<Evans::Editor::DemoDescriptor>& demos =
         Evans::Editor::DemoCatalog::Descriptors();
     std::vector<const char*> demoLabels;
@@ -303,7 +256,7 @@ void DrawEditorImgui(WindowState& state)
     }
     int demoIndex = DemoSelectionIndex(state.Editor->SelectedDemo());
     if (!demoLabels.empty() &&
-        imguiCombo("Demo", &demoIndex, demoLabels.data(), static_cast<int>(demoLabels.size())))
+        imguiCombo("Scene", &demoIndex, demoLabels.data(), static_cast<int>(demoLabels.size())))
     {
         state.Editor->SelectDemo(demos[static_cast<std::size_t>(demoIndex)].Id);
     }

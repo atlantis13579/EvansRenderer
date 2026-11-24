@@ -70,7 +70,7 @@ and DXR have smaller capability sets.
 | Geometry | Frustum and back-face culling, quadric mesh LOD, indexed instancing, GPU instance compaction and indirect drawing, compute PN triangle tessellation, geometric displacement, streamed virtual geometry |
 | Antialiasing | Native MSAA with explicit resolves, display-domain FXAA, motion-reprojected TAA, independent temporal super resolution (TSR) |
 | Volumes | Height fog, shadowed volumetric lighting, procedural heterogeneous participating media, procedural volumetric clouds, screen-space light shafts |
-| Post-processing | Reinhard and ACES-fitted tone mapping, bloom, analytic color grading, thin-lens depth of field, rigid motion blur, screen-space distortion, lens flare, film grain, vignette, temporal exposure adaptation |
+| Post-processing | Reinhard and ACES-fitted tone mapping, bloom, analytic color grading, thin-lens depth of field, rigid motion blur, radial and animated screen distortion, lens flare, film grain, vignette, temporal exposure adaptation, fullscreen color and depth/normal contours, pixelation, Kuwahara oil paint and watercolor filtering. Depth/normal contours require a raster material buffer and are inactive during path tracing. |
 | Transparency | Sorted source-over blending, weighted blended OIT, bounded depth-peeling OIT |
 
 

@@ -48,7 +48,7 @@ public:
         imguiPushVisibility(true);
         imguiSeparatorLine();
         const std::string group(name);
-        auto& open=expanded.emplace(group,group=="Rendering" || group=="RenderMode").first->second;
+        auto& open=expanded.emplace(group,group=="Rendering").first->second;
         if (imguiCollapse(name,"",open)) open=!open;
         imguiPushVisibility(open); imguiIndent();
         imguiPushEnabled(available,reason?reason:"This category's techniques are unavailable in the current scene, pipeline or backend.");
@@ -70,6 +70,26 @@ bool DrawControlChoices(int& selected,const std::vector<const char*>& names,bool
     }
     imguiSetDisabledReason(nullptr);
     return changed;
+}
+bool DrawBackendControls(EditorCore& editor)
+{
+    const auto backends = editor.Backends();
+    std::vector<const char*> labels, reasons;
+    labels.reserve(backends.size());
+    reasons.reserve(backends.size());
+    int selected = 0;
+    for (std::size_t index = 0; index < backends.size(); ++index)
+    {
+        const auto& backend = backends[index];
+        labels.push_back(backend.DisplayName.c_str());
+        reasons.push_back(editor.SupportsSelectedPipeline(backend.Id)
+            ? nullptr : "The selected pipeline is unavailable on this backend.");
+        if (backend.Id == editor.SelectedBackend()) selected = static_cast<int>(index);
+    }
+    if (labels.empty() || !imguiCombo("RHI Backend", &selected, labels.data(),
+            static_cast<int>(labels.size()), true, reasons.data())) return false;
+    editor.SelectBackend(backends[static_cast<std::size_t>(selected)].Id);
+    return true;
 }
 bool DrawLumenEnvironment(Techniques::LumenEnvironmentSettings& environment,const char* context)
 {
@@ -176,15 +196,13 @@ void DrawRenderModeControls(EditorCore& editor)
 {
     const bool path=Techniques::UsesPathTracing(editor.Settings().Techniques.Pipeline) &&
         editor.QueryTechniqueSupport(Techniques::Technique::PathTracing).Available();
-    imguiSetDisabledReason("Ray Tracing Full owns primary visibility; wire modes require rasterization.");
     const char* labels[]{"Solid","Wireframe","Solid + Wireframe"};
-    for (int i=0;i<3;++i)
-    {
-        const auto mode=FillMode(i);
-        if (imguiCheck(labels[i],path?mode==FillMode::Solid:editor.Settings().Mode==mode,!path) && editor.Settings().Mode!=mode)
-            editor.SetFillMode(mode);
-    }
-    imguiSetDisabledReason(nullptr);
+    const char* reasons[]{nullptr,
+        path ? "Ray Tracing Full owns primary visibility; wire modes require rasterization." : nullptr,
+        path ? "Ray Tracing Full owns primary visibility; wire modes require rasterization." : nullptr};
+    int selected=path?0:static_cast<int>(editor.Settings().Mode);
+    if (imguiCombo("Render Mode",&selected,labels,3,true,reasons))
+        editor.SetFillMode(static_cast<FillMode>(selected));
 }
 
 void DrawRenderBufferControls(EditorCore& editor)
@@ -206,7 +224,7 @@ void DrawRenderBufferControls(EditorCore& editor)
     for (const auto& reason:reasons) pointers.push_back(reason.c_str());
     int selected=int(editor.Settings().Buffer);
     if (selected<0 || selected>=14 || !reasons[selected].empty()) {selected=0;editor.SetRenderBuffer(B::Color);}
-    if (imguiCombo("Render Buffer",&selected,labels,14,true,pointers.data(),true)) editor.SetRenderBuffer(B(selected));
+    if (imguiCombo("Render Buffer",&selected,labels,14,true,pointers.data())) editor.SetRenderBuffer(B(selected));
 }
 
 void DrawTechniqueControls(EditorCore& editor)
@@ -341,6 +359,7 @@ void DrawTechniqueControls(EditorCore& editor)
     }
     if(requested.Pipeline==RenderingPipeline::Neural3DGS)
     {
+        if (DrawBackendControls(editor)) return;
         sections.Next("Neural Rendering");
         DrawNeuralPanel(editor);
         sections.End();if(changed) editor.SetTechniqueSettings(requested);return;
@@ -415,9 +434,8 @@ void DrawTechniqueControls(EditorCore& editor)
     if (native && !path && requested.Shading == ShadingModel::Toon)
         changed |= imguiSlider("Light bands", &requested.ToonBands, 2.0f, 12.0f, 1.0f);
 
-    sections.Next("Render Buffer");
+    if (DrawBackendControls(editor)) return;
     DrawRenderBufferControls(editor);
-    sections.Next("RenderMode");
     DrawRenderModeControls(editor);
     const bool softwareMaterials = IsSoftwareRaster(backend);
     const bool rasterMaterials = native || softwareMaterials;
@@ -1683,6 +1701,42 @@ void DrawTechniqueControls(EditorCore& editor)
     const bool vignetteAvailable = native && QuerySupport(Technique::Vignette, backend).Available();
     const bool grainAvailable = native && QuerySupport(Technique::FilmGrain, backend).Available();
     const bool distortionAvailable = native && QuerySupport(Technique::ScreenSpaceDistortion, backend).Available();
+    toggle("Pixelation", post.Pixelation, native);
+    if (native && post.Pixelation)
+        changed |= imguiSlider("Pixel size (pixels)", &post.PixelSize, 1.0f, 128.0f, 1.0f);
+    toggle("Color edge outline", post.ColorEdgeOutline, native);
+    if (native && post.ColorEdgeOutline)
+    {
+        changed |= imguiSlider("Color edge threshold", &post.ColorEdgeThreshold, 0.0f, 2.0f, 0.01f);
+        changed |= imguiSlider("Color edge strength", &post.ColorEdgeStrength, 0.0f, 1.0f, 0.01f);
+    }
+    toggle("Dynamic distortion", post.DynamicDistortion, native);
+    if (native && post.DynamicDistortion)
+    {
+        changed |= imguiSlider("Wave amplitude (pixels)", &post.DynamicDistortionAmplitude, 0.0f, 64.0f, 0.5f);
+        changed |= imguiSlider("Wave cycles", &post.DynamicDistortionFrequency, 1.0f, 64.0f, 1.0f);
+        changed |= imguiSlider("Wave speed", &post.DynamicDistortionSpeed, -8.0f, 8.0f, 0.1f);
+    }
+    toggle("Oil paint", post.OilPaint, native);
+    if (native && post.OilPaint)
+    {
+        changed |= imguiSlider("Oil radius (pixels)", &post.OilPaintRadius, 1.0f, 4.0f, 1.0f);
+        changed |= imguiSlider("Oil strength", &post.OilPaintStrength, 0.0f, 1.0f, 0.01f);
+    }
+    toggle("Watercolor", post.Watercolor, native);
+    if (native && post.Watercolor)
+    {
+        changed |= imguiSlider("Watercolor radius (pixels)", &post.WatercolorRadius, 1.0f, 4.0f, 1.0f);
+        changed |= imguiSlider("Watercolor strength", &post.WatercolorStrength, 0.0f, 1.0f, 0.01f);
+    }
+    toggle("Depth and normal outline", post.DepthNormalOutline, native && !path);
+    if (native && !path && post.DepthNormalOutline)
+    {
+        changed |= imguiSlider("Depth edge threshold", &post.DepthEdgeThreshold, 0.0001f, 0.1f, 0.001f);
+        changed |= imguiSlider("Normal edge threshold", &post.NormalEdgeThreshold, 0.0f, 2.0f, 0.01f);
+        changed |= imguiSlider("Depth/normal edge strength", &post.DepthNormalEdgeStrength, 0.0f, 1.0f, 0.01f);
+    }
+    if (path) HelpLabel("Depth/normal contours require raster material buffers.");
     toggle("Screen-space distortion", post.ScreenSpaceDistortion, distortionAvailable);
     if (distortionAvailable && post.ScreenSpaceDistortion)
     {

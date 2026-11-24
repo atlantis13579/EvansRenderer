@@ -104,6 +104,7 @@ public:
     [[nodiscard]] const std::string& StatusText() const noexcept { return StatusText_; }
     [[nodiscard]] std::uint64_t Generation() const noexcept { return Generation_; }
     [[nodiscard]] std::vector<BackendDescriptor> Backends() const;
+    [[nodiscard]] bool SupportsSelectedPipeline(const std::string& backendId) const;
     [[nodiscard]] std::uint32_t QueryMultisampleCounts() const;
     [[nodiscard]] std::uint32_t QueryWeightedTransparencySampleCounts() const;
     [[nodiscard]] bool QueryNaniteHardwareScheduling() const;

@@ -21,7 +21,6 @@
 
 namespace
 {
-using Evans::Editor::BackendDescriptor;
 using Evans::Editor::DemoDescriptor;
 using Evans::Editor::DemoId;
 using Evans::Editor::EditorCore;
@@ -48,20 +47,6 @@ Rect EditorViewportBounds(int clientWidth, int clientHeight)
         top,
         std::max(1.0f, static_cast<float>(clientWidth) - left - EditorViewportMargin),
         std::max(1.0f, static_cast<float>(clientHeight) - top - EditorViewportMargin)};
-}
-
-int BackendSelectionIndex(
-    const std::vector<BackendDescriptor>& backends,
-    const std::string& selectedBackend)
-{
-    for (std::size_t index = 0; index < backends.size(); ++index)
-    {
-        if (backends[index].Id == selectedBackend)
-        {
-            return static_cast<int>(index);
-        }
-    }
-    return 0;
 }
 
 int DemoSelectionIndex(DemoId selectedDemo)
@@ -302,28 +287,6 @@ NSString* StringFromUtf8(const std::string& text)
         panelHeight,
         &PanelScroll_);
 
-    const std::vector<BackendDescriptor> backends = Editor_->Backends();
-    std::vector<const char*> backendLabels;
-    backendLabels.reserve(backends.size());
-    for (const BackendDescriptor& backend : backends)
-    {
-        backendLabels.push_back(backend.DisplayName.c_str());
-    }
-
-    // Keep the backend selector as the first control in the editor panel.
-    imguiLabel("RHI Backend");
-    int backendIndex = BackendSelectionIndex(backends, Editor_->SelectedBackend());
-    if (!backendLabels.empty() && imguiCombo(
-            "",
-            &backendIndex,
-            backendLabels.data(),
-            static_cast<int>(backendLabels.size())))
-    {
-        Editor_->SelectBackend(backends[static_cast<std::size_t>(backendIndex)].Id);
-    }
-
-    imguiSeparatorLine();
-    imguiLabel("Scene");
     const std::vector<DemoDescriptor>& demos =
         Evans::Editor::DemoCatalog::Descriptors();
     std::vector<const char*> demoLabels;
@@ -334,7 +297,7 @@ NSString* StringFromUtf8(const std::string& text)
     }
     int demoIndex = DemoSelectionIndex(Editor_->SelectedDemo());
     if (!demoLabels.empty() && imguiCombo(
-            "Demo",
+            "Scene",
             &demoIndex,
             demoLabels.data(),
             static_cast<int>(demoLabels.size())))

@@ -1536,7 +1536,7 @@ struct OpenGLESRHI::Impl
     {
         const std::size_t index = static_cast<std::size_t>(pass);
         if (index >= PostPrograms.size()) { Fail("Invalid post-process pass"); return 0; }
-        constexpr const char* filenames[] = {"FXAA.glsl", "Vignette.glsl", "FilmGrain.glsl", "ScreenSpaceDistortion.glsl", "NPR.glsl"};
+        constexpr const char* filenames[] = {"FXAA.glsl", "Vignette.glsl", "FilmGrain.glsl", "ScreenSpaceDistortion.glsl", "NPR.glsl", "Pixelation.glsl", "ColorEdgeOutline.glsl", "DynamicDistortion.glsl", "OilPaint.glsl", "Watercolor.glsl", "DepthNormalOutline.glsl"};
         static_assert(std::size(filenames) == PostProcessTechniqueCount);
         if (PostPrograms[index] == 0) PostPrograms[index] = CompileStageProgram(filenames[index]);
         return PostPrograms[index];
@@ -3339,9 +3339,20 @@ GLuint density=0;
             UploadFloat4(GlGetUniformLocation(program, "NprStyle"), constants.NprStyle);
             UploadFloat4(GlGetUniformLocation(program, "NprHatch"), constants.NprHatch);
             UploadFloat4(GlGetUniformLocation(program, "NprTone"), constants.NprTone);
+            UploadFloat4(GlGetUniformLocation(program, "DynamicWarp"), constants.DynamicWarp);
+            UploadFloat4(GlGetUniformLocation(program, "Painterly"), constants.Painterly);
+            UploadFloat4(GlGetUniformLocation(program, "DepthNormalEdge"), constants.DepthNormalEdge);
             GlUniform1i(GlGetUniformLocation(program, "SceneColor"), 0);
             GlActiveTexture(GL_TEXTURE0);
             GlBindTexture(GL_TEXTURE_2D, source);
+            if (pass == Techniques::PostProcessPassKind::DepthNormalOutline)
+            {
+                GlUniform1i(GlGetUniformLocation(program, "SceneDepth"), 1);
+                GlActiveTexture(GL_TEXTURE0 + 1); GlBindTexture(GL_TEXTURE_2D, DepthTexture);
+                GlUniform1i(GlGetUniformLocation(program, "SceneNormal"), 2);
+                GlActiveTexture(GL_TEXTURE0 + 2); GlBindTexture(GL_TEXTURE_2D, GBufferTextures[1]);
+                GlActiveTexture(GL_TEXTURE0);
+            }
             GlDrawArrays(GL_TRIANGLES, 0, 3);
             if (!CheckGL("Draw fullscreen post-process pass")) return false;
             source = PostTextures[destination];

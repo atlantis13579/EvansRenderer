@@ -233,7 +233,8 @@ void EditorCore::SelectBackend(const std::string& backendId)
     const std::string canonicalBackend =
         backendId;
     (void)FindDescriptor(canonicalBackend);
-    if (!DemoCatalog::SupportsBackend(SelectedDemo_,Techniques::BackendFromId(canonicalBackend))) return;
+    if (!DemoCatalog::SupportsBackend(SelectedDemo_,Techniques::BackendFromId(canonicalBackend)) ||
+        !SupportsSelectedPipeline(canonicalBackend)) return;
     if (canonicalBackend == SelectedBackend_)
     {
         return;
@@ -796,6 +797,13 @@ std::vector<BackendDescriptor> EditorCore::Backends() const
         }
     }
     return result;
+}
+
+bool EditorCore::SupportsSelectedPipeline(const std::string& backendId) const
+{
+    const auto requested = Settings_.Techniques.Pipeline;
+    const auto backend = Techniques::BackendFromId(backendId);
+    return Techniques::ResolveSettings(Settings_.Techniques, backend).Effective.Pipeline == requested;
 }
 
 void EditorCore::InvalidateAndRender()

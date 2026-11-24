@@ -194,6 +194,20 @@ NPRSettings SanitizeNPRSettings(NPRSettings settings) noexcept
 bool operator==(const PostProcessSettings& a, const PostProcessSettings& b) noexcept
 {
     return a.AntiAliasing == b.AntiAliasing && a.Vignette == b.Vignette &&
+        a.Pixelation == b.Pixelation && a.PixelSize == b.PixelSize &&
+        a.ColorEdgeOutline == b.ColorEdgeOutline &&
+        a.ColorEdgeThreshold == b.ColorEdgeThreshold && a.ColorEdgeStrength == b.ColorEdgeStrength &&
+        a.DynamicDistortion == b.DynamicDistortion &&
+        a.DynamicDistortionAmplitude == b.DynamicDistortionAmplitude &&
+        a.DynamicDistortionFrequency == b.DynamicDistortionFrequency &&
+        a.DynamicDistortionSpeed == b.DynamicDistortionSpeed &&
+        a.OilPaint == b.OilPaint && a.OilPaintRadius == b.OilPaintRadius &&
+        a.OilPaintStrength == b.OilPaintStrength && a.Watercolor == b.Watercolor &&
+        a.WatercolorRadius == b.WatercolorRadius && a.WatercolorStrength == b.WatercolorStrength &&
+        a.DepthNormalOutline == b.DepthNormalOutline &&
+        a.DepthEdgeThreshold == b.DepthEdgeThreshold &&
+        a.NormalEdgeThreshold == b.NormalEdgeThreshold &&
+        a.DepthNormalEdgeStrength == b.DepthNormalEdgeStrength &&
         a.ScreenSpaceDistortion == b.ScreenSpaceDistortion && a.DistortionStrength == b.DistortionStrength &&
         a.FilmGrain == b.FilmGrain && a.VignetteStrength == b.VignetteStrength &&
         a.FilmGrainStrength == b.FilmGrainStrength && a.FilmGrainSeed == b.FilmGrainSeed && a.HDR == b.HDR &&
@@ -214,6 +228,19 @@ PostProcessSettings SanitizePostProcessSettings(PostProcessSettings settings) no
         FiniteOr(settings.VignetteStrength, defaults.VignetteStrength), 0.0f, 1.0f);
     settings.FilmGrainStrength = std::clamp(
         FiniteOr(settings.FilmGrainStrength, defaults.FilmGrainStrength), 0.0f, MaximumFilmGrainStrength);
+    settings.PixelSize = std::clamp(FiniteOr(settings.PixelSize, defaults.PixelSize), 1.0f, 128.0f);
+    settings.ColorEdgeThreshold = std::clamp(FiniteOr(settings.ColorEdgeThreshold, defaults.ColorEdgeThreshold), 0.0f, 2.0f);
+    settings.ColorEdgeStrength = std::clamp(FiniteOr(settings.ColorEdgeStrength, defaults.ColorEdgeStrength), 0.0f, 1.0f);
+    settings.DynamicDistortionAmplitude = std::clamp(FiniteOr(settings.DynamicDistortionAmplitude, defaults.DynamicDistortionAmplitude), 0.0f, 64.0f);
+    settings.DynamicDistortionFrequency = std::clamp(FiniteOr(settings.DynamicDistortionFrequency, defaults.DynamicDistortionFrequency), 1.0f, 64.0f);
+    settings.DynamicDistortionSpeed = std::clamp(FiniteOr(settings.DynamicDistortionSpeed, defaults.DynamicDistortionSpeed), -8.0f, 8.0f);
+    settings.OilPaintRadius = std::clamp(FiniteOr(settings.OilPaintRadius, defaults.OilPaintRadius), 1.0f, 4.0f);
+    settings.OilPaintStrength = std::clamp(FiniteOr(settings.OilPaintStrength, defaults.OilPaintStrength), 0.0f, 1.0f);
+    settings.WatercolorRadius = std::clamp(FiniteOr(settings.WatercolorRadius, defaults.WatercolorRadius), 1.0f, 4.0f);
+    settings.WatercolorStrength = std::clamp(FiniteOr(settings.WatercolorStrength, defaults.WatercolorStrength), 0.0f, 1.0f);
+    settings.DepthEdgeThreshold = std::clamp(FiniteOr(settings.DepthEdgeThreshold, defaults.DepthEdgeThreshold), 0.0001f, 1.0f);
+    settings.NormalEdgeThreshold = std::clamp(FiniteOr(settings.NormalEdgeThreshold, defaults.NormalEdgeThreshold), 0.0f, 2.0f);
+    settings.DepthNormalEdgeStrength = std::clamp(FiniteOr(settings.DepthNormalEdgeStrength, defaults.DepthNormalEdgeStrength), 0.0f, 1.0f);
     settings.DistortionStrength = std::clamp(
         FiniteOr(settings.DistortionStrength, defaults.DistortionStrength),
         MinimumDistortionStrength, MaximumDistortionStrength);
@@ -297,10 +324,19 @@ std::vector<PostProcessPassKind> BuildPostProcessPlan(const PostProcessSettings&
     std::vector<PostProcessPassKind> passes;
     // Ink the complete tone-mapped scene before geometric color warping and FXAA.
     if (settings.NPR.Enabled && settings.NPR.Blend > 0.0f) passes.push_back(PostProcessPassKind::NPR);
+    if (settings.ColorEdgeOutline && settings.ColorEdgeStrength > 0.0f)
+        passes.push_back(PostProcessPassKind::ColorEdgeOutline);
+    if (settings.DepthNormalOutline && settings.DepthNormalEdgeStrength > 0.0f)
+        passes.push_back(PostProcessPassKind::DepthNormalOutline);
     // Pull-map the resolved scene before edge filtering. Vignette and grain
     // remain in display coordinates. A neutral warp needs no allocation/draw.
     if (settings.ScreenSpaceDistortion && settings.DistortionStrength != 0.0f)
         passes.push_back(PostProcessPassKind::ScreenSpaceDistortion);
+    if (settings.DynamicDistortion && settings.DynamicDistortionAmplitude > 0.0f)
+        passes.push_back(PostProcessPassKind::DynamicDistortion);
+    if (settings.Pixelation && settings.PixelSize > 1.0f) passes.push_back(PostProcessPassKind::Pixelation);
+    if (settings.OilPaint && settings.OilPaintStrength > 0.0f) passes.push_back(PostProcessPassKind::OilPaint);
+    if (settings.Watercolor && settings.WatercolorStrength > 0.0f) passes.push_back(PostProcessPassKind::Watercolor);
     if (settings.AntiAliasing == AntiAliasingMode::FXAA) passes.push_back(PostProcessPassKind::FXAA);
     if (settings.Vignette) passes.push_back(PostProcessPassKind::Vignette);
     if (settings.FilmGrain) passes.push_back(PostProcessPassKind::FilmGrain);
@@ -1285,6 +1321,11 @@ Resolution ResolveSettings(const Settings& requested, Backend backend)
             path.GlobalIllumination.Mode=GlobalIlluminationMode::None;
             path.VolumetricFog.Enabled=false; path.VolumetricLighting.Enabled=false; path.LightShafts.Enabled=false;
             path.PostProcessing.AntiAliasing=AntiAliasingMode::None; path.PostProcessing.MotionBlur.Enabled=false;
+            if (path.PostProcessing.DepthNormalOutline)
+            {
+                path.PostProcessing.DepthNormalOutline=false;
+                result.Diagnostics.emplace_back("Depth/normal outline needs raster material normals; it is inactive for path tracing.");
+            }
             if (path.PostProcessing.HDR.ToneMapping==ToneMappingMode::None) path.PostProcessing.HDR.ToneMapping=ToneMappingMode::Reinhard;
             result.Diagnostics.emplace_back("Path tracing owns primary visibility, surface transport and stochastic antialiasing. Raster lighting, blended surfaces, volume effects and temporal filters are inactive; requested settings are retained.");
             return result;
@@ -2034,7 +2075,7 @@ PassPlan BuildPassPlan(const Settings& settings, Backend backend,
     // Dense clusters depend only on the camera and frozen light collection.
     if (clustered) append(PassKind::ClusteredAssignment, C | L, lightLists);
     if (hair && (contact || forwardPlus)) append(forwardPlus?PassKind::ForwardPlusDepth:PassKind::ContactDepth,Surface | Mask(Resource::HairStrands),rasterDepth);
-    if ((ambientOcclusion || reflections || globalIllumination || hair) && !UsesDeferredLighting(effective.Pipeline))
+    if ((ambientOcclusion || reflections || globalIllumination || hair || effective.PostProcessing.DepthNormalOutline) && !UsesDeferredLighting(effective.Pipeline))
         append(PassKind::MaterialInputs, Surface, materialInputs | rasterDepth);
     else if (forwardPlus && !hair)
         append(PassKind::ForwardPlusDepth, Surface, rasterDepth);
@@ -2055,7 +2096,7 @@ PassPlan BuildPassPlan(const Settings& settings, Backend backend,
         (shadowPass?shadowVisibility:0) | contactInput,rasterColor | rasterDepth | materialInputs);
     if (multisample)
     {
-        const bool materialCapture = ambientOcclusion || reflections || globalIllumination || hair || UsesDeferredLighting(effective.Pipeline);
+        const bool materialCapture = ambientOcclusion || reflections || globalIllumination || hair || effective.PostProcessing.DepthNormalOutline || UsesDeferredLighting(effective.Pipeline);
         append(PassKind::ResolveOpaqueSamples, rasterColor | rasterDepth | (materialCapture ? materialInputs : 0),
             sceneColor | Depth | (materialCapture ? Mask(Resource::GBuffer) | N : 0));
     }
