@@ -235,7 +235,7 @@ void SlabPaths(float f,float3 a,thread float3& r,thread float3& t)
     float pass = 1-f; t = a*pass*pass/((pass+f*(1-a))*(1+a*f)); r = f+a*f*t;
 }
 fragment float4 PSMain(ScreenVertex input [[stage_in]],constant RefractionUniforms& data [[buffer(0)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],texture2d<float> lumenAtlas [[texture(19)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float,access::read> opaqueDepth [[texture(0)]],texture2d<float,access::read> scene [[texture(4)]],
     depth2d<float,access::read> surfaceDepth [[texture(5)]],texture2d<float,access::read> normals [[texture(6)]],
     texture2d<float,access::read> tintMap [[texture(7)]])

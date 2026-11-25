@@ -140,7 +140,7 @@ fragment float4 CubeFragmentMain(CubeVertex input [[stage_in]],
     texture2d<float, access::read> reflection [[texture(6)]],
     texturecube<float, access::sample> environment [[texture(7)]])
 {
-    uint2 pixel(input.PixelPosition.xy);
+    uint2 pixel = uint2(input.PixelPosition.xy);
     if (settings.Operation.x == CompositeOperation) return float4(reflection.read(pixel).rgb, 0);
     if (settings.ReflectionScale.w > 0)
     {

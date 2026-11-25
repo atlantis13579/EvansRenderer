@@ -200,8 +200,8 @@ float SurfaceWeight(int2 center, int2 candidate, SurfaceSample receiver,
     SurfaceSample other;
     if (!LoadSurface(candidate, settings, depth, normals, other) || dot(receiver.Normal, other.Normal) < settings.Appearance.w) return 0;
     float planeDistance = abs(dot(other.Position - receiver.Position, receiver.Normal));
-    float kernel = (center.x == candidate.x ? 2.0 : 1.0) * (center.y == candidate.y ? 2.0 : 1.0);
-    return kernel * exp(-planeDistance / settings.Appearance.z);
+    float tapWeight = (center.x == candidate.x ? 2.0 : 1.0) * (center.y == candidate.y ? 2.0 : 1.0);
+    return tapWeight * exp(-planeDistance / settings.Appearance.z);
 }
 float4 FilterTransport(uint2 pixel, constant GIUniforms& settings, depth2d<float, access::read> depth,
     texture2d<float, access::read> normals, texture2d<float, access::read> estimate)

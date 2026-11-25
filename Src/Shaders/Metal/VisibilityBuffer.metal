@@ -201,7 +201,7 @@ fragment VisibilityMaterialOutput EvansVisibilityResolveFragment(VisibilityScree
     texture2d<float> diffuse [[texture(2)]], texture2d<float> normalMap [[texture(3)]],
     texture2d<float> opacityMap [[texture(4)]], sampler repeatSampler [[sampler(0)]])
 {
-    uint2 pixel(input.Position.xy); uint encoded = references.read(pixel).r, reference = encoded & VisibilityReferenceMask;
+    uint2 pixel = uint2(input.Position.xy); uint encoded = references.read(pixel).r, reference = encoded & VisibilityReferenceMask;
     // A discarded fragment/helper must still use a valid device-buffer address.
     uint safeTriangle = min(reference > 0u ? reference - 1u : 0u, max(frame.Draw.x, 1u) - 1u);
     if (reference == 0u || reference > frame.Draw.x) discard_fragment();

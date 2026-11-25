@@ -79,21 +79,21 @@ bool materialWeights(uint id,float2 pixel,constant DrawParameters& p,device cons
     return all(isfinite(weights)) && all(isfinite(dx)) && all(isfinite(dy));
 }
 struct HardwareVertex { float4 Position [[position]]; uint Reference [[flat]]; uint Priority [[flat]]; };
-vertex HardwareVertex EvansHardwareQueueVertex(uint vertex [[vertex_id]],constant DrawParameters& p [[buffer(0)]],
+vertex HardwareVertex EvansHardwareQueueVertex(uint vertexIndex [[vertex_id]],constant DrawParameters& p [[buffer(0)]],
     device const uint* input [[buffer(2)]],device const uint* queue [[buffer(3)]])
 {
-    HardwareVertex output{}; uint priority=queue[queue[p.Schedule.x]+vertex/Corners]; if (priority>=p.Schedule.z) return output;
+    HardwareVertex output{}; uint priority=queue[queue[p.Schedule.x]+vertexIndex/Corners]; if (priority>=p.Schedule.z) return output;
     uint id=queue[p.Schedule.y+priority]; if (id>=p.Raster.counts.z) return output;
-    output.Position=projectedCorner(input,id,vertex%Corners,p);
+    output.Position=projectedCorner(input,id,vertexIndex%Corners,p);
     if (safeCoverageCorner(output.Position)) output.Position=snapCoverage(output.Position,p);
     output.Reference=id+1; output.Priority=priority; return output;
 }
-void coverage(HardwareVertex vertex,constant DrawParameters& p,device const WorldTriangle* geometry,device const uint* input,
+void coverage(HardwareVertex surfaceVertex,constant DrawParameters& p,device const WorldTriangle* geometry,device const uint* input,
     texture2d<float> diffuse,texture2d<float> opacity,sampler surfaceSampler)
 {
-    if (vertex.Reference==0 || vertex.Reference>p.Raster.counts.z || vertex.Position.z>=1) discard_fragment();
-    uint id=min(vertex.Reference>0?vertex.Reference-1u:0u,max(p.Raster.counts.z,1u)-1u); float3 w,dx,dy;
-    if (!materialWeights(id,vertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
+    if (surfaceVertex.Reference==0 || surfaceVertex.Reference>p.Raster.counts.z || surfaceVertex.Position.z>=1) discard_fragment();
+    uint id=min(surfaceVertex.Reference>0?surfaceVertex.Reference-1u:0u,max(p.Raster.counts.z,1u)-1u); float3 w,dx,dy;
+    if (!materialWeights(id,surfaceVertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
     WorldTriangle item=geometry[id]; float2 a(item.UVAB.x,1-item.UVAB.y),b(item.UVAB.z,1-item.UVAB.w),c(item.UVC.x,1-item.UVC.y);
     float2 uv=a*w.x+b*w.y+c*w.z,uvDx=(b-a)*dx.y+(c-a)*dx.z,uvDy=(b-a)*dy.y+(c-a)*dy.z;
     float coverage=dot(float3(item.Color[0].a,item.Color[1].a,item.Color[2].a),w)*p.Material.x;
@@ -101,31 +101,31 @@ void coverage(HardwareVertex vertex,constant DrawParameters& p,device const Worl
     if (p.Images.y) coverage*=opacity.sample(surfaceSampler,uv,gradient2d(uvDx,uvDy)).r;
     if (p.Material.y>0 && saturate(coverage)<p.Material.y) discard_fragment();
 }
-fragment void EvansHardwareDepth(HardwareVertex vertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
+fragment void EvansHardwareDepth(HardwareVertex surfaceVertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
     device const WorldTriangle* geometry [[buffer(1)]],device const uint* input [[buffer(2)]],
     texture2d<float> diffuse [[texture(0)]],texture2d<float> opacity [[texture(1)]],sampler surfaceSampler [[sampler(0)]])
-{ coverage(vertex,p,geometry,input,diffuse,opacity,surfaceSampler); }
+{ coverage(surfaceVertex,p,geometry,input,diffuse,opacity,surfaceSampler); }
 [[early_fragment_tests]]
-fragment void EvansHardwareOwner(HardwareVertex vertex [[stage_in]],bool front [[front_facing]],constant DrawParameters& p [[buffer(0)]],
+fragment void EvansHardwareOwner(HardwareVertex surfaceVertex [[stage_in]],bool front [[front_facing]],constant DrawParameters& p [[buffer(0)]],
     device const WorldTriangle* geometry [[buffer(1)]],device const uint* input [[buffer(2)]],device atomic_uint* owners [[buffer(4)]],
     texture2d<float> diffuse [[texture(0)]],texture2d<float> opacity [[texture(1)]],sampler surfaceSampler [[sampler(0)]])
 {
-    coverage(vertex,p,geometry,input,diffuse,opacity,surfaceSampler);
-    uint pixel=uint(vertex.Position.y)*p.Raster.counts.x+uint(vertex.Position.x);
-    atomic_fetch_min_explicit(&owners[pixel],((vertex.Priority+1u)<<1u)|(front?0u:1u),memory_order_relaxed);
+    coverage(surfaceVertex,p,geometry,input,diffuse,opacity,surfaceSampler);
+    uint pixel=uint(surfaceVertex.Position.y)*p.Raster.counts.x+uint(surfaceVertex.Position.x);
+    atomic_fetch_min_explicit(&owners[pixel],((surfaceVertex.Priority+1u)<<1u)|(front?0u:1u),memory_order_relaxed);
 }
 struct ScreenVertex { float4 Position [[position]]; };
-vertex ScreenVertex EvansHardwareResolveVertex(uint vertex [[vertex_id]])
-{ uint2 p((vertex<<1u)&2u,vertex&2u); return {float4(float2(p)*float2(2,-2)+float2(-1,1),0,1)}; }
+vertex ScreenVertex EvansHardwareResolveVertex(uint vertexIndex [[vertex_id]])
+{ uint2 p((vertexIndex<<1u)&2u,vertexIndex&2u); return {float4(float2(p)*float2(2,-2)+float2(-1,1),0,1)}; }
 struct RasterPayload { uint Reference [[color(0)]]; float2 Bary [[color(1)]]; };
-fragment RasterPayload EvansHardwareResolve(ScreenVertex vertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
+fragment RasterPayload EvansHardwareResolve(ScreenVertex surfaceVertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
     device const uint* input [[buffer(2)]],device const uint* queue [[buffer(3)]],device const uint* owners [[buffer(4)]])
 {
-    uint pixel=uint(vertex.Position.y)*p.Raster.counts.x+uint(vertex.Position.x),owner=owners[pixel],priority=owner>>1u;
+    uint pixel=uint(surfaceVertex.Position.y)*p.Raster.counts.x+uint(surfaceVertex.Position.x),owner=owners[pixel],priority=owner>>1u;
     if (owner==EmptyOwner || priority==0 || priority>p.Schedule.z) discard_fragment();
     uint safePriority=min(priority>0?priority-1u:0u,max(p.Schedule.z,1u)-1u);
     uint id=queue[p.Schedule.y+safePriority]; if (id>=p.Raster.counts.z) discard_fragment();
     id=min(id,max(p.Raster.counts.z,1u)-1u);
-    float3 w,dx,dy; if (!materialWeights(id,vertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
+    float3 w,dx,dy; if (!materialWeights(id,surfaceVertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
     return {(id+1u)|((owner&1u)?FaceBit:0u),w.yz};
 }

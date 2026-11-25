@@ -23,17 +23,17 @@ kernel void tsrPack(constant TextureBridgeFrame& frame [[buffer(0)]],device floa
     packet[first+OutlineField]=overlay;
 }
 struct ExportVertex { float4 Position [[position]]; };
-vertex ExportVertex tsrExportVertex(uint vertex [[vertex_id]])
+vertex ExportVertex tsrExportVertex(uint vertexIndex [[vertex_id]])
 {
     constexpr float TriangleReach=3;
-    float2 p=vertex==0?float2(-1):vertex==1?float2(-1,TriangleReach):float2(TriangleReach,-1);
+    float2 p=vertexIndex==0?float2(-1):vertexIndex==1?float2(-1,TriangleReach):float2(TriangleReach,-1);
     ExportVertex result; result.Position=float4(p,0,1); return result;
 }
-fragment float4 tsrExportFragment(ExportVertex vertex [[stage_in]],constant TextureBridgeFrame& frame [[buffer(0)]],
+fragment float4 tsrExportFragment(ExportVertex stageInput [[stage_in]],constant TextureBridgeFrame& frame [[buffer(0)]],
     device const float4* history [[buffer(1)]])
 {
     constexpr uint HistoryVectors=2;
-    uint2 at=uint2(vertex.Position.xy);
+    uint2 at=uint2(stageInput.Position.xy);
     return history[(at.y*frame.ExtentFlags.x+at.x)*HistoryVectors];
 }
 // Native Metal HDR temporal reconstruction. Row arrays preserve the host camera

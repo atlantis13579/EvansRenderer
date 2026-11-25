@@ -4994,7 +4994,7 @@ bool MetalRHI::CreateDisplacedVertexBuffer(const DisplacementGeometry& geometry,
         auto volume=m_Impl->LumenVolumeFrame;
         const bool translucentGI=m_Impl->CurrentPass.Type==PassType::Color && !m_Impl->CurrentPass.Target && m_Impl->BoundPipeline.BlendEnabled && m_Impl->FrameGI.Lumen.Translucency.Enabled && volume.Grid.W!=0;
         if (!translucentGI) volume.Grid.W=0;
-        constexpr NSUInteger LumenVolumeConstantIndex=9,LumenVolumeTextureIndex=19;
+        constexpr NSUInteger LumenVolumeConstantIndex=11,LumenVolumeTextureIndex=19;
         Send<void,const void*,NSUInteger,NSUInteger>(m_Impl->RenderEncoder,"setFragmentBytes:length:atIndex:",&volume,sizeof(volume),LumenVolumeConstantIndex);
         Send<void,ObjCObject,NSUInteger>(m_Impl->RenderEncoder,"setFragmentTexture:atIndex:",translucentGI?m_Impl->LumenVolumeAtlas:m_Impl->DummyColorTexture,LumenVolumeTextureIndex);
         Send<void, const void*, NSUInteger, NSUInteger>(m_Impl->RenderEncoder,
@@ -5650,8 +5650,11 @@ bool MetalRHI::ApplyGlobalIllumination(const GlobalIlluminationDesc& desc)
         if (!m_Impl->CheckThread("ApplyReflections")) return false;
         if (m_Impl->FrameSampleCount > 1 && !m_Impl->SamplesOpaqueResolved)
             return m_Impl->Fail("Metal reflections require resolved sample radiance, depth and materials");
+        // The skybox prepass legitimately logs its cubemap capture passes before the
+        // receiver's reflections run, so the pass list cannot gate this call;
+        // ReflectionResolved already prevents a second application in one frame.
         if (!m_Impl->FrameOpen || m_Impl->PassOpen || !m_Impl->ReflectionActive || m_Impl->ReflectionResolved ||
-            !m_Impl->PendingFrame.ReflectionPasses.empty() || !m_Impl->HdrActive || !m_Impl->GBufferWritten ||
+            !m_Impl->HdrActive || !m_Impl->GBufferWritten ||
             (m_Impl->EnvironmentActive && !m_Impl->EnvironmentReady) ||
             (m_Impl->PlanarActive && !m_Impl->PlanarReady) ||
             (m_Impl->VelocityCaptured && !m_Impl->EarlyTemporalActive) ||

@@ -48,19 +48,19 @@ bool ExportTSR(TSRNativeHistory& record,TSRReadback& result,bool readback=true)
     Send<void,NSUInteger,NSUInteger,NSUInteger>(encoder,"drawPrimitives:vertexStart:vertexCount:",PrimitiveTypeTriangle,0,3); Send<void>(encoder,"endEncoding");
     if(!readback){Send<void>(command,"commit");Send<void>(command,"waitUntilCompleted");return CommandSucceeded(command,"Metal TSR HDR export");}
     const auto blit=Send<ObjCObject>(command,"blitCommandEncoder"); if (!blit) return Fail("Metal TSR HDR readback encoder is unavailable");
-    ObjCObject readback=nullptr; std::size_t rowPitch=0;
-    const bool enqueued=EnqueueReadback(blit,record.Color,record.Info.Width,record.Info.Height,4*sizeof(std::uint16_t),readback,rowPitch); Send<void>(blit,"endEncoding");
-    if (!enqueued) { ReleaseObject(readback); return false; }
+    ObjCObject readbackBuffer=nullptr; std::size_t rowPitch=0;
+    const bool enqueued=EnqueueReadback(blit,record.Color,record.Info.Width,record.Info.Height,4*sizeof(std::uint16_t),readbackBuffer,rowPitch); Send<void>(blit,"endEncoding");
+    if (!enqueued) { ReleaseObject(readbackBuffer); return false; }
     Send<void>(command,"commit"); Send<void>(command,"waitUntilCompleted");
-    if (!CommandSucceeded(command,"Metal TSR HDR export")) { ReleaseObject(readback); return false; }
-    const auto* start=static_cast<const std::uint8_t*>(Send<void*>(readback,"contents")); if (!start) { ReleaseObject(readback); return Fail("Metal TSR HDR readback is unavailable"); }
+    if (!CommandSucceeded(command,"Metal TSR HDR export")) { ReleaseObject(readbackBuffer); return false; }
+    const auto* start=static_cast<const std::uint8_t*>(Send<void*>(readbackBuffer,"contents")); if (!start) { ReleaseObject(readbackBuffer); return Fail("Metal TSR HDR readback is unavailable"); }
     result.PresentationHDR.resize(std::size_t(record.Info.Width)*record.Info.Height);
     for (unsigned y=0;y<record.Info.Height;++y)
     {
         const auto* row=reinterpret_cast<const std::uint16_t*>(start+std::size_t(y)*rowPitch);
         for (unsigned x=0;x<record.Info.Width;++x) result.PresentationHDR[std::size_t(y)*record.Info.Width+x]=DecodeTSRHalfPixel(row+x*4);
     }
-    ReleaseObject(readback); return true;
+    ReleaseObject(readbackBuffer); return true;
 }
 struct TSRNativeImages { std::array<ObjCObject,TSRSceneImageCount> Images{}; std::uint32_t Flags=0; };
 bool PackTSRImages(ObjCObject command,const TSRFrame& frame,const TSRNativeImages& images,ObjCObject packet)

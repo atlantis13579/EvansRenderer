@@ -42,11 +42,11 @@ vertex LightmapVertex VSMain(uint id [[vertex_id]],device const ReceiverData* ve
     {
         float2 corner = float2((id<<1)&2,id&2); result.Position = float4(corner*2-1,0,1); return result;
     }
-    ReceiverData vertex = vertices[id];
-    float4 worldPosition = TransformPosition(uniforms.World,float4(float3(vertex.Position),1));
+    ReceiverData receiver = vertices[id];
+    float4 worldPosition = TransformPosition(uniforms.World,float4(float3(receiver.Position),1));
     result.Position = TransformPosition(uniforms.ViewProjection,worldPosition);
-    result.MaterialUV = float2(vertex.MaterialUV.x,1-vertex.MaterialUV.y);
-    result.AtlasUV = float2(vertex.AtlasUV); result.Color = float4(LinearColor(float4(vertex.Color).xyz),vertex.Color.w);
+    result.MaterialUV = float2(receiver.MaterialUV.x,1-receiver.MaterialUV.y);
+    result.AtlasUV = float2(receiver.AtlasUV); result.Color = float4(LinearColor(float4(receiver.Color).xyz),receiver.Color.w);
     return result;
 }
 float3 FilterAtlas(texture2d<float> frontAtlas,texture2d<float> backAtlas,float2 uv,float side,bool front,bool hasBack)

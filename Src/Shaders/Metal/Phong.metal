@@ -344,7 +344,10 @@ constant float VirtualSampleCenter = 0.5;
 float2 VirtualDepth(float2 uv, uint firstMip, constant CascadeConstants& frame,
     depth2d<float, access::read> atlas, depth2d<float, access::read> directory)
 {
-    uint4 layout(frame.FarDepths), physical(frame.BlendDepths);
+    const float4 farDepths = frame.FarDepths;
+    const float4 blendDepths = frame.BlendDepths;
+    uint4 layout = uint4(farDepths.x, farDepths.y, farDepths.z, farDepths.w);
+    uint4 physical = uint4(blendDepths.x, blendDepths.y, blendDepths.z, blendDepths.w);
     uint side = layout.x / layout.y, offset = 0;
     for (uint mip = 0; mip < layout.z; ++mip)
     {
@@ -388,7 +391,7 @@ float VirtualVisibility(float3 position, float bias, constant CascadeConstants& 
     if (frame.Filtering.x == 0) return receiver <= stored.x ? 1.0 : 0.0;
     mip = uint(stored.y);
     float2 texel = uv * float(uint(frame.FarDepths.x) >> mip) - VirtualSampleCenter;
-    int2 base(floor(texel)); float2 fraction = fract(texel); float visible = 0;
+    int2 base = int2(int(floor(texel.x)), int(floor(texel.y))); float2 fraction = fract(texel); float visible = 0;
     for (int y = -int(frame.Filtering.x); y <= int(frame.Filtering.x); ++y)
         for (int x = -int(frame.Filtering.x); x <= int(frame.Filtering.x); ++x)
         {
@@ -810,7 +813,7 @@ fragment float4 EvansFragmentMain(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],
@@ -852,7 +855,7 @@ fragment WeightedSurfaceOutput EvansWeightedFragment(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],

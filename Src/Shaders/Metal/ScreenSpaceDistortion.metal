@@ -17,12 +17,12 @@ vertex ScreenVertex PostVertexMain(uint vertexId [[vertex_id]])
         vertexId == 1 ? float2(FullscreenExtent, -1.0) : float2(-1.0, FullscreenExtent);
     return {float4(corner, 0.0, 1.0)};
 }
-fragment float4 PostFragmentMain(ScreenVertex fragment [[stage_in]],
+fragment float4 PostFragmentMain(ScreenVertex stageInput [[stage_in]],
     constant PostConstants& parameters [[buffer(0)]], texture2d<float> scene [[texture(0)]])
 {
     constexpr sampler LinearEdge(coord::normalized, address::clamp_to_edge, filter::linear);
     const float2 LensCenter = float2(0.5);
-    float2 uv = fragment.Position.xy * parameters.InverseExtentStrengths.xy;
+    float2 uv = stageInput.Position.xy * parameters.InverseExtentStrengths.xy;
     float2 radial = (uv - LensCenter) * 2.0;
     float radiusSquared = dot(radial * radial, parameters.DistortionStrengthRadiusWeights.yz);
     float radialScale = 1.0 + parameters.DistortionStrengthRadiusWeights.x * radiusSquared;

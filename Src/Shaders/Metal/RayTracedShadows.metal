@@ -813,7 +813,7 @@ float4 EvaluateMaterialSurface(
     texture2d<float> normalMap,
     texture2d<float> opacityMap,
     sampler surfaceSampler,
-    bool frontFacing, float contactVisibility = 1.0, texture2d<uint,access::read> shadowRayImage)
+    bool frontFacing, texture2d<uint,access::read> shadowRayImage, float contactVisibility = 1.0)
 {
     float2 roughnessMetallic = constants.ShadingParameters.xy;
     if (constants.TextureFlags.z > 1) roughnessMetallic *= opacityMap.sample(surfaceSampler, input.TexCoord).gb;
@@ -922,7 +922,7 @@ fragment float4 EvansFragmentMain(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],
@@ -945,7 +945,7 @@ fragment float4 EvansFragmentMain(
 #endif
     return EvaluateMaterialSurface(input, constants, pcss, cascades, fog, fogAtlas, lumenVolume, lumenAtlas,
         cascade0, cascade1, cascade2, cascade3, shadowMap,
-        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, contactVisibility, shadowRayImage);
+        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, shadowRayImage, contactVisibility);
 }
 
 struct WeightedCoverageParameters
@@ -965,7 +965,7 @@ fragment WeightedSurfaceOutput EvansWeightedFragment(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],
@@ -1136,7 +1136,7 @@ float4 ShadeDeferredSurface(float2 rasterPosition, float2 extent, float4 diffuse
     constant LightingConstants& lighting, constant CascadeConstants& cascades,
     depth2d<float, access::read> shadowDepth, depth2d<float, access::read> cascade0,
     depth2d<float, access::read> cascade1, depth2d<float, access::read> cascade2,
-    depth2d<float, access::read> cascade3, float contactVisibility = 1.0, texture2d<uint,access::read> shadowRayImage)
+    depth2d<float, access::read> cascade3, texture2d<uint,access::read> shadowRayImage, float contactVisibility = 1.0)
 {
     // Wire overlays can intentionally leave opaque depth untouched.
     if (materialNormal.w < 0.0) return DirectDiffuseOnly(lighting) ? float4(0.0) : float4(emission.rgb, diffuse.a);
@@ -1231,7 +1231,7 @@ fragment float4 DeferredLightingFragment(LightingVaryings input [[stage_in]],
     return ShadeDeferredSurface(input.Position.xy, float2(sceneDepth.get_width(), sceneDepth.get_height()),
         diffuseOpacity.read(pixel), normalRoughness.read(pixel), sceneDepth.read(pixel),
         specularShininess.read(pixel), ambientMetallic.read(pixel), emission.read(pixel),
-        pcss, lighting, cascades, shadowDepth, cascade0, cascade1, cascade2, cascade3, contactVisibility, shadowRayImage);
+        pcss, lighting, cascades, shadowDepth, cascade0, cascade1, cascade2, cascade3, shadowRayImage, contactVisibility);
 }
 
 #else
@@ -1265,7 +1265,7 @@ fragment float4 DeferredLightingSampleFragment(LightingVaryings input [[stage_in
     return ShadeDeferredSurface(rasterPosition, float2(sceneDepth.get_width(), sceneDepth.get_height()),
         diffuseOpacity.read(pixel, sampleIndex), normalRoughness.read(pixel, sampleIndex), sceneDepth.read(pixel, sampleIndex),
         specularShininess.read(pixel, sampleIndex), ambientMetallic.read(pixel, sampleIndex), emission.read(pixel, sampleIndex),
-        pcss, lighting, cascades, shadowDepth, cascade0, cascade1, cascade2, cascade3, contactVisibility, shadowRayImage);
+        pcss, lighting, cascades, shadowDepth, cascade0, cascade1, cascade2, cascade3, shadowRayImage, contactVisibility);
 }
 #endif
 #else

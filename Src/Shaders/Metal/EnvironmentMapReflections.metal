@@ -86,7 +86,7 @@ fragment float4 EnvironmentFragmentMain(EnvironmentVertex input [[stage_in]],
     texture2d<float, access::read> reflectedRadiance [[texture(6)]],
     texture2d<float, access::sample> environment [[texture(7)]])
 {
-    uint2 pixel(input.Position.xy);
+    uint2 pixel = uint2(input.Position.xy);
     if (settings.PhaseAndModel.x == CompositePhase) return float4(reflectedRadiance.read(pixel).rgb, 0);
     float4 surface = normalRoughness.read(pixel);
     float3 normal = surface.xyz;

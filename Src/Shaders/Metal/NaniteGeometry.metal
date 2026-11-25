@@ -172,12 +172,12 @@ kernel void EvansNaniteDecode(constant NaniteFrame& f [[buffer(0)]],device const
     threadgroup_barrier(mem_flags::mem_threadgroup); if (allowed==0) return;
     uint header=map[geometry.x].x*PhysicalStride+VectorWords+geometry.y,payload=header+ClusterHeader;
     float scale=as_type<float>(uint(as_type<int>(f.Limits.w)+int(ExponentBias))<<MantissaBits);
-    for (uint vertex=lane;vertex<geometry.z;vertex+=BatchWidth) for (uint channel=0;channel<VertexStride;++channel)
+    for (uint vertexSlot=lane;vertexSlot<geometry.z;vertexSlot+=BatchWidth) for (uint channel=0;channel<VertexStride;++channel)
     {
         uint base=pool[header+ChannelBases+channel],width=pool[header+ChannelWidths+channel];
-        uint delta=Extract(pool,payload,pool[header+ChannelOffsets+channel]+vertex*width,width),decoded=base^delta;
+        uint delta=Extract(pool,payload,pool[header+ChannelOffsets+channel]+vertexSlot*width,width),decoded=base^delta;
         if (channel<PositionChannels) { if (delta>MaximumSigned-base) Report(m,f,BadPayload); decoded=as_type<uint>(float(as_type<int>(base+delta))*scale); }
-        if (!isfinite(as_type<float>(decoded))) Report(m,f,BadPayload); vertices[(firstVertex+vertex)*VertexStride+channel]=decoded;
+        if (!isfinite(as_type<float>(decoded))) Report(m,f,BadPayload); vertices[(firstVertex+vertexSlot)*VertexStride+channel]=decoded;
     }
     uint indexWidth=0; for (uint value=geometry.z-1;value!=0;value>>=1) ++indexWidth;
     for (uint index=lane;index<geometry.w;index+=BatchWidth)

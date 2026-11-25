@@ -508,7 +508,8 @@ constant float VirtualSampleCenter = 0.5;
 float2 VirtualDepth(float2 uv, uint firstMip, constant CascadeConstants& frame,
     depth2d<float, access::read> atlas, depth2d<float, access::read> directory)
 {
-    uint4 layout(frame.FarDepths), physical(frame.BlendDepths);
+    uint4 layout = uint4(frame.FarDepths);
+    uint4 physical = uint4(frame.BlendDepths);
     uint side = layout.x / layout.y, offset = 0;
     for (uint mip = 0; mip < layout.z; ++mip)
     {
@@ -552,7 +553,7 @@ float VirtualVisibility(float3 position, float bias, constant CascadeConstants& 
     if (frame.Filtering.x == 0) return receiver <= stored.x ? 1.0 : 0.0;
     mip = uint(stored.y);
     float2 texel = uv * float(uint(frame.FarDepths.x) >> mip) - VirtualSampleCenter;
-    int2 base(floor(texel)); float2 fraction = fract(texel); float visible = 0;
+    int2 base = int2(floor(texel)); float2 fraction = fract(texel); float visible = 0;
     for (int y = -int(frame.Filtering.x); y <= int(frame.Filtering.x); ++y)
         for (int x = -int(frame.Filtering.x); x <= int(frame.Filtering.x); ++x)
         {
@@ -924,7 +925,7 @@ float4 EvaluateMaterialSurface(
     texture2d<float> normalMap,
     texture2d<float> opacityMap,
     sampler surfaceSampler,
-    bool frontFacing, float contactVisibility = 1.0, texture2d<uint,access::read> shadowRayImage)
+    bool frontFacing, texture2d<uint,access::read> shadowRayImage, float contactVisibility = 1.0)
 {
     float2 roughnessMetallic = constants.ShadingParameters.xy;
     if (constants.TextureFlags.z > 1) roughnessMetallic *= opacityMap.sample(surfaceSampler, input.TexCoord).gb;
@@ -1001,7 +1002,7 @@ fragment float4 EvansFragmentMain(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],
@@ -1024,7 +1025,7 @@ fragment float4 EvansFragmentMain(
 #endif
     return EvaluateMaterialSurface(input, constants, cascades, fog, fogAtlas, lumenVolume, lumenAtlas,
         cascade0, cascade1, cascade2, cascade3, shadowMap,
-        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, contactVisibility, shadowRayImage);
+        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, shadowRayImage, contactVisibility);
 }
 
 struct WeightedCoverageParameters
@@ -1043,7 +1044,7 @@ fragment WeightedSurfaceOutput EvansWeightedFragment(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     depth2d<float, access::read> cascade0 [[texture(10)]],
     depth2d<float, access::read> cascade1 [[texture(11)]],

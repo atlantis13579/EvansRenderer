@@ -200,46 +200,46 @@ bool materialWeights(uint id,float2 pixel,constant DrawParameters& p,device cons
     return all(isfinite(weights)) && all(isfinite(dx)) && all(isfinite(dy));
 }
 struct HardwareVertex { float4 Position [[position]]; uint Reference [[flat]]; };
-vertex HardwareVertex EvansNaniteHardwareVertex(uint vertex [[vertex_id]],constant DrawParameters& p [[buffer(0)]],
+vertex HardwareVertex EvansNaniteHardwareVertex(uint vertexIndex [[vertex_id]],constant DrawParameters& p [[buffer(0)]],
     device const uint* input [[buffer(2)]],device const uint* result [[buffer(3)]])
 {
-    HardwareVertex output{}; const uint Corners=3; uint local=vertex/Corners,id=p.Range.x+local;
+    HardwareVertex output{}; const uint Corners=3; uint local=vertexIndex/Corners,id=p.Range.x+local;
     if (local>=p.Range.y || id>=p.Raster.counts.z) return output;
     if ((p.Raster.quality.w&PreserveMain)!=0) id=p.Range.x+p.Range.y-1u-local;
     if (result[p.Raster.layout.w+id]!=HardwareRoute) return output;
     float4 a=projectedCorner(input,id,0,p),b=projectedCorner(input,id,1,p),c=projectedCorner(input,id,2,p);
-    uint corner=vertex%Corners; output.Position=corner==0?a:corner==1?b:c;
+    uint corner=vertexIndex%Corners; output.Position=corner==0?a:corner==1?b:c;
     // Preserve the common edge grid beside hardware-clipped triangles.
     if (safeCoverageCorner(output.Position)) output.Position=snapCoverage(output.Position,p);
     output.Reference=id+1; return output;
 }
 struct RasterPayload { uint Reference [[color(0)]]; float2 Bary [[color(1)]]; };
-fragment RasterPayload EvansNaniteHardwareFragment(HardwareVertex vertex [[stage_in]],bool front [[front_facing]],
+fragment RasterPayload EvansNaniteHardwareFragment(HardwareVertex surfaceVertex [[stage_in]],bool front [[front_facing]],
     constant DrawParameters& p [[buffer(0)]],device const WorldTriangle* geometry [[buffer(1)]],device const uint* input [[buffer(2)]],
     texture2d<float> diffuse [[texture(0)]],texture2d<float> opacity [[texture(1)]],sampler surfaceSampler [[sampler(0)]])
 {
     const uint FaceBit=0x80000000u;
-    if (vertex.Reference==0 || vertex.Reference>p.Raster.counts.z || vertex.Position.z>=1) discard_fragment();
-    uint id=min(vertex.Reference>0?vertex.Reference-1u:0u,max(p.Raster.counts.z,1u)-1u); float3 w,dx,dy;
-    if (!materialWeights(id,vertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
+    if (surfaceVertex.Reference==0 || surfaceVertex.Reference>p.Raster.counts.z || surfaceVertex.Position.z>=1) discard_fragment();
+    uint id=min(surfaceVertex.Reference>0?surfaceVertex.Reference-1u:0u,max(p.Raster.counts.z,1u)-1u); float3 w,dx,dy;
+    if (!materialWeights(id,surfaceVertex.Position.xy,p,input,w,dx,dy)) discard_fragment();
     WorldTriangle item=geometry[id]; float2 a(item.UVAB.x,1-item.UVAB.y),b(item.UVAB.z,1-item.UVAB.w),c(item.UVC.x,1-item.UVC.y);
     float2 uv=a*w.x+b*w.y+c*w.z,uvDx=(b-a)*dx.y+(c-a)*dx.z,uvDy=(b-a)*dy.y+(c-a)*dy.z;
     float coverage=dot(float3(item.Color[0].a,item.Color[1].a,item.Color[2].a),w)*p.Material.x;
     if (p.Images.x) coverage*=diffuse.sample(surfaceSampler,uv,gradient2d(uvDx,uvDy)).a;
     if (p.Images.y) coverage*=opacity.sample(surfaceSampler,uv,gradient2d(uvDx,uvDy)).r;
     if (p.Material.y>0 && saturate(coverage)<p.Material.y) discard_fragment();
-    return {vertex.Reference|(front?0u:FaceBit),w.yz};
+    return {surfaceVertex.Reference|(front?0u:FaceBit),w.yz};
 }
 struct ScreenVertex { float4 Position [[position]]; };
-vertex ScreenVertex EvansNaniteExportVertex(uint vertex [[vertex_id]])
-{ uint2 p((vertex<<1u)&2u,vertex&2u); return {float4(float2(p)*float2(2,-2)+float2(-1,1),0,1)}; }
+vertex ScreenVertex EvansNaniteExportVertex(uint vertexIndex [[vertex_id]])
+{ uint2 p((vertexIndex<<1u)&2u,vertexIndex&2u); return {float4(float2(p)*float2(2,-2)+float2(-1,1),0,1)}; }
 struct ExportPayload { uint Reference [[color(0)]]; float2 Bary [[color(1)]]; float Depth [[depth(any)]]; };
-fragment ExportPayload EvansNaniteExportFragment(ScreenVertex vertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
+fragment ExportPayload EvansNaniteExportFragment(ScreenVertex surfaceVertex [[stage_in]],constant DrawParameters& p [[buffer(0)]],
     device const uint* input [[buffer(2)]],device const uint* result [[buffer(3)]])
 {
     const uint FaceBit=0x80000000u;
-    uint pixel=uint(vertex.Position.y)*p.Raster.counts.x+uint(vertex.Position.x),owner=result[p.Raster.counts.w+pixel],reference=(owner&~SoftwarePriorityBit)>>1u;
+    uint pixel=uint(surfaceVertex.Position.y)*p.Raster.counts.x+uint(surfaceVertex.Position.x),owner=result[p.Raster.counts.w+pixel],reference=(owner&~SoftwarePriorityBit)>>1u;
     ExportPayload output{reference|((owner&1u)?FaceBit:0u),float2(0),as_type<float>(result[pixel])};
-    if (reference>0 && reference<=p.Raster.counts.z) { float3 w,dx,dy; materialWeights(reference-1u,vertex.Position.xy,p,input,w,dx,dy); output.Bary=w.yz; }
+    if (reference>0 && reference<=p.Raster.counts.z) { float3 w,dx,dy; materialWeights(reference-1u,surfaceVertex.Position.xy,p,input,w,dx,dy); output.Bary=w.yz; }
     return output;
 }

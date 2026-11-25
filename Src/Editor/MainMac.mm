@@ -199,7 +199,7 @@ NSString* StringFromUtf8(const std::string& text)
         // Metal is the first usable realtime backend on macOS. Software backend
         // selections continue to use Metal only as their presentation surface.
         editor->SelectBackend("renderer.metal");
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Evans::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         editor->ResizeViewport(
             static_cast<std::uint32_t>(std::max(viewport.Width, 1.0f)),
             static_cast<std::uint32_t>(std::max(viewport.Height, 1.0f)));
@@ -264,7 +264,7 @@ NSString* StringFromUtf8(const std::string& text)
     }
     if (Editor_ != nullptr)
     {
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Evans::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         Editor_->ResizeViewport(
             static_cast<std::uint32_t>(std::max(viewport.Width, 1.0f)),
             static_cast<std::uint32_t>(std::max(viewport.Height, 1.0f)));
@@ -338,7 +338,7 @@ NSString* StringFromUtf8(const std::string& text)
         return;
     }
 
-    const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+    const Evans::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
     if (!Presenter_->BeginFrame(
             Editor_->ViewportImage(),
             Editor_->ViewportRevision(),
@@ -439,7 +439,7 @@ NSString* StringFromUtf8(const std::string& text)
     MouseButtons_ |= IMGUI_MBUT_LEFT;
     if (Editor_ != nullptr)
     {
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Evans::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         LightDragCapture_=Editor_->HandleLightPointer(float(MouseX_),float(MouseY_),viewport,true);
         if (!LightDragCapture_) Editor_->HandleViewportPointer(
             static_cast<float>(MouseX_),
@@ -462,7 +462,7 @@ NSString* StringFromUtf8(const std::string& text)
 {
     [self updateMouseFromEvent:event];
     MouseButtons_ |= IMGUI_MBUT_RIGHT;
-    const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+    const Evans::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
     CameraRotateCapture_ = viewport.Contains(
         static_cast<float>(MouseX_),
         static_cast<float>(MouseY_));

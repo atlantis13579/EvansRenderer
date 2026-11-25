@@ -40,21 +40,21 @@ float3 QuadraticControl(device const uint* source,constant TessellationFrame& fr
 }
 void StoreVector(device uint* vertices,uint word,float3 value)
 { uint3 bits=as_type<uint3>(value); vertices[word]=bits.x; vertices[word+1]=bits.y; vertices[word+2]=bits.z; }
-float4 ReadColor(device const uint* source,uint vertex)
+float4 ReadColor(device const uint* source,uint vertexIndex)
 {
-    uint word=vertex*VertexStride+ColorOffset;
+    uint word=vertexIndex*VertexStride+ColorOffset;
     return as_type<float4>(uint4(source[word],source[word+1],source[word+2],source[word+3]));
 }
-float2 ReadUV(device const uint* source,uint vertex)
-{ uint word=vertex*VertexStride+UVOffset; return as_type<float2>(uint2(source[word],source[word+1])); }
+float2 ReadUV(device const uint* source,uint vertexIndex)
+{ uint word=vertexIndex*VertexStride+UVOffset; return as_type<float2>(uint2(source[word],source[word+1])); }
 void EmitVertex(device const uint* source,device uint* vertices,constant TessellationFrame& frame,
-    uint vertex,uint3 corner,float3 weight,float3 position,float3 normal)
+    uint vertexIndex,uint3 corner,float3 weight,float3 position,float3 normal)
 {
     float4 a=ReadColor(source,corner.x),b=ReadColor(source,corner.y),c=ReadColor(source,corner.z);
     float4 color=float4(ColorChannel(a.r,b.r,c.r,weight),ColorChannel(a.g,b.g,c.g,weight),
         ColorChannel(a.b,b.b,c.b,weight),dot(float3(a.a,b.a,c.a),weight));
     float2 uv=ReadUV(source,corner.x)*weight.x+ReadUV(source,corner.y)*weight.y+ReadUV(source,corner.z)*weight.z;
-    uint word=vertex*VertexStride;
+    uint word=vertexIndex*VertexStride;
     StoreVector(vertices,word,frame.Bounds.xyz+position/frame.Bounds.w);
     StoreVector(vertices,word+NormalOffset,SafeUnit(normal,SafeUnit(PatchNormal(source,corner.x),float3(0,0,1))));
     uint4 channels=as_type<uint4>(color); for (uint channel=0;channel<4;++channel) vertices[word+ColorOffset+channel]=channels[channel];
@@ -93,25 +93,25 @@ kernel void BuildEdges(device const uint* source [[buffer(0)]],device const uint
 kernel void BuildVertices(device const uint* source [[buffer(0)]],device const uint4* patches [[buffer(1)]],
     device const uint4* boundaries [[buffer(2)]],device const uint4* edges [[buffer(3)]],device const uint4* geometric [[buffer(4)]],
     device const float4* controls [[buffer(5)]],device uint* vertices [[buffer(6)]],
-    constant TessellationFrame& frame [[buffer(8)]],uint vertex [[thread_position_in_grid]])
+    constant TessellationFrame& frame [[buffer(8)]],uint vertexIndex [[thread_position_in_grid]])
 {
-    uint n=frame.Outputs.z; if (vertex>=frame.Outputs.x) return;
-    if (vertex<frame.Inputs.x)
-    { for (uint word=0;word<VertexStride;++word) vertices[vertex*VertexStride+word]=source[vertex*VertexStride+word]; return; }
+    uint n=frame.Outputs.z; if (vertexIndex>=frame.Outputs.x) return;
+    if (vertexIndex<frame.Inputs.x)
+    { for (uint word=0;word<VertexStride;++word) vertices[vertexIndex*VertexStride+word]=source[vertexIndex*VertexStride+word]; return; }
     uint interiorStart=frame.Inputs.x+frame.Inputs.z*(n-1);
-    if (vertex<interiorStart)
+    if (vertexIndex<interiorStart)
     {
-        uint ordinal=vertex-frame.Inputs.x,edgeId=ordinal/(n-1),step=ordinal%(n-1)+1;
+        uint ordinal=vertexIndex-frame.Inputs.x,edgeId=ordinal/(n-1),step=ordinal%(n-1)+1;
         uint4 record=edges[edgeId],edge=geometric[record.z]; uint along=(record.w&ReverseOrientation)!=0?n-step:step;
         float t=float(along)/n,s=float(n-along)/n,v=float(step)/n,u=float(n-step)/n;
         float3 a=PatchPosition(source,edge.x,frame),b=PatchPosition(source,edge.y,frame);
         float3 cubic=a*(s*s*s)+controls[record.z*2].xyz*(3*s*s*t)+controls[record.z*2+1].xyz*(3*s*t*t)+b*(t*t*t);
         float3 na=PatchNormal(source,record.x),nb=PatchNormal(source,record.y);
         float3 middle=QuadraticControl(source,frame,record.x,record.y,na,nb);
-        EmitVertex(source,vertices,frame,vertex,uint3(record.x,record.y,record.x),float3(u,v,0),
+        EmitVertex(source,vertices,frame,vertexIndex,uint3(record.x,record.y,record.x),float3(u,v,0),
             mix(a*s+b*t,cubic,frame.Shape.x),mix(na*u+nb*v,na*(u*u)+middle*(2*u*v)+nb*(v*v),frame.Shape.x)); return;
     }
-    uint ordinal=vertex-interiorStart,face=ordinal/frame.Outputs.w,remainder=ordinal%frame.Outputs.w,i=1;
+    uint ordinal=vertexIndex-interiorStart,face=ordinal/frame.Outputs.w,remainder=ordinal%frame.Outputs.w,i=1;
     while (remainder>=n-i-1) { remainder-=n-i-1; ++i; } uint j=remainder+1;
     float3 weight=float3(n-i-j,i,j)/n; float u=weight.x,v=weight.y,w=weight.z;
     uint3 p=patches[face].xyz,e=boundaries[face].xyz;
@@ -125,7 +125,7 @@ kernel void BuildVertices(device const uint* source [[buffer(0)]],device const u
     float3 na=PatchNormal(source,p.x),nb=PatchNormal(source,p.y),nc=PatchNormal(source,p.z);
     float3 quadratic=na*(u*u)+nb*(v*v)+nc*(w*w)+QuadraticControl(source,frame,p.x,p.y,na,nb)*(2*u*v)+
         QuadraticControl(source,frame,p.y,p.z,nb,nc)*(2*v*w)+QuadraticControl(source,frame,p.z,p.x,nc,na)*(2*w*u);
-    EmitVertex(source,vertices,frame,vertex,p,weight,mix(a*u+b*v+c*w,cubic,frame.Shape.x),
+    EmitVertex(source,vertices,frame,vertexIndex,p,weight,mix(a*u+b*v+c*w,cubic,frame.Shape.x),
         mix(na*u+nb*v+nc*w,quadratic,frame.Shape.x));
 }
 kernel void BuildIndices(device const uint4* patches [[buffer(1)]],device const uint4* boundaries [[buffer(2)]],

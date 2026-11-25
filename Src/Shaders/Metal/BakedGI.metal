@@ -43,7 +43,7 @@ float3 OctDirection(uint2 cell, uint size)
 fragment float4 PSMain(ProbeVertex input [[stage_in]], constant ProbeUniforms& uniforms [[buffer(0)]],
     texture2d<float, access::read> samples [[texture(0)]])
 {
-    uint2 pixel(input.Position.xy);
+    uint2 pixel = uint2(input.Position.xy);
     if (uniforms.Options.x == ProjectIrradiance)
     {
         float3 value(0);

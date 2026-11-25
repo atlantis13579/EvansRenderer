@@ -69,7 +69,10 @@ namespace Evans::Renderer
             if (!LoadTechniqueShaderSource("Metal", "ContactShadows.metal", source, error)) return false;
             auto native = (id<MTLDevice>)device;
             MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-            options.languageVersion = MTLLanguageVersion2_0;
+            // ContactVertex packs its Color/UV words for the host ABI, and MSL 2.0
+            // rejects component access on packed vectors; every other technique
+            // library in this renderer compiles at 2.1.
+            options.languageVersion = MTLLanguageVersion2_1;
             // Apple's default enables algebraic reassociation and assumes finite
             // values. DDA corner bounds and compensated arithmetic require IEEE.
             options.fastMathEnabled = NO;

@@ -71,7 +71,7 @@ fragment float4 PlanarFragmentMain(PlanarVertex input [[stage_in]],
     texture2d<float, access::read> reflectedRadiance [[texture(6)]],
     texture2d<float, access::sample> mirror [[texture(7)]])
 {
-    uint2 pixel(input.Position.xy);
+    uint2 pixel = uint2(input.Position.xy);
     if (settings.Options.x == CompositePhase) return float4(reflectedRadiance.read(pixel).rgb, 0);
     float opaqueDepth = depth.read(pixel);
     if (settings.Options.z == 0 || settings.Sampling.x <= 0 || opaqueDepth >= BackgroundDepth) return float4(0);
@@ -139,7 +139,7 @@ fragment float4 PlanarMipMain(PlanarVertex input [[stage_in]],
     float2 footprint = float2(sourceExtent) / settings.Viewport.xy;
     float2 begin = floor(input.Position.xy) * footprint;
     float2 end = begin + footprint;
-    uint2 first(floor(begin));
+    uint2 first = uint2(floor(begin));
     float4 integral(0);
     for (uint y = 0; y < MaximumFootprintTexels; ++y)
     for (uint x = 0; x < MaximumFootprintTexels; ++x)

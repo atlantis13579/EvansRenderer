@@ -886,13 +886,13 @@ struct LumenVarying
 };
 vertex LumenVarying lumenCaptureVertex(device const LumenVertex* vertices [[buffer(0)]],uint index [[vertex_id]],constant LumenCaptureFrame& frame [[buffer(1)]])
 {
-    LumenVertex vertex=vertices[index]; LumenVarying output; float4 local=float4(float3(vertex.Position),1);
+    LumenVertex sourceVertex=vertices[index]; LumenVarying output; float4 local=float4(float3(sourceVertex.Position),1);
     float4 world=float4(dot(frame.WorldRows[0],local),dot(frame.WorldRows[1],local),dot(frame.WorldRows[2],local),dot(frame.WorldRows[3],local));
     // Project capture-relative world coordinates without a combined matrix.
     output.Position=float4(dot(frame.ClipRows[0],world),dot(frame.ClipRows[1],world),dot(frame.ClipRows[2],world),dot(frame.ClipRows[3],world));
     output.World=world.xyz/max(abs(world.w),ProjectionEpsilon);
-    output.Normal=float3(dot(frame.NormalRows[0].xyz,vertex.Normal),dot(frame.NormalRows[1].xyz,vertex.Normal),dot(frame.NormalRows[2].xyz,vertex.Normal));
-    output.Color=float4(lumenLinearVertex(vertex.Color.rgb),vertex.Color.a); output.UV=float2(vertex.UV.x,1-vertex.UV.y); return output;
+    output.Normal=float3(dot(frame.NormalRows[0].xyz,sourceVertex.Normal),dot(frame.NormalRows[1].xyz,sourceVertex.Normal),dot(frame.NormalRows[2].xyz,sourceVertex.Normal));
+    output.Color=float4(lumenLinearVertex(sourceVertex.Color.rgb),sourceVertex.Color.a); output.UV=float2(sourceVertex.UV.x,1-sourceVertex.UV.y); return output;
 }
 float3 lumenMappedNormal(LumenVarying input,bool front,constant LumenCaptureFrame& frame,texture2d<float> image,sampler materialSampler)
 {
@@ -1320,9 +1320,9 @@ struct LumenTemporalFrame
     uint4 Extent;
     float4 Rules,Clip,Jitter,Numeric;
 };
-constexpr uint LumenTemporalHalfBits=16,LumenTemporalHalfMask=0xffffu;
-constexpr float LumenTemporalNormalScale=32767,LumenTemporalNormalFloor=1e-12;
-constexpr int LumenTemporalFilterRadius=1;
+constant uint LumenTemporalHalfBits=16,LumenTemporalHalfMask=0xffffu;
+constant float LumenTemporalNormalScale=32767,LumenTemporalNormalFloor=1e-12;
+constant int LumenTemporalFilterRadius=1;
 float4 lumenTemporalColor(uint4 bits)
 { return float4(float2(as_type<half2>(bits.x)),float2(as_type<half2>(bits.y))); }
 float2 lumenTemporalSign(float2 value) { return float2(value.x>=0?1:-1,value.y>=0?1:-1); }

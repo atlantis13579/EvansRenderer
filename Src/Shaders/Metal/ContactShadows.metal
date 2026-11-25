@@ -185,7 +185,8 @@ float ContactVisibility(DepthTexture depth, uint3 receiver, constant TraceConsta
     float pixelUncertainty = NativeRoundoff * float(max(trace.ImageAndBudget.x, trace.ImageAndBudget.y));
     float intervalTolerance = pixelUncertainty / major;
     float cornerTolerance = intervalTolerance + (minor > DirectionEpsilon ? pixelUncertainty / minor : 0.0);
-    int2 extent(trace.ImageAndBudget.xy), cell, advance;
+    const uint2 imageBudget = trace.ImageAndBudget.xy;
+    int2 extent = int2(int(imageBudget.x), int(imageBudget.y)), cell, advance;
     float2 nextCrossing, crossingStep;
     for (uint axis = 0; axis < 2; ++axis)
     {

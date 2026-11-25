@@ -9,11 +9,11 @@ constant uint TriangleSize=48u, TriangleSource=44u;
 constant uint NoBin=0xffffffffu, TriangleMask=0x7fffffffu;
 struct MaterialFrame { uint4 Image, Bins, Memory; };
 kernel void EvansMaterialClear(constant MaterialFrame& frame [[buffer(0)]],
-    device atomic_uint* work [[buffer(3)]],uint thread [[thread_position_in_grid]])
+    device atomic_uint* work [[buffer(3)]],uint threadIndex [[thread_position_in_grid]])
 {
-    if (thread>=frame.Bins.x) return;
+    if (threadIndex>=frame.Bins.x) return;
     for (uint field=0u;field<HeaderSize;++field)
-        atomic_store_explicit(work+thread*HeaderSize+field,field==0u?QuadVertices:0u,memory_order_relaxed);
+        atomic_store_explicit(work+threadIndex*HeaderSize+field,field==0u?QuadVertices:0u,memory_order_relaxed);
 }
 kernel void EvansMaterialClassify(constant MaterialFrame& frame [[buffer(0)]],
     const device uint* materialBins [[buffer(1)]],const device uint* geometry [[buffer(2)]],

@@ -111,7 +111,12 @@ namespace Evans::Renderer
                 if(!options)options=[[[MTLCompileOptions alloc] init] autorelease];
                 NSMutableArray<NSString*>* arguments=[NSMutableArray arrayWithObjects:@"--sdk",@"macosx",@"metal",@"-c",@"-O3",nil];
                 const auto language=static_cast<unsigned long>(options.languageVersion);
-                if(language)[arguments addObject:Text("-std=metal"+std::to_string(language>>16)+"."+std::to_string(language&65535))];
+                // Metal 1.x-2.x spell the target as macos-metalM.m; 3.0 and later drop the prefix.
+                if(language)
+                {
+                    const auto major=language>>16, minor=language&65535;
+                    [arguments addObject:Text((major>=3?"-std=metal":"-std=macos-metal")+std::to_string(major)+"."+std::to_string(minor))];
+                }
                 [arguments addObject:options.fastMathEnabled?@"-ffast-math":@"-fno-fast-math"];
                 if(@available(macOS 11.0,*))if(options.preserveInvariance)[arguments addObject:@"-fpreserve-invariance"];
                 for(NSString* name in [[options.preprocessorMacros allKeys] sortedArrayUsingSelector:@selector(compare:)])

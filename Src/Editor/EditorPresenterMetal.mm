@@ -10,6 +10,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <algorithm>
 #include <cmath>
@@ -247,9 +248,13 @@ struct EditorPresenterMetal::Impl
             return Fail("Metal editor could not allocate the font atlas.");
         }
 
+        // Core Graphics bitmap rows run top-down while the context origin is
+        // bottom-left. Drawing through a flipped AppKit context mirrors every
+        // glyph in memory and parks it in the wrong rows, so the atlas is drawn
+        // unflipped and each cell is positioned with a bottom-up rectangle.
         NSGraphicsContext* graphics = [NSGraphicsContext
             graphicsContextWithCGContext:context
-            flipped:YES];
+            flipped:NO];
         if (graphics == nil)
         {
             CGContextRelease(context);
@@ -292,7 +297,11 @@ struct EditorPresenterMetal::Impl
             glyph.Width = static_cast<float>(glyphWidth);
             glyph.Height = static_cast<float>(FontHeight);
             glyph.Advance = static_cast<float>(glyphWidth);
-            [string drawAtPoint:NSMakePoint(penX, penY) withAttributes:attributes];
+            [string drawInRect:NSMakeRect(
+                penX,
+                AtlasHeight - penY - FontHeight,
+                glyphWidth,
+                FontHeight) withAttributes:attributes];
             ReleaseObject(string);
             penX += glyphWidth + 1;
         }

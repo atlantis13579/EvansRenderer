@@ -591,15 +591,15 @@ static_assert(sizeof(MeshVertex) == 48, "Forward+ mesh vertex ABI changed");
 vertex VertexOutput EvansVertexMain(device const MeshVertex* vertices [[buffer(0)]],
     constant DrawConstants& constants [[buffer(1)]], uint index [[vertex_id]])
 {
-    const device MeshVertex& vertex = vertices[index];
-    float4 world = TransformRows(constants.World, float4(float3(vertex.Position), 1.0));
+    const device MeshVertex& meshVertex = vertices[index];
+    float4 world = TransformRows(constants.World, float4(float3(meshVertex.Position), 1.0));
     VertexOutput result;
     result.Position = TransformRows(constants.ViewProjection, world);
     result.WorldPosition = world.xyz / max(abs(world.w), HomogeneousEpsilon);
-    result.Normal = NormalizeSafe(TransformRows(constants.NormalWorld, float4(float3(vertex.Normal), 0.0)).xyz, float3(0.0, 1.0, 0.0));
-    result.Color = float4(SRGBToLinear(saturate(float3(vertex.Color.xyz))), vertex.Color.w);
+    result.Normal = NormalizeSafe(TransformRows(constants.NormalWorld, float4(float3(meshVertex.Normal), 0.0)).xyz, float3(0.0, 1.0, 0.0));
+    result.Color = float4(SRGBToLinear(saturate(float3(meshVertex.Color.xyz))), meshVertex.Color.w);
     result.LightPosition = TransformRows(constants.LightViewProjection, world);
-    result.TexCoord = float2(vertex.UV.x, 1.0 - vertex.UV.y);
+    result.TexCoord = float2(meshVertex.UV.x, 1.0 - meshVertex.UV.y);
     return result;
 }
 float4 SampleDiffuse(
@@ -685,7 +685,8 @@ constant float VirtualSampleCenter = 0.5;
 float2 VirtualDepth(float2 uv, uint firstMip, constant CascadeConstants& frame,
     depth2d<float, access::read> atlas, depth2d<float, access::read> directory)
 {
-    uint4 layout(frame.FarDepths), physical(frame.BlendDepths);
+    uint4 layout = uint4(frame.FarDepths);
+    uint4 physical = uint4(frame.BlendDepths);
     uint side = layout.x / layout.y, offset = 0;
     for (uint mip = 0; mip < layout.z; ++mip)
     {
@@ -729,7 +730,7 @@ float VirtualVisibility(float3 position, float bias, constant CascadeConstants& 
     if (frame.Filtering.x == 0) return receiver <= stored.x ? 1.0 : 0.0;
     mip = uint(stored.y);
     float2 texel = uv * float(uint(frame.FarDepths.x) >> mip) - VirtualSampleCenter;
-    int2 base(floor(texel)); float2 fraction = fract(texel); float visible = 0;
+    int2 base = int2(int(floor(texel.x)), int(floor(texel.y))); float2 fraction = fract(texel); float visible = 0;
     for (int y = -int(frame.Filtering.x); y <= int(frame.Filtering.x); ++y)
         for (int x = -int(frame.Filtering.x); x <= int(frame.Filtering.x); ++x)
         {
@@ -1104,7 +1105,7 @@ float4 EvaluateMaterialSurface(
     texture2d<float> normalMap,
     texture2d<float> opacityMap,
     sampler surfaceSampler,
-    bool frontFacing, float contactVisibility = 1.0, texture2d<uint,access::read> shadowRayImage)
+    bool frontFacing, texture2d<uint,access::read> shadowRayImage, float contactVisibility = 1.0)
 {
     float2 roughnessMetallic = constants.ShadingParameters.xy;
     if (constants.TextureFlags.z > 1) roughnessMetallic *= opacityMap.sample(surfaceSampler, input.TexCoord).gb;
@@ -1183,7 +1184,7 @@ fragment float4 EvansFragmentMain(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     ForwardShadowImage cascade0 [[texture(10)]],
     ForwardShadowImage cascade1 [[texture(11)]],
@@ -1206,7 +1207,7 @@ fragment float4 EvansFragmentMain(
 #endif
     return EvaluateMaterialSurface(input, sceneLights, selection, tileHeaders, tileIndices, constants, pcss, cascades, fog, fogAtlas, lumenVolume, lumenAtlas,
         cascade0, cascade1, cascade2, cascade3, shadowMap,
-        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, contactVisibility, shadowRayImage);
+        diffuseMap, normalMap, opacityMap, surfaceSampler, frontFacing, shadowRayImage, contactVisibility);
 }
 
 struct WeightedCoverageParameters
@@ -1230,7 +1231,7 @@ fragment WeightedSurfaceOutput EvansWeightedFragment(
     constant CascadeConstants& cascades [[buffer(2)]],
     constant SurfaceFogParameters& fog [[buffer(4)]],
     texture2d<float> fogAtlas [[texture(14)]],
-    constant LumenVolumeParameters& lumenVolume [[buffer(9)]],
+    constant LumenVolumeParameters& lumenVolume [[buffer(11)]],
     texture2d<float> lumenAtlas [[texture(19)]],
     ForwardShadowImage cascade0 [[texture(10)]],
     ForwardShadowImage cascade1 [[texture(11)]],

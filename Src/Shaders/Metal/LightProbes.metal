@@ -62,7 +62,7 @@ fragment float4 PSMain(ProbeVertex raster [[stage_in]],constant ProbeUniforms& u
     texture2d<float,access::read> normalRoughness [[texture(5)]],texture2d<float,access::read> diffuseOpacity [[texture(6)]],
     texture2d<float,access::read> ambientMetallic [[texture(7)]])
 {
-    uint2 pixel(raster.Position.xy);
+    uint2 pixel = uint2(raster.Position.xy);
     float4 scene=color.read(pixel),material=normalRoughness.read(pixel);
     float z=depth.read(pixel);
     if(z>=1 || material.w<0 || !all(isfinite(material)) || dot(material.xyz,material.xyz)<=VectorSquaredEpsilon)return scene;

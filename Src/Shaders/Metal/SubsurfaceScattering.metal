@@ -38,7 +38,7 @@ bool Surface(int2 pixel,constant DiffusionFrame& frame,texture2d<float,access::r
     if (!(z<EmptyDepth && n.w>=0 && squared>NormalTolerance && isfinite(squared))) return false;
     normal=n.xyz*rsqrt(squared); return Unproject((float2(pixel)+PixelCenter)*frame.Viewport.zw,z,frame,world);
 }
-void Accumulate(int2 pixel,float fraction,float3 kernel,float3 center,float3 normal,float sigma,
+void Accumulate(int2 pixel,float fraction,float3 tapKernel,float3 center,float3 normal,float sigma,
     constant DiffusionFrame& frame,texture2d<float,access::read> signal,texture2d<float,access::read> depth,
     texture2d<float,access::read> normals,thread float3& radiance,thread float3& weights)
 {
@@ -47,7 +47,7 @@ void Accumulate(int2 pixel,float fraction,float3 kernel,float3 center,float3 nor
     float4 value=signal.read(uint2(pixel)); if (value.a<=MinimumMask) return;
     float distance=dot(world-center,frame.CameraForward.xyz)/sigma;
     float angular=frame.Rejection.y>0 ? pow(saturate(dot(normal,n)),frame.Rejection.y) : 1;
-    float3 weight=kernel*(fraction*exp(-distance*distance/2)*angular*value.a);
+    float3 weight=tapKernel*(fraction*exp(-distance*distance/2)*angular*value.a);
     radiance+=value.rgb/value.a*weight; weights+=weight;
 }
 fragment float4 PSMain(Fullscreen input [[stage_in]],constant DiffusionFrame& frame [[buffer(0)]],

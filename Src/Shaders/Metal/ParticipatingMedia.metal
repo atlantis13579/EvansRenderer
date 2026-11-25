@@ -2,7 +2,7 @@
 // Pharr, Jakob and Humphreys, PBRT v4, Volume Scattering and Equation of Transfer.
 // https://www.pbr-book.org/4ed/Volume_Scattering/Transmittance
 // EVANS_MEDIA_COMPOSITE selects the resolved-scene consumer of paired S.rgb/T.rgb planes.
-#if defined(EVANS_MEDIA_COMPOSITE)
+// Shared preamble so the world-space shadow query block compiles in both variants.
 #include <metal_stdlib>
 using namespace metal;
 // Metal world-space shadow queries. Woop, Benthin and Wald, JCGT 2013.
@@ -159,6 +159,10 @@ float ShadowRayVisibility(float3 position,float3 normal,float3 towardLight,textu
     if (!(all(isfinite(origin)))) return 1.0;
     return ShadowRayAnyHit(origin,direction,limit,ShadowRayLoad(image,ShadowRayCountsHeader).y,image)?0.0:1.0;
 }
+
+#if defined(EVANS_MEDIA_COMPOSITE)
+#include <metal_stdlib>
+using namespace metal;
 
 // Opaque endpoints interpolate the independently integrated RGB transport.
 struct FogParameters
@@ -525,7 +529,8 @@ constant float VirtualSampleCenter = 0.5;
 float2 VirtualDepth(float2 uv, uint firstMip, constant VolumeLighting& frame,
     MediumShadowTexture atlas, MediumShadowTexture directory)
 {
-    uint4 layout(frame.CascadeEnds), physical(frame.CascadeBlendStarts);
+    uint4 layout = uint4(frame.CascadeEnds);
+    uint4 physical = uint4(frame.CascadeBlendStarts);
     uint side = layout.x / layout.y, offset = 0;
     for (uint mip = 0; mip < layout.z; ++mip)
     {
@@ -585,7 +590,7 @@ float VirtualVisibility(float3 position, float bias, constant VolumeLighting& fr
     if (frame.ShadowFilter.x == 0) return receiver <= stored.x ? 1.0 : 0.0;
     mip = uint(stored.y);
     float2 texel = uv * float(uint(frame.CascadeEnds.x) >> mip) - VirtualSampleCenter;
-    int2 base(floor(texel)); float2 fraction = fract(texel); float visible = 0;
+    int2 base = int2(floor(texel)); float2 fraction = fract(texel); float visible = 0;
     for (int y = -int(frame.ShadowFilter.x); y <= int(frame.ShadowFilter.x); ++y)
         for (int x = -int(frame.ShadowFilter.x); x <= int(frame.ShadowFilter.x); ++x)
         {

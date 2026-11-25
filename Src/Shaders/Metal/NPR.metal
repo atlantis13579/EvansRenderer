@@ -48,9 +48,9 @@ float contour(texture2d<float> scene, int2 center, constant PostConstants& setti
         {
             uint2 donor = uint2(clamp(center + int2(column, row), int2(0), extent - 1));
             float luma = dot(encodeDisplay(scene.read(donor).rgb), LumaWeights);
-            float2 kernel = exp(-float(row * row + column * column) / (2 * scales * scales));
-            totals += luma * kernel;
-            normalization += kernel;
+            float2 tapWeight = exp(-float(row * row + column * column) / (2 * scales * scales));
+            totals += luma * tapWeight;
+            normalization += tapWeight;
         }
     float2 mean = totals / normalization;
     float difference = mean.x - settings.NprEdge.y * mean.y;
@@ -64,10 +64,10 @@ float lineCoverage(float2 pixel, float2 axis, float spacing, float width)
     float footprint = (abs(axis.x) + abs(axis.y)) * 0.5;
     return 1 - smoothstep(max(0.0f, halfWidth - footprint), halfWidth + footprint, distance);
 }
-fragment float4 PostFragmentMain(PostVertex vertex [[stage_in]],
+fragment float4 PostFragmentMain(PostVertex stageInput [[stage_in]],
     constant PostConstants& settings [[buffer(0)]], texture2d<float> scene [[texture(0)]])
 {
-    float4 source = scene.read(uint2(vertex.Position.xy));
+    float4 source = scene.read(uint2(stageInput.Position.xy));
     float3 display = saturate(encodeDisplay(source.rgb));
     const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
     const float LightTone = 0.25, MiddleTone = 0.5, DarkTone = 0.75, ToneFade = 0.1;
@@ -77,11 +77,11 @@ fragment float4 PostFragmentMain(PostVertex vertex [[stage_in]],
     float3 layers = smoothstep(thresholds - ToneFade, thresholds + ToneFade, float3(darkness));
     float2 axis = settings.NprHatch.zw;
     float spacing = settings.NprHatch.x, width = settings.NprHatch.y;
-    float3 strokes = float3(lineCoverage(vertex.Position.xy, axis, spacing, width),
-        lineCoverage(vertex.Position.xy, float2(-axis.y, axis.x), spacing, width),
-        lineCoverage(vertex.Position.xy, float2(axis.x - axis.y, axis.x + axis.y) * DiagonalNormalization, spacing, width));
+    float3 strokes = float3(lineCoverage(stageInput.Position.xy, axis, spacing, width),
+        lineCoverage(stageInput.Position.xy, float2(-axis.y, axis.x), spacing, width),
+        lineCoverage(stageInput.Position.xy, float2(axis.x - axis.y, axis.x + axis.y) * DiagonalNormalization, spacing, width));
     float3 transmission = 1 - strokes * layers * settings.NprStyle.y;
-    float edge = settings.NprStyle.x > 0 ? contour(scene, int2(vertex.Position.xy), settings) : 1;
+    float edge = settings.NprStyle.x > 0 ? contour(scene, int2(stageInput.Position.xy), settings) : 1;
     float intervals = settings.NprTone.x - 1;
     float3 tones = floor(display * intervals + 0.5) / intervals;
     float3 paper = mix(float3(1), tones, settings.NprStyle.z);

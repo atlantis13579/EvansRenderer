@@ -306,7 +306,8 @@ constant float VirtualSampleCenter = 0.5;
 float2 VirtualDepth(float2 uv, uint firstMip, constant VolumeLighting& frame,
     MediumShadowTexture atlas, MediumShadowTexture directory)
 {
-    uint4 layout(frame.CascadeEnds), physical(frame.CascadeBlendStarts);
+    uint4 layout = uint4(frame.CascadeEnds);
+    uint4 physical = uint4(frame.CascadeBlendStarts);
     uint side = layout.x / layout.y, offset = 0;
     for (uint mip = 0; mip < layout.z; ++mip)
     {
@@ -366,7 +367,7 @@ float VirtualVisibility(float3 position, float bias, constant VolumeLighting& fr
     if (frame.ShadowFilter.x == 0) return receiver <= stored.x ? 1.0 : 0.0;
     mip = uint(stored.y);
     float2 texel = uv * float(uint(frame.CascadeEnds.x) >> mip) - VirtualSampleCenter;
-    int2 base(floor(texel)); float2 fraction = fract(texel); float visible = 0;
+    int2 base = int2(floor(texel)); float2 fraction = fract(texel); float visible = 0;
     for (int y = -int(frame.ShadowFilter.x); y <= int(frame.ShadowFilter.x); ++y)
         for (int x = -int(frame.ShadowFilter.x); x <= int(frame.ShadowFilter.x); ++x)
         {
